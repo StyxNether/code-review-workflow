@@ -64,7 +64,7 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
 
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
     """添加 review 的选项（单 Agent 审查，只查不改）。"""
-    parser.add_argument("-o", dest="out", metavar="文件", help="将 Markdown 报告写入文件")
+    parser.add_argument("-o", "--out", dest="out", metavar="文件", help="将 Markdown 报告写入文件")
     parser.add_argument(
         "--json",
         dest="as_json",
@@ -88,7 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument(
         "requirement", nargs="?", metavar="需求文本", help="需求文本（与 -f 二选一）"
     )
-    inputs.add_argument("-f", dest="file", metavar="文件", help="既有代码文件（与需求文本二选一）")
+    inputs.add_argument(
+        "-f", "--file", dest="file", metavar="文件", help="既有代码文件（与需求文本二选一）"
+    )
     run_parser.set_defaults(_subparser=run_parser)
     _add_workflow_options(run_parser)
 
@@ -115,7 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     graph_parser = subparsers.add_parser("graph", help="导出工作流 mermaid 流程图")
     graph_parser.add_argument(
-        "-o", dest="out", metavar="文件", help="写入文件（默认输出到 stdout）"
+        "-o",
+        "--out",
+        dest="out",
+        metavar="文件",
+        help="写入文件（默认输出到 stdout）",
     )
 
     subparsers.add_parser("uninstall", help="卸载：分级清理程序、PATH 条目与用户数据")

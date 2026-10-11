@@ -105,8 +105,10 @@ def test_run_accepts_all_documented_options() -> None:
     assert args.no_stream is True
 
 
-def test_run_accepts_file_input() -> None:
-    args = build_parser().parse_args(["run", "-f", "samples/legacy.py"])
+@pytest.mark.parametrize("flag", ["-f", "--file"])
+def test_run_accepts_file_input(flag: str) -> None:
+    """既有代码文件输入同时支持短名与长名。"""
+    args = build_parser().parse_args(["run", flag, "samples/legacy.py"])
 
     assert args.file == "samples/legacy.py"
     assert args.requirement is None
@@ -212,6 +214,31 @@ def test_review_requires_at_least_one_path() -> None:
         build_parser().parse_args(["review"])
 
     assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["review", "src/crw/cli.py", "--out", "report.md"],
+        ["graph", "--out", "graph.mmd"],
+    ],
+)
+def test_short_options_also_accept_long_names(argv: list[str]) -> None:
+    """短选项均有等价长名（用户 2026-10-11 决定：全面恢复长名）。"""
+    assert build_parser().parse_args(argv).out == argv[-1]
+
+
+def test_every_short_option_has_a_long_form() -> None:
+    """参数面不变量：任何短选项都必须配长名，避免再出现只有 ``-x`` 的选项。"""
+    root = build_parser()
+    subparser_actions = [a for a in root._actions if isinstance(a, argparse._SubParsersAction)]
+    parsers = [root, *subparser_actions[0].choices.values()]
+
+    for parser in parsers:
+        for action in parser._actions:
+            shorts = [name for name in action.option_strings if not name.startswith("--")]
+            longs = [name for name in action.option_strings if name.startswith("--")]
+            assert not shorts or longs, f"{parser.prog}：{'/'.join(shorts)} 缺少长名"
 
 
 def test_config_action_accepts_test_only() -> None:

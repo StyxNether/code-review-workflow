@@ -289,19 +289,19 @@ Finding：
 ### 8.1 CLI 命令面
 
 ```
-crw run [<需求文本> | -f <文件>] [选项]   # 运行工作流（核心）
+crw run [<需求文本> | -f, --file <文件>] [选项]   # 运行工作流（核心）
 crw runs                                  # 列出运行记录
 crw show [<运行号>]                       # 展示运行详情（省略运行号 → 列出记录供选择）
 crw resume <运行号>                       # 续跑（从最新版本新开运行）
 crw review <路径...> | - [选项]            # 单 Agent 审查（不修复；- 读 stdin）
 crw config [test]                         # 供应商配置 / 连通性自检
-crw graph [-o <文件>]                     # 导出 mermaid 流程图
+crw graph [-o, --out <文件>]              # 导出 mermaid 流程图
 crw uninstall                             # 卸载
 crw --version                             # 版本号
 ```
 
-`crw run` 选项：`-f <文件>`、`--max-iter <n>`（默认 3，非负整数）、`--strict`、`--no-exec`、`--out <目录>`、`--model / --provider`、`--no-stream`。
-`crw review` 选项：`-o <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`。
+`crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，非负整数）、`--strict`、`--no-exec`、`--out <目录>`、`--model / --provider`、`--no-stream`。
+`crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`。
 
 补充约定：
 
