@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import re
 
 import pytest
 
@@ -43,13 +44,13 @@ def test_version_falls_back_when_metadata_is_missing(
 
 
 def test_help_lists_every_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    """帮助文本按行列出全部子命令（子串匹配会被 runs 满足 run，故按行锚定）。"""
     with pytest.raises(SystemExit) as excinfo:
         main(["--help"])
 
     assert excinfo.value.code == 0
-    out = capsys.readouterr().out
-    for command in COMMANDS:
-        assert command in out
+    listed = set(re.findall(r"^ {4}(\S+) {2,}\S", capsys.readouterr().out, flags=re.MULTILINE))
+    assert listed >= set(COMMANDS)
 
 
 def test_missing_subcommand_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
@@ -118,10 +119,11 @@ def test_run_rejects_requirement_and_file_together() -> None:
     assert excinfo.value.code == 2
 
 
-def test_run_requires_one_of_requirement_or_file(capsys: pytest.CaptureFixture[str]) -> None:
-    """run 的两种输入必须恰好给出一个（Design §8.1）。"""
+@pytest.mark.parametrize("argv", [["run"], ["run", ""], ["run", "   "], ["run", "-f", ""]])
+def test_run_requires_non_blank_input(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    """run 的两种输入必须恰好给出一个，且不得为空白（Design §8.1）。"""
     with pytest.raises(SystemExit) as excinfo:
-        main(["run"])
+        main(argv)
 
     assert excinfo.value.code == 2
     assert "二选一" in capsys.readouterr().err
@@ -131,8 +133,9 @@ def test_run_max_iter_zero_is_allowed() -> None:
     assert build_parser().parse_args(["run", "--max-iter", "0"]).max_iter == 0
 
 
-@pytest.mark.parametrize("value", ["-1", "1.5", "abc"])
-def test_run_max_iter_rejects_non_negative_integer_violations(value: str) -> None:
+@pytest.mark.parametrize("value", ["-1", "1.5", "abc", "+3", " 3", "1_0", "\u0663"])
+def test_run_max_iter_rejects_non_ascii_or_non_decimal(value: str) -> None:
+    """只接受 ASCII 十进制写法：符号前缀、下划线分组、全角/阿拉伯-印度数字均拒绝。"""
     with pytest.raises(SystemExit) as excinfo:
         build_parser().parse_args(["run", "--max-iter", value])
 
@@ -173,8 +176,26 @@ def test_review_accepts_paths_and_options() -> None:
     assert args.no_exec is True
 
 
+def test_review_accepts_model_overrides() -> None:
+    args = build_parser().parse_args(
+        ["review", "src/crw/cli.py", "--model", "some-model", "--provider", "some-provider"]
+    )
+
+    assert args.model == "some-model"
+    assert args.provider == "some-provider"
+
+
 def test_review_reads_stdin_marker_as_path() -> None:
     assert build_parser().parse_args(["review", "-"]).paths == ["-"]
+
+
+def test_review_rejects_blank_paths(capsys: pytest.CaptureFixture[str]) -> None:
+    """空白路径不是可审查目标，按参数错误拒绝。"""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["review", ""])
+
+    assert excinfo.value.code == 2
+    assert "空白" in capsys.readouterr().err
 
 
 def test_review_stdin_marker_must_stand_alone(capsys: pytest.CaptureFixture[str]) -> None:
@@ -212,6 +233,26 @@ def test_commands_without_arguments(command: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "argv",
+    [
+        ["review", "-o"],
+        ["run", "-f"],
+        ["run", "--max-iter"],
+        ["run", "--unknown"],
+        ["show", "a", "b"],
+        ["runs", "extra"],
+        ["config", "test", "extra"],
+    ],
+)
+def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
+    """缺选项值、未知选项与多余位置参数一律按参数错误退出（Design §8.1）。"""
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize(
     ("argv", "command"),
     [
         (["run", "写一个计算器"], "run"),
@@ -229,13 +270,15 @@ def test_skeleton_commands_report_not_implemented(
 ) -> None:
     """骨架期八个子命令均已接线：分发到占位处理器并给出可读提示。"""
     assert main(argv) == 2
-    assert command in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert command in captured.err
 
 
 def test_unexpected_failure_reports_readably(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """未预期异常兜底为可读报错 + 退出码 2，而不是 traceback 退出（Design §8.1）。"""
+    """处理器阶段的未预期异常兜底为可读报错 + 退出码 2，而不是 traceback 退出（Design §8.1）。"""
 
     def _boom(args: argparse.Namespace) -> int:
         raise RuntimeError("运行目录不可写")
@@ -245,9 +288,44 @@ def test_unexpected_failure_reports_readably(
     assert main(["runs"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith("crw runs：运行失败")
+    assert "运行失败" in captured.err
     assert "RuntimeError" in captured.err
     assert "运行目录不可写" in captured.err
+
+
+def test_build_stage_failure_is_covered_too(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """解析 / 校验阶段的未预期异常同样兜底（如发行版元数据损坏）。"""
+
+    def _boom() -> argparse.ArgumentParser:
+        raise ValueError("dist-info 损坏")
+
+    monkeypatch.setattr(crw.cli, "build_parser", _boom)
+
+    assert main(["--version"]) == 2
+    captured = capsys.readouterr()
+    assert "运行失败" in captured.err
+    assert "ValueError" in captured.err
+
+
+def test_failure_message_masks_key_like_text_and_truncates(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """兜底报错遮蔽密钥形态并限长：异常文本可能来自模型 / HTTP 栈且会被重定向保存。"""
+    fake_key = "sk-" + "k" * 24
+
+    def _boom(args: argparse.Namespace) -> int:
+        raise RuntimeError(f"task-analysis failed: 401 unauthorized, key={fake_key} " + "长" * 500)
+
+    monkeypatch.setitem(crw.cli._HANDLERS, "runs", _boom)
+
+    assert main(["runs"]) == 2
+    err = capsys.readouterr().err
+    assert fake_key not in err
+    assert "sk-***" in err
+    assert "task-analysis failed" in err  # 普通连字符词不得被误伤
+    assert "已截断" in err
 
 
 @pytest.mark.parametrize(

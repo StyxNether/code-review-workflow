@@ -1,11 +1,15 @@
-"""模块骨架测试：Design §3 列出的模块均可导入且带模块 docstring。"""
+"""模块骨架测试：Design §3 列出的模块均可导入、带 docstring，且清单不漂移。"""
 
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import pytest
 
+import crw
+
+# Design §3 的模块清单：新增 / 删除模块时必须同步本表，否则 test_module_list_matches_package_tree 会失败。
 MODULES = (
     "crw",
     "crw.cli",
@@ -30,9 +34,23 @@ MODULES = (
 )
 
 
+def _modules_on_disk() -> set[str]:
+    """枚举包目录下的模块名（包目录自身的 ``__init__`` 归一为包名）。"""
+    package_root = Path(str(crw.__file__)).parent
+    found: set[str] = set()
+    for path in package_root.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        parts = list(path.relative_to(package_root.parent).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        found.add(".".join(parts))
+    return found
+
+
 @pytest.mark.parametrize("module_name", MODULES)
 def test_module_is_importable(module_name: str) -> None:
-    assert importlib.import_module(module_name) is not None
+    assert importlib.import_module(module_name).__name__ == module_name
 
 
 @pytest.mark.parametrize("module_name", MODULES)
@@ -40,3 +58,8 @@ def test_module_documents_its_responsibility(module_name: str) -> None:
     module = importlib.import_module(module_name)
 
     assert (module.__doc__ or "").strip()
+
+
+def test_module_list_matches_package_tree() -> None:
+    """包目录实际模块集合与 Design §3 清单一致（多、少、改名都即刻暴露）。"""
+    assert _modules_on_disk() == set(MODULES)
