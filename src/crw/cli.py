@@ -27,15 +27,23 @@ def _package_version() -> str:
         return "unknown"
 
 
-def _non_negative_int(text: str) -> int:
-    """解析非负整数选项值；只接受 ASCII 十进制写法。
+_MAX_ITER_LIMIT = 10
 
-    int() 会接受 ``+3`` / ``1_0`` / 全角与阿拉伯-印度数字等写法，静默重新解释用户输入，
-    故选在解析之前先按字面收紧（非法取值按参数错误处理，退出码 2）。
+
+def _max_iter_rounds(text: str) -> int:
+    """解析修复轮次上限：0 ~ ``_MAX_ITER_LIMIT`` 的 ASCII 十进制整数（Design §4.4）。
+
+    先按字面收紧再取值——int() 会接受 ``+3`` / ``1_0`` / 全角与阿拉伯-印度数字等写法并静默
+    重新解释用户输入；同时设硬上限，避免误填大值造成无界循环与无界调用费用。
     """
     if not text.isascii() or not text.isdecimal():
-        raise argparse.ArgumentTypeError(f"需要非负整数，收到 {text!r}")
-    return int(text)
+        raise argparse.ArgumentTypeError(f"需要 0–{_MAX_ITER_LIMIT} 的整数，收到 {text!r}")
+    rounds = int(text)
+    if rounds > _MAX_ITER_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"修复轮次上限最多 {_MAX_ITER_LIMIT} 轮（防止无界循环），收到 {text!r}"
+        )
+    return rounds
 
 
 def _add_model_options(parser: argparse.ArgumentParser) -> None:
@@ -49,10 +57,10 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
     """添加 run / resume 共用的工作流选项（resume 不提供 -f）。"""
     parser.add_argument(
         "--max-iter",
-        type=_non_negative_int,
+        type=_max_iter_rounds,
         default=3,
         metavar="n",
-        help="修复轮次上限（默认 3；0 = 只审不修）",
+        help=f"修复轮次上限（默认 3，可取值 0–{_MAX_ITER_LIMIT}；0 = 只审不修）",
     )
     parser.add_argument(
         "--strict", action="store_true", help="干净判定加严：无【严重】且无【一般】"

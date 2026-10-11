@@ -131,8 +131,22 @@ def test_run_requires_non_blank_input(argv: list[str], capsys: pytest.CaptureFix
     assert "二选一" in capsys.readouterr().err
 
 
-def test_run_max_iter_zero_is_allowed() -> None:
-    assert build_parser().parse_args(["run", "--max-iter", "0"]).max_iter == 0
+@pytest.mark.parametrize("value", ["0", "1", "3", "10"])
+def test_run_max_iter_accepts_values_up_to_the_limit(value: str) -> None:
+    """轮次由用户在命令行指定，取值范围 0–10（Design §4.4；0 = 只审不修）。"""
+    assert build_parser().parse_args(["run", "--max-iter", value]).max_iter == int(value)
+
+
+@pytest.mark.parametrize("value", ["11", "100", "999999999"])
+def test_run_max_iter_rejects_values_above_the_limit(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """超过硬上限即参数错误（退出码 2），防止无界循环与无界调用费用。"""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "需求文本", "--max-iter", value])
+
+    assert excinfo.value.code == 2
+    assert "最多 10 轮" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["-1", "1.5", "abc", "+3", " 3", "1_0", "\u0663"])
