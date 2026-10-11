@@ -1,0 +1,32 @@
+# ===== 本地开发辅助文档（仅本地维护，不随仓库分发）=====
+AGENTS.md
+docs/PROGRESS.md
+
+# ===== Python =====
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# ===== 本机数据目录 / 本地环境与敏感文件 =====
+.cra/
+.crw/
+.env
+.env.*
+*.local
+
+# ===== 提交物与敏感文件（压缩包 / 演示视频 / 演示文稿一律不进仓库）=====
+*.rar
+*.zip
+*.7z
+*.mp4
+*.mov
+*.pptx
+
+# ===== 本机隐私/临时文件（任何含隐私信息的本地文件都必须加入本清单）=====
+~$*

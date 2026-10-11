@@ -1,0 +1,36 @@
+[project]
+name = "code-review-workflow"
+version = "0.1.0"
+description = "基于 LLM 的代码审查工作流：编码 → 审查 → 修复（+ 复审循环）"
+readme = "README.md"
+authors = [{ name = "Styx River", email = "yxyy_11@126.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.0",
+    "langgraph>=1.0",
+    "langchain-openai>=1.0",
+    "rich",
+]
+
+[project.scripts]
+crw = "crw.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crw"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["tests/fixtures"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
