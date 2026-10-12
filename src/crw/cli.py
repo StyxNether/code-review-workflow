@@ -10,9 +10,16 @@ import importlib.metadata
 import re
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
+
+from . import render
+from .workflow import engine as engine_mod
+from .workflow import records as records_mod
+from .workflow import state as state_mod
 
 _PACKAGE_NAME = "code-review-workflow"
 _PROG = "crw"
+_EXIT_OK = 0
 _EXIT_ERROR = 2
 
 
@@ -46,6 +53,20 @@ def _max_iter_rounds(text: str) -> int:
     return rounds
 
 
+class _MaxIterAction(argparse.Action):
+    """记录 ``--max-iter`` 是否由命令行显式给出（轮次取值来源，Design §4.4）。"""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        namespace.max_iter_source = state_mod.SOURCE_CLI
+
+
 def _add_model_options(parser: argparse.ArgumentParser) -> None:
     """添加 run / resume / review 共用的执行与模型覆盖选项。"""
     parser.add_argument("--no-exec", action="store_true", help="禁止运行代码核实")
@@ -58,9 +79,11 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-iter",
         type=_max_iter_rounds,
-        default=3,
+        default=engine_mod.DEFAULT_MAX_ITERATIONS,
+        action=_MaxIterAction,
         metavar="n",
-        help=f"修复轮次上限（默认 3，可取值 0–{_MAX_ITER_LIMIT}；0 = 只审不修）",
+        help=f"修复轮次上限（默认 {engine_mod.DEFAULT_MAX_ITERATIONS}，"
+        f"可取值 0–{_MAX_ITER_LIMIT}；0 = 只审不修）",
     )
     parser.add_argument(
         "--strict", action="store_true", help="干净判定加严：无【严重】且无【一般】"
@@ -68,6 +91,7 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
     _add_model_options(parser)
     parser.add_argument("--out", metavar="目录", help="将最终代码与报告复制到指定目录")
     parser.add_argument("--no-stream", action="store_true", help="关闭流式渲染，整体输出")
+    parser.set_defaults(max_iter_source=None)
 
 
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
@@ -180,19 +204,83 @@ def _not_implemented(command: str) -> int:
     return _EXIT_ERROR
 
 
+def _read_input_file(path: Path) -> tuple[str | None, int]:
+    """读取 ``-f`` 输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。"""
+    if not path.exists():
+        print(f"crw run：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
+        return None, _EXIT_ERROR
+    if path.is_dir():
+        print(f"crw run：运行失败 — 输入是目录：{path}（-f 需要一个代码文件）", file=sys.stderr)
+        return None, _EXIT_ERROR
+    try:
+        return path.read_text(encoding="utf-8"), _EXIT_OK
+    except UnicodeDecodeError:
+        print(f"crw run：运行失败 — 输入文件不是 UTF-8 文本：{path}", file=sys.stderr)
+        return None, _EXIT_ERROR
+    except OSError as exc:
+        print(f"crw run：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
+        return None, _EXIT_ERROR
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    """运行工作流（占位）。"""
-    return _not_implemented("run")
+    """运行工作流：装配请求 → 驱动引擎 → 渲染结论（Design §8.1）。
+
+    ``-f`` 输入由命令面读取（Design §8.4），工作区内落盘交给引擎；其余选项本轮为占位。
+    """
+    requirement = (args.requirement or "").strip() or None
+    source_path: Path | None = None
+    source_text: str | None = None
+    if args.file:
+        source_path = Path(args.file)
+        source_text, error_code = _read_input_file(source_path)
+        if source_text is None:
+            return error_code
+    request = engine_mod.RunRequest(
+        requirement=requirement,
+        source_path=source_path,
+        source_text=source_text,
+        max_iterations=args.max_iter,
+        max_iterations_source=args.max_iter_source or state_mod.SOURCE_DEFAULT,
+        strict=bool(args.strict),
+        no_exec=bool(args.no_exec),
+    )
+    engine = engine_mod.WorkflowEngine(observer=render.RunRenderer())
+    result = engine.execute(request)
+    render.render_result(result, command="run")
+    return result.exit_code
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
-    """列出运行记录（占位）。"""
-    return _not_implemented("runs")
+    """列出运行记录（运行号 / 时间 / 输入摘要 / 状态 / 修复轮数 / 残留严重数）。"""
+    render.render_runs(records_mod.list_runs())
+    return _EXIT_OK
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
-    """展示运行详情（占位）。"""
-    return _not_implemented("show")
+    """展示运行详情；省略运行号时列出记录供数字选择（Design §8.1）。"""
+    run_id = args.run_id
+    if run_id is None:
+        summaries = records_mod.list_runs()
+        if not summaries:
+            print("crw show：暂无运行记录（先执行 crw run）。", file=sys.stderr)
+            return _EXIT_ERROR
+        # 候选清单属交互过程：走 stderr，stdout 只留被选中记录的详情（Design §8.4）
+        picked = records_mod.select_run(
+            summaries,
+            ask=render.ask_user,
+            show=lambda line: print(line, file=sys.stderr),
+        )
+        if picked is None:
+            print("crw show：已取消。", file=sys.stderr)
+            return _EXIT_ERROR
+        run_id = picked.run_id
+    try:
+        detail = records_mod.load_detail(run_id)
+    except records_mod.RunRecordError as exc:
+        print(f"crw show：{exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    render.render_detail(detail)
+    return _EXIT_OK
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:

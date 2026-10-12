@@ -1,15 +1,20 @@
-"""命令面骨架测试：版本、帮助、参数解析与占位分发（无真实网络调用）。"""
+"""命令面测试：版本、帮助、参数解析、输入契约与 run / runs / show 实现（无真实网络调用）。"""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
 import re
+from pathlib import Path
 
 import pytest
+from support import sample_path
 
 import crw.cli
+import crw.render
 from crw.cli import build_parser, main
+from crw.workflow import records
+from crw.workflow import state as state_mod
 
 COMMANDS = ("run", "runs", "show", "resume", "review", "config", "graph", "uninstall")
 
@@ -296,9 +301,6 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
 @pytest.mark.parametrize(
     ("argv", "command"),
     [
-        (["run", "写一个计算器"], "run"),
-        (["runs"], "runs"),
-        (["show"], "show"),
         (["resume", "r-20261011-1a2b"], "resume"),
         (["review", "src/crw/cli.py"], "review"),
         (["config"], "config"),
@@ -306,14 +308,187 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
         (["uninstall"], "uninstall"),
     ],
 )
-def test_skeleton_commands_report_not_implemented(
+def test_commands_still_placeholders_report_not_implemented(
     argv: list[str], command: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """骨架期八个子命令均已接线：分发到占位处理器并给出可读提示。"""
+    """M1 已实现 run / runs / show；其余命令仍为占位（M2/M3 落地）。"""
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert command in captured.err
+
+
+# ---- run / runs / show 实现（Design §8.1）----
+
+
+def test_run_with_requirement_prints_conclusion_and_persists_record(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """需求文本路径：假节点默认装配即可干净跑通（本轮生效选项 -f / --max-iter）。"""
+    assert main(["run", "写一个命令行四则运算计算器"]) == 0
+
+    captured = capsys.readouterr()
+    assert "完成：干净通过" in captured.out
+    assert "运行记录" in captured.out
+    assert "[编码]" in captured.err  # 过程叙述走 stderr（Design §8.4）
+    assert "[审查]" in captured.err
+
+    (summary,) = records.list_runs()
+    assert summary.status == state_mod.STATUS_SUCCESS
+    assert summary.fix_rounds == 0
+    assert summary.residual_severe == 0
+
+
+def test_run_with_syntax_fixture_reports_the_fix_cycle(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "-f", str(sample_path("syntax_error.py"))]) == 0
+
+    captured = capsys.readouterr()
+    assert "【严重】" in captured.out  # findings 清单走 stdout
+    assert "【修复】f-1 → fixed" in captured.out
+    assert "完成：干净通过（共 2 轮审查 / 1 轮修复）" in captured.out
+    assert "第 1 轮（code_v1.py）：1 严重" in captured.err
+
+    (summary,) = records.list_runs()
+    assert summary.fix_rounds == 1
+
+
+def test_run_with_divide_by_zero_fixture_residual(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """达限残留：退出码 1 + 残留清单（Design §4.4）。"""
+    assert main(["run", "--max-iter", "1", "-f", str(sample_path("divide_by_zero.py"))]) == 1
+
+    captured = capsys.readouterr()
+    assert "达修复轮次上限，仍有 1 项【严重】残留" in captured.out
+
+    (summary,) = records.list_runs()
+    assert summary.status == state_mod.STATUS_RESIDUAL
+    assert summary.residual_severe == 1
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_source"),
+    [
+        (["run", "需求", "--max-iter", "2"], state_mod.SOURCE_CLI),
+        (["run", "需求"], state_mod.SOURCE_DEFAULT),
+    ],
+)
+def test_run_records_max_iterations_source(
+    argv: list[str], expected_source: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """轮次取值来源：命令行显式给出记 cli，否则记内置默认（Design §4.4）。"""
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    (summary,) = records.list_runs()
+    state = records.read_state(summary.path)
+    assert state is not None
+    assert state["max_iterations_source"] == expected_source
+
+
+def test_run_reports_unreadable_file_as_run_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "-f", "samples/does-not-exist.py"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "运行失败" in captured.err
+    assert "does-not-exist.py" in captured.err or "No such file" in captured.err
+    assert records.list_runs() == []  # 输入读不到：不产生运行记录
+
+
+def test_runs_lists_the_six_columns(capsys: pytest.CaptureFixture[str]) -> None:
+    main(["run", "写一个计算器"])
+    capsys.readouterr()
+
+    assert main(["runs"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数"]
+    assert any("写一个计算器" in line for line in lines[1:])  # 数据行（不依赖表头 / 分隔行序）
+
+
+def test_runs_without_records_is_not_an_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["runs"]) == 0
+
+    assert "暂无运行记录" in capsys.readouterr().out
+
+
+def test_show_renders_the_record(capsys: pytest.CaptureFixture[str]) -> None:
+    main(["run", "-f", str(sample_path("syntax_error.py"))])
+    capsys.readouterr()
+    (summary,) = records.list_runs()
+
+    assert main(["show", summary.run_id]) == 0
+
+    text = capsys.readouterr().out
+    assert f"── 运行 {summary.run_id}" in text
+    assert "[状态] 干净通过" in text
+    assert "时间线：" in text and "逐轮审查：" in text
+    assert "【严重】code_v1.py:7" in text and "← 处置：fixed" in text
+    assert "report.md" in text
+
+
+def test_show_without_run_id_offers_selection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["run", "写一个计算器"])
+    capsys.readouterr()
+    monkeypatch.setattr(crw.render, "ask_user", lambda prompt: "1")
+
+    assert main(["show"]) == 0
+
+    captured = capsys.readouterr()
+    assert "干净通过" in captured.out
+    assert "1. r-" in captured.err  # 候选清单走 stderr（交互过程）
+
+
+def test_show_without_run_id_and_cancelled_selection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["run", "写一个计算器"])
+    capsys.readouterr()
+    monkeypatch.setattr(crw.render, "ask_user", lambda prompt: None)
+
+    assert main(["show"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "已取消" in captured.err
+
+
+def test_show_without_records_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["show"]) == 2
+
+    assert "暂无运行记录" in capsys.readouterr().err
+
+
+def test_show_unknown_run_id_is_readable(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["show", "r-20261012-0001"]) == 2
+
+    assert "运行记录不存在" in capsys.readouterr().err
+
+
+def test_show_rejects_invalid_run_id_format(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["show", "../secret"]) == 2
+
+    assert "运行号格式非法" in capsys.readouterr().err
+
+
+def test_run_state_file_records_the_cli_options(capsys: pytest.CaptureFixture[str]) -> None:
+    """本轮生效选项（-f / --max-iter）与其余选项的占位口径都写进状态快照。"""
+    assert (
+        main(["run", "-f", str(sample_path("divide_by_zero.py")), "--max-iter", "0", "--strict"])
+        == 1
+    )
+    capsys.readouterr()
+
+    (summary,) = records.list_runs()
+    state = records.read_state(summary.path)
+    assert state is not None
+    assert state["max_iterations"] == 0
+    assert state["strict"] is True
+    assert state["input"]["kind"] == state_mod.INPUT_FILE
+    assert state["findings"] and state["next_action"] == state_mod.NEXT_FIX_AGAIN
 
 
 def test_unexpected_failure_reports_readably(
@@ -383,3 +558,43 @@ def test_input_contract_accepts_legal_combinations(argv: list[str]) -> None:
     parser = build_parser()
 
     crw.cli._validate_input_contract(parser, parser.parse_args(argv))
+
+
+def test_run_reports_directory_input_readably(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``-f`` 目标为目录：给中文可读说明（Design §4.6 可读报错），退出码 2。"""
+    assert main(["run", "-f", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "输入是目录" in captured.err
+    assert "-f 需要一个代码文件" in captured.err
+    assert records.list_runs() == []
+
+
+def test_run_reports_missing_input_file_readably(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "-f", "no/such/file.py"]) == 2
+
+    assert "输入文件不存在" in capsys.readouterr().err
+
+
+def test_run_reports_non_utf8_input_readably(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    binary = tmp_path / "sample.py"
+    binary.write_bytes(b"\xff\xfe\x00print(1)\n")
+
+    assert main(["run", "-f", str(binary)]) == 2
+
+    assert "不是 UTF-8 文本" in capsys.readouterr().err
+
+
+def test_run_writes_nothing_to_the_real_user_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """运行记录根目录随 CRW_HOME 走：测试用例不会写真实用户目录（Design §9.1）。"""
+    assert main(["run", "写一个计算器"]) == 0
+    capsys.readouterr()
+
+    assert records.runs_root().is_relative_to(tmp_path)

@@ -1,0 +1,435 @@
+"""运行记录 IO：原子写、白名单、列表降级派生与选择（Design §8.2、§9.1）。"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from crw import config
+from crw.workflow import records
+from crw.workflow import state as state_mod
+
+
+def write_run(
+    run_id: str = "r-20261012-0001",
+    *,
+    state: dict | None = None,
+    write_state: bool = True,
+    events: list[dict] | None = None,
+    workspace: dict[str, str] | None = None,
+) -> Path:
+    """在重定向后的数据目录里铺一条运行记录（默认字段齐全、状态 success）。
+
+    ``state`` 覆盖默认字段；``write_state=False`` 用于构造"state.json 缺失"的降级场景。
+    """
+    run_path = records.create_run_dir(run_id)
+    payload = {
+        "run_id": run_id,
+        "input": {"kind": "requirement", "requirement": "写一个计算器"},
+        "status": state_mod.STATUS_SUCCESS,
+        "created_at": "2026-10-12T10:00:00+08:00",
+        "fix_rounds": 1,
+        "review_round": 2,
+        "findings": [],
+    }
+    if state:
+        payload.update(state)
+    if write_state:
+        records.atomic_write_text(run_path / "state.json", json.dumps(payload, ensure_ascii=False))
+    if events:
+        for event in events:
+            records.append_log_event(run_path / "log.jsonl", event)
+    for name, text in (workspace or {}).items():
+        records.atomic_write_text(run_path / "workspace" / name, text)
+    return run_path
+
+
+# ---- 目录与名称白名单 ----
+
+
+def test_data_dir_follows_crw_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """数据目录经 CRW_HOME 解析（Design §8.3/§9.1）：测试不写真实用户目录。"""
+    assert config.data_dir().is_relative_to(tmp_path)
+    assert records.runs_root() == config.data_dir() / "runs"
+
+    monkeypatch.delenv(config.HOME_ENV)
+    assert config.data_dir() == Path.home() / ".crw"
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["r-20261012-0001", "r-00000000-ffff"],
+)
+def test_valid_run_ids(run_id: str) -> None:
+    assert records.is_valid_run_id(run_id)
+    assert records.run_dir(run_id).name == run_id
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "",
+        "r-20261012-000",  # 十六进制位数不足
+        "r-20261012-00011",
+        "r-20261012-000G",  # 非十六进制
+        "R-20261012-0001",  # 大写
+        "r-2026101-0001",
+        "s-20261012-0001",  # 会话号不是运行号
+        "../r-20261012-0001",
+        "r-20261012-0001/../..",
+        "r-20261012-0001 ",
+        "r-20261012-0001\n",
+    ],
+)
+def test_invalid_run_ids_are_rejected(run_id: str) -> None:
+    """白名单校验挡住路径穿越与格式漂移（Design §8.2）。"""
+    assert not records.is_valid_run_id(run_id)
+    with pytest.raises(records.RunRecordError, match="运行号格式非法"):
+        records.run_dir(run_id)
+
+
+def test_new_run_id_retries_on_collision() -> None:
+    records.create_run_dir("r-20261012-0001")
+    candidates = iter(["0001", "0001", "0002"])
+
+    run_id = records.new_run_id(day="20261012", hex_factory=candidates.__next__)
+
+    assert run_id == "r-20261012-0002"
+
+
+def test_new_run_id_gives_up_after_repeated_collisions() -> None:
+    records.create_run_dir("r-20261012-0001")
+
+    with pytest.raises(records.RunRecordError, match="连续碰撞"):
+        records.new_run_id(day="20261012", hex_factory=lambda: "0001")
+
+
+def test_new_run_id_rejects_generator_output() -> None:
+    with pytest.raises(records.RunRecordError, match="非法编号"):
+        records.new_run_id(day="20261012", hex_factory=lambda: "zzzz!")
+
+
+def test_new_run_id_default_generator_matches_the_pattern() -> None:
+    assert records.is_valid_run_id(records.new_run_id(day="20261012"))
+
+
+def test_create_run_dir_refuses_existing_directory() -> None:
+    records.create_run_dir("r-20261012-0001")
+
+    with pytest.raises(FileExistsError):
+        records.create_run_dir("r-20261012-0001")
+
+
+# ---- 原子写与事件流 ----
+
+
+def test_atomic_write_creates_parents_and_replaces_content(tmp_path: Path) -> None:
+    target = tmp_path / "nested" / "dir" / "state.json"
+
+    records.atomic_write_text(target, "第一版")
+    records.atomic_write_text(target, "第二版")
+
+    assert target.read_text(encoding="utf-8") == "第二版"
+    assert list(target.parent.glob(".*tmp")) == []
+
+
+def test_atomic_write_leaves_no_temp_file_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "state.json"
+
+    def broken_replace(source: object, destination: object) -> None:
+        raise OSError("替换失败")
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+
+    with pytest.raises(OSError, match="替换失败"):
+        records.atomic_write_text(target, "内容")
+    assert list(tmp_path.glob(".*tmp")) == []
+    assert not target.exists()
+
+
+def test_append_log_event_keeps_only_schema_keys_and_truncates_detail(tmp_path: Path) -> None:
+    log_path = tmp_path / "log.jsonl"
+
+    records.append_log_event(
+        log_path,
+        {
+            "ts": "2026-10-12T10:00:00+08:00",
+            "node": "review",
+            "event": "end",
+            "iteration": 2,
+            "detail": "长" * 500,
+            "run_id": "r-20261012-0001",  # 渲染用附加键：不落盘
+        },
+    )
+    records.append_log_event(
+        log_path, {"ts": "t", "node": "engine", "event": "start", "detail": "短"}
+    )
+
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert set(lines[0]) == {"ts", "node", "event", "iteration", "detail"}
+    assert "run_id" not in lines[0]
+    assert len(lines[0]["detail"]) == records.DETAIL_PREVIEW_CHARS + len("…（已截断）")
+    assert "已截断" in lines[0]["detail"]
+    assert set(lines[1]) == {"ts", "node", "event", "detail"}
+    assert lines[1]["detail"] == "短"
+
+
+def test_read_events_skips_incomplete_and_broken_lines(tmp_path: Path) -> None:
+    """跳过写一半的末行与损坏行（Design §8.2）。"""
+    log_path = tmp_path / "log.jsonl"
+    log_path.write_text(
+        '{"ts": "t", "node": "engine", "event": "start"}\n'
+        "不是 JSON 的行\n"
+        '{"ts": "t2", "node": "review", "event": "start"}\n'
+        '{"ts": "t3", "node": "review", "eve',  # 写一半
+        encoding="utf-8",
+    )
+
+    events = records.read_events(log_path)
+
+    assert [event["event"] for event in events] == ["start", "start"]
+
+
+def test_read_events_returns_empty_for_missing_file(tmp_path: Path) -> None:
+    assert records.read_events(tmp_path / "nonexistent.jsonl") == []
+
+
+@pytest.mark.parametrize("content", ["{不是 JSON", "[1, 2]", '{"run_id": "x"'])
+def test_read_state_rejects_broken_records(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(content, encoding="utf-8")
+
+    assert records.read_state(tmp_path) is None
+
+
+def test_read_rounds_pairs_reviews_with_fixes(tmp_path: Path) -> None:
+    run_path = write_run(
+        workspace={
+            "code_v1.py": "print(1)\n",
+            "review_1.json": json.dumps({"iteration": 1, "file": "code_v1.py", "findings": []}),
+            "fixes_1.json": json.dumps({"round": 1, "fixes": []}),
+            "review_2.json": json.dumps({"iteration": 2, "findings": []}),
+            "review_x.json": "{}",
+            "code_v9.py": "print(9)\n",
+        }
+    )
+
+    rounds = records.read_rounds(run_path)
+
+    assert [item.round_number for item in rounds] == [1, 2]
+    assert rounds[0].file_name == "code_v1.py"
+    assert rounds[0].fixes is not None
+    assert rounds[1].fixes is None
+    assert rounds[1].file_name == "code_v2.py"  # file 缺失时按轮次推出工作区实名
+
+
+def test_run_artifacts_skip_temporary_and_hidden_files(tmp_path: Path) -> None:
+    run_path = write_run(workspace={"code_v1.py": "print(1)\n", ".code_v2.py.tmp": "x"})
+    records.atomic_write_text(run_path / ".state.json.tmp", "x")
+
+    names = sorted(path.name for path in records.run_artifacts(run_path))
+
+    assert names == ["code_v1.py", "state.json"]
+
+
+# ---- 列表与降级派生 ----
+
+
+def test_list_runs_ignores_foreign_entries(tmp_path: Path) -> None:
+    write_run("r-20261012-0001")
+    (records.runs_root() / "not-a-run").mkdir(parents=True)
+    (records.runs_root() / "r-20261012-0002.tmp").write_text("x", encoding="utf-8")
+    (records.runs_root() / "note.txt").write_text("x", encoding="utf-8")
+
+    assert [item.run_id for item in records.list_runs()] == ["r-20261012-0001"]
+
+
+def test_list_runs_sorts_newest_first() -> None:
+    write_run("r-20261012-0001", state={"created_at": "2026-10-12T09:00:00+08:00"})
+    write_run("r-20261012-0002", state={"created_at": "2026-10-12T11:00:00+08:00"})
+    write_run("r-20261012-0003", state={"created_at": "2026-10-12T10:00:00+08:00"})
+
+    assert [item.run_id for item in records.list_runs()] == [
+        "r-20261012-0002",
+        "r-20261012-0003",
+        "r-20261012-0001",
+    ]
+
+
+def test_list_runs_is_empty_without_records() -> None:
+    assert records.list_runs() == []
+
+
+def test_list_runs_derives_columns_from_workspace_and_reviews() -> None:
+    """单条记录状态损坏时按降级派生链回退（Design §8.2）。"""
+    run_path = write_run(
+        "r-20261012-0001",
+        write_state=False,
+        events=[
+            {"ts": "t", "node": "engine", "event": "start", "detail": "开始"},
+            {"ts": "t", "node": "engine", "event": "end", "detail": "residual"},
+        ],
+        workspace={
+            "code_v1.py": "print(1)\n",
+            "code_v2.py": "print(2)\n",
+            "code_v3.py": "print(3)\n",
+            "review_1.json": json.dumps({"findings": [{"severity": "严重"}]}),
+            "review_2.json": json.dumps({"findings": [{"severity": "严重"}, {"severity": "严重"}]}),
+        },
+    )
+
+    (summary,) = records.list_runs()
+
+    assert summary.path == run_path
+    assert summary.status == "residual"
+    assert summary.fix_rounds == 2
+    assert summary.residual_severe == 2
+    assert summary.input_summary == "（记录损坏）"
+    assert summary.created_at  # 退回目录修改时间
+
+
+def test_list_runs_infers_failed_status_from_log_tail() -> None:
+    write_run(
+        "r-20261012-0001",
+        write_state=False,
+        events=[
+            {"ts": "t", "node": "engine", "event": "start"},
+            {"ts": "t", "node": "review", "event": "error", "detail": "模型调用失败"},
+        ],
+    )
+
+    (summary,) = records.list_runs()
+
+    assert summary.status == state_mod.STATUS_FAILED
+    assert summary.fix_rounds is None
+    assert summary.residual_severe is None
+
+
+def test_list_runs_reports_unknown_when_nothing_is_readable() -> None:
+    records.create_run_dir("r-20261012-0001")
+
+    (summary,) = records.list_runs()
+
+    assert summary.status == "unknown"
+
+
+# ---- 单条加载 ----
+
+
+def test_load_detail_reads_state_events_rounds_and_artifacts() -> None:
+    write_run(
+        workspace={
+            "code_v1.py": "print(1)\n",
+            "review_1.json": json.dumps({"findings": [{"severity": "严重"}]}),
+        },
+        events=[{"ts": "t", "node": "engine", "event": "end", "detail": "success"}],
+    )
+
+    detail = records.load_detail("r-20261012-0001")
+
+    assert detail.state["run_id"] == "r-20261012-0001"
+    assert len(detail.events) == 1
+    assert [item.round_number for item in detail.rounds] == [1]
+    assert {path.name for path in detail.artifacts} == {
+        "state.json",
+        "log.jsonl",
+        "code_v1.py",
+        "review_1.json",
+    }
+
+
+def test_load_detail_rejects_unknown_or_invalid_ids() -> None:
+    with pytest.raises(records.RunRecordError, match="不存在"):
+        records.load_detail("r-20261012-0001")
+    with pytest.raises(records.RunRecordError, match="格式非法"):
+        records.load_detail("../etc/passwd")
+
+
+def test_load_detail_reports_corrupt_state_readably() -> None:
+    run_path = records.create_run_dir("r-20261012-0001")
+    (run_path / "state.json").write_text("{损坏", encoding="utf-8")
+
+    with pytest.raises(records.RunRecordError, match="运行记录损坏"):
+        records.load_detail("r-20261012-0001")
+
+
+# ---- 选择 ----
+
+
+@pytest.mark.parametrize(
+    ("raw", "count", "expected"),
+    [("1", 3, 0), ("3", 3, 2), ("2", 2, 1), ("0", 3, None), ("-1", 3, None), ("4", 3, None)],
+)
+def test_parse_index(raw: str, count: int, expected: int | None) -> None:
+    assert records.parse_index(raw, count) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", " ", "abc", "1.0", "１", "1 0", "0x1"])
+def test_parse_index_rejects_non_ascii_or_out_of_range(raw: str | None) -> None:
+    """ASCII 白名单：全角数字、空串与越界一律视为取消（沿用前作选择交互口径）。"""
+    assert records.parse_index(raw, 3) is None
+
+
+def test_select_run_returns_the_chosen_record() -> None:
+    write_run("r-20261012-0001", state={"created_at": "2026-10-12T09:00:00+08:00"})
+    write_run("r-20261012-0002", state={"created_at": "2026-10-12T11:00:00+08:00"})
+    printed: list[str] = []
+
+    picked = records.select_run(records.list_runs(), ask=lambda prompt: "1", show=printed.append)
+
+    assert picked is not None and picked.run_id == "r-20261012-0002"  # 列表按时间倒序
+    assert len(printed) == 2  # 两行候选
+    assert "r-20261012-0002" in printed[0]
+
+
+@pytest.mark.parametrize("answer", [None, "", "0", "abc"])
+def test_select_run_returns_none_when_cancelled(answer: str | None) -> None:
+    write_run("r-20261012-0001")
+
+    picked = records.select_run(
+        records.list_runs(), ask=lambda prompt: answer, show=lambda text: None
+    )
+
+    assert picked is None
+
+
+# ---- 陈旧 running 标注（Design §8.2）----
+
+
+def test_stale_running_is_flagged_after_thirty_minutes(tmp_path: Path) -> None:
+    """判据 = max(mtime(state.json), mtime(log.jsonl)) 超过 30 分钟；只标注不改状态。"""
+    run_path = write_run("r-20261012-0001", state={"status": state_mod.STATUS_RUNNING})
+    records.append_log_event(
+        run_path / "log.jsonl", {"ts": "t", "node": "engine", "event": "start"}
+    )
+    old = time.time() - records.STALE_RUNNING_SECONDS - 60
+    for name in ("state.json", "log.jsonl"):
+        os.utime(run_path / name, (old, old))
+
+    (summary,) = records.list_runs()
+
+    assert summary.stale is True
+    assert summary.status == state_mod.STATUS_RUNNING  # 不自动改状态
+    state = records.read_state(run_path)
+    assert state is not None and state["status"] == state_mod.STATUS_RUNNING
+
+
+def test_fresh_or_finished_runs_are_not_flagged_stale() -> None:
+    write_run("r-20261012-0001", state={"status": state_mod.STATUS_RUNNING})
+    write_run("r-20261012-0002")  # success
+
+    summaries = {item.run_id: item for item in records.list_runs()}
+
+    assert summaries["r-20261012-0001"].stale is False
+    assert summaries["r-20261012-0002"].stale is False
+
+
+def test_stale_detection_ignores_non_running_and_missing_state(tmp_path: Path) -> None:
+    assert records.is_stale_running(None, tmp_path) is False
+    assert records.is_stale_running({"status": state_mod.STATUS_SUCCESS}, tmp_path) is False

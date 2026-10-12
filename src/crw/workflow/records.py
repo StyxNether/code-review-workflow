@@ -2,3 +2,431 @@
 
 原子写采用临时文件 + 替换；列表 / 加载忽略临时文件与非目录项，并对损坏记录降级（Design §8.2）。
 """
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import json
+import os
+import re
+import secrets
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from ..config import data_dir
+from . import contracts
+from . import state as state_mod
+
+#: 运行号白名单：``r-YYYYMMDD-`` + 4 位小写十六进制（Design §4.3/§4.5）。
+#: 运行号直接拼进路径，白名单（而非仅剥离分隔符）使任何合法编号都只能是单个路径成分。
+RUN_ID_PATTERN = re.compile(r"^r-[0-9]{8}-[0-9a-f]{4}$")
+
+#: 序号选择输入：仅 ASCII 十进制正整数（``0`` / 负数 / ``＋1`` 等一律视为取消）。
+_INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
+
+_REVIEW_NAME_PATTERN = re.compile(r"^review_([0-9]+)\.json$")
+_CODE_NAME_PATTERN = re.compile(r"^code_v([0-9]+)\.py$")
+
+#: 事件 detail 只存截断预览（Design §8.2）
+DETAIL_PREVIEW_CHARS = 400
+
+#: 陈旧 running 判定阈值：判据 = max(mtime(state.json), mtime(log.jsonl)) 超过 30 分钟（Design §8.2）
+STALE_RUNNING_SECONDS = 30 * 60
+
+_RUN_ID_ATTEMPTS = 8
+
+
+class RunRecordError(RuntimeError):
+    """运行记录不可用（名称非法 / 不存在 / 结构损坏），消息为可读中文。"""
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """运行列表的一行（含降级派生结果，Design §8.2）。"""
+
+    run_id: str
+    created_at: str
+    input_summary: str
+    status: str
+    fix_rounds: int | None
+    residual_severe: int | None
+    path: Path
+    stale: bool = False
+    """``status=running`` 且长时间无更新：可能已中断（Design §8.2，只标注不改状态）。"""
+
+
+@dataclass(frozen=True)
+class RoundReport:
+    """一轮审查与紧随其后的修复处置（报告与 `crw show` 的逐轮数据）。"""
+
+    round_number: int
+    file_name: str
+    review: Mapping[str, Any]
+    fixes: Mapping[str, Any] | None = field(default=None)
+
+
+@dataclass(frozen=True)
+class RunDetail:
+    """单条运行记录的完整视图。"""
+
+    summary: RunSummary
+    state: Mapping[str, Any]
+    events: tuple[Mapping[str, Any], ...]
+    rounds: tuple[RoundReport, ...]
+    artifacts: tuple[Path, ...]
+
+
+def runs_root() -> Path:
+    """运行记录根目录：``data_dir()/runs``（经 ``CRW_HOME`` 解析，Design §8.3）。"""
+    return data_dir() / "runs"
+
+
+def is_valid_run_id(run_id: str) -> bool:
+    """运行号是否合法（白名单：格式 + 仅单一路径成分，防路径穿越）。"""
+    return bool(RUN_ID_PATTERN.fullmatch(run_id))
+
+
+def run_dir(run_id: str) -> Path:
+    """运行号 → 运行目录路径；非法运行号抛 :class:`RunRecordError`。
+
+    会话模式的轮次记录位于 ``sessions/<会话号>/rounds/round-<i>/``（Design §4.7），
+    M4 在此处扩展两处查找；运行号本身全局唯一，记录格式与目录契约保持一致。
+    """
+    if not is_valid_run_id(run_id):
+        raise RunRecordError(
+            f"运行号格式非法：{run_id!r}（应为 r-YYYYMMDD-xxxx，xxxx 为 4 位小写十六进制）"
+        )
+    return runs_root() / run_id
+
+
+def new_run_id(*, day: str, hex_factory: Callable[[], str] | None = None) -> str:
+    """生成运行号 ``r-YYYYMMDD-xxxx``；与既有记录碰撞时重新抽取（Design §4.3）。
+
+    Args:
+        day: 日期部分（8 位数字，由调用方从注入时钟截取）。
+        hex_factory: 4 位小写十六进制生成器；省略时用 ``secrets.token_hex(2)``（可注入以复现碰撞）。
+    """
+    generator = hex_factory or (lambda: secrets.token_hex(2))
+    root = runs_root()
+    for _ in range(_RUN_ID_ATTEMPTS):
+        candidate = f"r-{day}-{generator().lower()}"
+        if not is_valid_run_id(candidate):
+            raise RunRecordError(f"运行号生成器给出非法编号：{candidate!r}")
+        if not (root / candidate).exists():
+            return candidate
+    raise RunRecordError("运行号生成失败：连续碰撞次数过多，请检查系统随机源。")
+
+
+def create_run_dir(run_id: str) -> Path:
+    """创建运行目录与工作区；目录已存在抛 ``FileExistsError``（编号碰撞由调用方重试）。"""
+    path = run_dir(run_id)
+    path.mkdir(parents=True, exist_ok=False)
+    (path / "workspace").mkdir()
+    return path
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """原子写文本：临时文件 ``.<名称>.tmp`` + 替换（Design §8.2，POSIX 尽力 0600）。
+
+    写入失败（含中断）不留半写目标文件，临时文件尽力清理。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def append_log_event(path: Path, event: Mapping[str, Any]) -> None:
+    """追加一条事件到 ``log.jsonl``（逐事件 append + flush，Design §8.2）。
+
+    只落盘 schema 声明的键（``ts`` / ``node`` / ``event`` / ``iteration`` / ``detail``）：
+    渲染层需要的附加信息（如运行号）不进入日志；``detail`` 只存截断预览。
+    """
+    record: dict[str, Any] = {
+        "ts": event.get("ts"),
+        "node": event.get("node"),
+        "event": event.get("event"),
+    }
+    if event.get("iteration") is not None:
+        record["iteration"] = event["iteration"]
+    if event.get("detail") is not None:
+        record["detail"] = _preview(event["detail"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def read_events(log_path: Path) -> list[dict[str, Any]]:
+    """读取事件流；空行与损坏行（含最后一条写一半的行）跳过（Design §8.2）。"""
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # 写一半的行 / 损坏行：不影响其余事件
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def read_state(run_path: Path) -> dict[str, Any] | None:
+    """读取 ``state.json``；缺失 / 损坏 / 顶层非对象返回 ``None``（调用方决定降级口径）。"""
+    return _read_json_object(run_path / "state.json")
+
+
+def read_rounds(run_path: Path) -> list[RoundReport]:
+    """逐轮读取 ``review_N.json`` 与配对的 ``fixes_N.json``（Design §4.5）。"""
+    workspace = run_path / "workspace"
+    rounds: list[RoundReport] = []
+    for path in _iter_dir(workspace):
+        match = _REVIEW_NAME_PATTERN.fullmatch(path.name)
+        if not match:
+            continue
+        review = _read_json_object(path)
+        if review is None:
+            continue
+        round_number = int(match.group(1))
+        fixes = _read_json_object(workspace / state_mod.fixes_file_name(round_number))
+        file_name = str(review.get("file") or state_mod.code_file_name(round_number))
+        rounds.append(
+            RoundReport(round_number=round_number, file_name=file_name, review=review, fixes=fixes)
+        )
+    return sorted(rounds, key=lambda item: item.round_number)
+
+
+def run_artifacts(run_path: Path) -> list[Path]:
+    """运行目录内可见产物（顶层文件 + 工作区文件，忽略临时文件与子目录）。"""
+    artifacts: list[Path] = []
+    for directory in (run_path, run_path / "workspace"):
+        artifacts.extend(
+            path
+            for path in _iter_dir(directory)
+            if path.is_file() and not path.name.startswith(".") and not path.name.endswith(".tmp")
+        )
+    return artifacts
+
+
+def list_runs(*, root: Path | None = None) -> list[RunSummary]:
+    """列出运行记录（按开始时间倒序）；非目录项 / 非法名称 / 临时文件一律忽略。
+
+    单条记录损坏不拖垮列表页：缺失字段按 Design §8.2 的降级派生链回退
+    （修复轮数 → 工作区版本文件数；残留严重数 → 最新可解析审查结论；状态 → 日志末条事件）。
+    """
+    directory = root if root is not None else runs_root()
+    summaries = [
+        _summarize(path)
+        for path in _iter_dir(directory)
+        if path.is_dir() and is_valid_run_id(path.name)
+    ]
+    summaries.sort(key=lambda item: (item.created_at, item.run_id), reverse=True)
+    return summaries
+
+
+def load_detail(run_id: str) -> RunDetail:
+    """按运行号加载完整记录；名称非法 / 记录不存在 / ``state.json`` 损坏抛 :class:`RunRecordError`。"""
+    path = run_dir(run_id)
+    if not path.is_dir():
+        raise RunRecordError(f"运行记录不存在：{run_id}（可用 crw runs 查看现有记录）")
+    state = read_state(path)
+    if state is None:
+        raise RunRecordError(
+            f"运行记录损坏：{path / 'state.json'} 不可读或不是 JSON 对象；"
+            f"可查看日志与产物：{path / 'log.jsonl'}"
+        )
+    return RunDetail(
+        summary=_summarize(path),
+        state=state,
+        events=tuple(read_events(path / "log.jsonl")),
+        rounds=tuple(read_rounds(path)),
+        artifacts=tuple(run_artifacts(path)),
+    )
+
+
+def parse_index(raw: str | None, count: int) -> int | None:
+    """序号输入 → 0-based 下标；空 / 取消 / 越界（含 0 与负数）返回 ``None``。
+
+    显式拒绝 0 与负数（``"0"`` 经 ``int(raw) - 1`` 会命中 Python 负索引取到最后一
+    项）；匹配用 ASCII 白名单而非 ``isdigit()``——上标数字等 ``isdigit()`` 为真而
+    ``int()`` 抛错，两者接受集不一致。
+    """
+    if raw is None or not _INDEX_PATTERN.fullmatch(raw) or not 1 <= int(raw) <= count:
+        return None
+    return int(raw) - 1
+
+
+def select_run(
+    runs: Sequence[RunSummary],
+    *,
+    ask: Callable[[str], str | None],
+    show: Callable[[str], None],
+) -> RunSummary | None:
+    """列表 + 数字选择；回车 / 取消 / 非法序号返回 ``None``（Design §6.2 #7 的选择 UX）。
+
+    Args:
+        runs: 候选运行记录（调用方已排序）。
+        ask: 读取用户输入（返回 ``None`` 表示取消 / EOF / 中断）；由命令面提供。
+        show: 输出一行候选或提示；由命令面提供。
+    """
+    for index, run in enumerate(runs, start=1):
+        show(f"  {index}. {run.run_id}  {run.created_at}  [{run.status}]  {run.input_summary}")
+    raw = ask("选择运行号序号（回车取消）：")
+    index = parse_index(raw, len(runs))
+    return None if index is None else runs[index]
+
+
+def is_stale_running(
+    state: Mapping[str, Any] | None, run_path: Path, *, now: float | None = None
+) -> bool:
+    """陈旧 ``running`` 判定（Design §8.2）：判据 = ``max(mtime(state.json), mtime(log.jsonl))``
+    超过 30 分钟。只用于展示标注，绝不自动改状态。"""
+    if not state or str(state.get("status") or "") != state_mod.STATUS_RUNNING:
+        return False
+    stamps: list[float] = []
+    for name in ("state.json", "log.jsonl"):
+        with contextlib.suppress(OSError):
+            stamps.append((run_path / name).stat().st_mtime)
+    if not stamps:
+        return False
+    reference = time.time() if now is None else now
+    return reference - max(stamps) > STALE_RUNNING_SECONDS
+
+
+def _summarize(path: Path) -> RunSummary:
+    """单条运行的摘要（含降级派生）；不抛异常——坏记录也要能在列表页出现。"""
+    state = read_state(path)
+    created_at = _state_str(state, "created_at") or _mtime_text(path)
+    input_descriptor = state.get("input") if state else None
+    input_summary = (
+        state_mod.summarize_input(input_descriptor)
+        if isinstance(input_descriptor, Mapping)
+        else "（记录损坏）"
+    )
+    status = _state_str(state, "status") or _infer_status(path)
+    fix_rounds = _state_int(state, "fix_rounds")
+    if fix_rounds is None:
+        fix_rounds = _count_code_versions(path)
+    residual: int | None = None
+    findings = state.get("findings") if state else None
+    if isinstance(findings, list):
+        residual = contracts.residual_severe(findings)
+    else:
+        residual = _latest_review_severe(path)
+    return RunSummary(
+        run_id=path.name,
+        created_at=created_at,
+        input_summary=input_summary,
+        status=status,
+        fix_rounds=fix_rounds,
+        residual_severe=residual,
+        path=path,
+        stale=is_stale_running(state, path),
+    )
+
+
+def _infer_status(path: Path) -> str:
+    """状态派生（state.json 不可读时）：日志末条事件推断，推断不出记 ``unknown``（Design §8.2）。"""
+    known = (
+        state_mod.STATUS_RUNNING,
+        state_mod.STATUS_SUCCESS,
+        state_mod.STATUS_RESIDUAL,
+        state_mod.STATUS_FAILED,
+        state_mod.STATUS_INTERRUPTED,
+    )
+    for event in reversed(read_events(path / "log.jsonl")):
+        kind = event.get("event")
+        if kind == "end" and event.get("node") == "engine":
+            detail = event.get("detail")
+            return detail if isinstance(detail, str) and detail in known else "unknown"
+        if kind in ("interrupt", "error"):
+            return state_mod.STATUS_FAILED
+    return "unknown"
+
+
+def _count_code_versions(path: Path) -> int | None:
+    versions = [
+        int(match.group(1))
+        for entry in _iter_dir(path / "workspace")
+        if (match := _CODE_NAME_PATTERN.fullmatch(entry.name))
+    ]
+    return max(versions) - 1 if versions else None
+
+
+def _latest_review_severe(path: Path) -> int | None:
+    rounds = read_rounds(path)
+    if not rounds:
+        return None
+    latest = max(rounds, key=lambda item: item.round_number)
+    findings = latest.review.get("findings")
+    return contracts.residual_severe(findings) if isinstance(findings, list) else None
+
+
+def _iter_dir(path: Path) -> list[Path]:
+    """目录内容（排序）；不可读 / 不存在时返回空表——列表页不因坏目录整体报错（Design §8.2）。"""
+    try:
+        return sorted(path.iterdir())
+    except OSError:
+        return []
+
+
+def _state_str(state: Mapping[str, Any] | None, key: str) -> str:
+    value = state.get(key) if state else None
+    return value if isinstance(value, str) and value else ""
+
+
+def _state_int(state: Mapping[str, Any] | None, key: str) -> int | None:
+    value = state.get(key) if state else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _mtime_text(path: Path) -> str:
+    """目录修改时间（created_at 缺失时的兜底，供列表排序与展示）。"""
+    with contextlib.suppress(OSError):
+        return (
+            datetime.datetime.fromtimestamp(path.stat().st_mtime)
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+    return ""
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    """读一个 JSON 对象；文件缺失 / 非 UTF-8 / 损坏 / 顶层非对象一律返回 ``None``。
+
+    解析复用 ``state.loads``（Design §3.1：解析归 state、文件 IO 归本模块），失败口径统一为
+    ``ValueError``（``JSONDecodeError`` 亦属其子类）。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        return state_mod.loads(text)
+    except ValueError:
+        return None
+
+
+def _preview(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) <= DETAIL_PREVIEW_CHARS:
+        return text
+    return f"{text[:DETAIL_PREVIEW_CHARS]}…（已截断）"

@@ -93,8 +93,8 @@ tests/
 
 - 依赖单向：`cli → session → workflow → agents → {llm, config, tools}`（会话模式）；一次性运行路径为 `cli → workflow → agents → {llm, config, tools}`。`render.py` 与 `session/` 仅被 cli 使用；编排节点经 `llm.py` 取模型（不新造调用栈）；任何下层不 import 上层。
 - 框架类型边界：LangGraph 图/状态类型不越出 `workflow/`（engine 对外暴露纯数据结构）；LangChain 消息/流对象不越出 `agents/runtime.py`（对上层只给字符串与普通数据）。
-- 状态载体（两层）：**运行态**——`StateGraph` 执行上下文是单轮运行状态的**唯一载体**（由框架托管）；**会话态**——跨轮存活的会话状态（轮次链、当前设置、各 Agent 记忆索引）由 `session/state.py` 定义、会话层持有并落盘，engine 不感知会话态。下述"不维护第二份内存正本"专指运行态。engine 只做生命周期——构建初始状态、engine 只做生命周期——构建初始状态、驱动图执行、把节点边界状态导出为快照（state.json）、落日志、生成报告与退出码。
-- 节点协议：节点为纯函数 `node(state) -> dict`（契约型节点可带 `retry_feedback: str | None = None`）——只读所需字段、只返回要更新的字段；禁止落盘、禁止直接打印/写日志（过程输出经 runtime 回调转成事件与渲染输入）；契约校验、重试与 `clean` 判定由 workflow 层的包装完成（agents 只负责产出），条件路由为只读 state 的纯函数。
+- 状态载体（两层）：**运行态**——`StateGraph` 执行上下文是单轮运行状态的**唯一载体**（由框架托管）；**会话态**——跨轮存活的会话状态（轮次链、当前设置、各 Agent 记忆索引）由 `session/state.py` 定义、会话层持有并落盘，engine 不感知会话态。下述"不维护第二份内存正本"专指运行态。engine 只做生命周期——构建初始状态、驱动图执行、把节点边界状态导出为快照（state.json）、落日志、生成报告与退出码。
+- 节点协议：节点为纯函数 `node(state) -> dict`（契约型节点可带 `retry_feedback: str | None = None`）——只读所需字段、只返回要更新的字段；禁止落盘、禁止直接打印/写日志（过程输出经 runtime 回调转成事件与渲染输入）；契约校验、重试与 `clean` 判定由 workflow 层的包装完成（agents 只负责产出），条件路由为只读 state 的纯函数。节点产出的原始文本经**暂存键**交回包装层（encode → `code_text`、review → `review_text`、fix → `fix_text`）：暂存键不在状态 schema 内，由包装层消费后不进入运行记录；阶段摘要由引擎按产物与契约结论自算（抽取 / 落盘见 §4.2.1）。
 - 持久化职责切分：`state.py` = schema 与纯序列化/反序列化；`records.py` = 文件 IO（原子写、列表、加载、选择、结构自检）；`engine.py` = 组织时序（何时调用 records）；节点不接触文件。
 
 ## 4. 工作流设计
@@ -132,9 +132,9 @@ flowchart TD
 
 - **输出格式固定**：编码 Agent = 恰好一个 ```python 围栏（全部代码合并到**单个 Python 文件**，单文件硬约束）+ 围栏外简要说明；修复 Agent = 恰好一个 ```python 围栏 + 恰好一个 ```json fixes 围栏 + 围栏外说明。
 - **落盘执行者**：抽取与落盘在 workflow 包装层 / engine 完成（节点只返回文本与结构化数据，自身不落盘）。
-- **抽取规则（Markdown 语义）**：围栏闭合需同长或更长、语言标签 `python` / `py` 不区分大小写；按上述围栏数与顺序抽取（修复场景取第一个 python 围栏与第一个 json 围栏，其余围栏忽略并记 log）；围栏数不符或内容为空 → 附重试反馈重试一次 → 仍失败按节点失败。
-- **落盘顺序（原子）**：先写 `workspace/code_v(N+1).py`（临时文件 + 替换），再更新 `state.current_code`；失败不产生半写文件。
-- **`-f` 输入**：由 CLI 复制为 `workspace/code_v1.py`（原始路径记入 `input.source_path`，报告标注"原文件名 → 工作区名"映射）。
+- **抽取规则（Markdown 语义）**：围栏闭合需同长或更长、语言标签 `python` / `py` 不区分大小写；编码场景要求**恰好一个** python 围栏，修复场景**取第一个** python 围栏与**第一个** json 围栏、其余围栏忽略并记 log（计入该轮阶段摘要）；**缺少必需围栏**或内容为空 → 附重试反馈重试一次 → 仍失败按节点失败。
+- **落盘顺序（原子）**：先写 `workspace/code_v(N+1).py`（临时文件 + 替换），再写该轮处置 `workspace/fixes_N.json`（N = 修复轮次，与 `review_N.json` 按 finding id 配对），最后更新 `state.current_code`；失败不产生半写文件。
+- **`-f` 输入**：由 CLI 读取、按代码文本标准化（去首尾空行、统一以单个换行结尾）后落 `workspace/code_v1.py`（原始路径记入 `input.source_path`，报告标注"原文件名 → 工作区名"映射）；标准化保证版本间"逐字节相同"的比较口径一致。
 - **修复验证**：修复 Agent 的 `run_python` 使用内联 `code=<候选代码>` 执行（不依赖未落盘文件）；`--no-exec` 下跳过验证并在报告标注。
 
 ### 4.3 状态 schema
@@ -173,7 +173,7 @@ Finding：
 ### 4.4 分支与循环语义
 
 - **干净判定**：本轮 findings 中【严重】数为 0（`--strict`：严重与一般均为 0）。
-- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为硬闸，防止误填大值造成无界循环与无界调用费用（默认 3、封顶 10 时最坏约 22 次模型调用）。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1）。engine 在图调用处显式设置 `recursion_limit = 2 × max_iter + 8` 作崩溃护栏（公式按串行默认图；扩展 / 并行时须按节点与边数复算，见 §12.2），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 报告标注"未收敛"，但不提前中止。
+- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为硬闸，防止误填大值造成无界循环与无界调用费用（默认 3、封顶 10 时最坏约 22 次模型调用）。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1；`--strict` 下残留可能全部由【一般】构成，故报告与终端文案统一写"阻塞问题"，"残留严重数"列仍只数【严重】）。engine 在图调用处显式设置 `recursion_limit = 2 × max_iter + 8` 作崩溃护栏（公式按串行默认图；扩展 / 并行时须按节点与边数复算，见 §12.2），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 报告标注"未收敛"，但不提前中止（标注落地排期 M3）。
 - **轮次模式**：`up-to`（默认）= 至多 n 轮修复、任一复审干净即早退（首审干净则不进入修复）；`exact` = 固定跑满 n 轮修复 + n+1 次审查，即使中途干净也继续（"精益求精"场景）。两种模式**结尾恒为一次审查**，因此不存在"已修复但未审查"的收尾状态；`exact` 下若某轮修复与上版逐字节相同，按 §4.2 标注"本轮未产生改动"后继续。
 - **轮次取值来源与优先级**：命令行 `--max-iter`/`--rounds-mode`（显式）> 本次用户消息的结构化提取值（会话模式，§5.4）> 配置默认（`~/.crw/settings.json`，§8.3）> 内置 3 / `up-to`；全部受硬上限约束，来源记入 `max_iterations_source`。越界语义分开：**命令行越界 = 参数错误（退出码 2）**；**消息提取值越界 = 夹到上限执行并在报告与时间线标注**（那是意图理解）。
 - **早退**：`up-to` 模式下首轮审查即干净 → 直接收尾，不进入修复。
@@ -191,7 +191,8 @@ Finding：
     ├── code_v1.py       # 各版本代码（保留全部历史版本）
     ├── code_v2.py
     ├── review_1.json    # 各轮审查结论（结构化）
-    └── review_2.json
+    ├── review_2.json
+    └── fixes_1.json     # 各轮修复处置（逐条对应 findings id，与 review_N.json 配对）
 ```
 
 - 报告结构：运行摘要（输入 / 模型 / 状态 / 审查与修复次数）→ 时间线（节点事件表）→ 逐轮问题清单（标题固定为"第 i 轮审查（基于 `code_v{i}.py`）"，含"问题 ← 处置"对照）→ 产物清单与路径（`-f` 输入标注"原文件名 → 工作区名"映射）。
@@ -255,8 +256,9 @@ Finding：
 ```
 
 - **校验规则**：顶层为对象；`iteration` = 本次审查序号（= `review_round`，1-based）；`code_version` = 当前版本号且 `file` = `code_v{code_version}.py`；`findings` 为数组（**可为空** = 本轮无问题，进入 clean 判定）；逐条：severity 枚举、location / issue 非空字符串、suggestion 字符串（可空）、uncertain 缺省补 false、`id` 由校验层按序生成；`summary` 缺省补 ""；未知字段忽略并原样保留；校验失败 → 附错误清单重试一次。
-- **执行有效性门禁**：本轮须有至少一次成功工具事件（或内联送达记录）；`findings` 为空时 `summary` 不得为空串——否则视为"审查未执行"，重试一次 / 按节点失败（防"空数组即通过"逃逸）。
-- **重试接缝**：包装层经 `node(state, *, retry_feedback=None)` 回传错误清单（节点协议见 §3.1）；重试前 engine 发 `event=retry`，第二次模型输出的正文增量只进 log、不重复渲染。
+- **执行有效性门禁**：本轮须有至少一次成功工具事件（或内联送达记录）；`findings` 为空时 `summary` 不得为空串——否则视为"审查未执行"，重试一次 / 按节点失败（防"空数组即通过"逃逸）。工具事件的判定随 M2 的 Agent 运行时接入（M1 假节点以"契约文本即内联送达记录"满足该门禁）。
+- **权威字段的缺失与不符**：`iteration` / `code_version` / `file` 缺失时由校验层补权威值；给出但与权威值不符即违规（防模型自报版本号错位）。
+- **重试接缝**：包装层经 `node(state, *, retry_feedback=None)` 回传错误清单（节点协议见 §3.1）；重试前 engine 发 `event=retry`，第二次模型输出的正文增量只进 log、不重复渲染。重试不计审查轮次。
 
 修复 Agent 的输出契约（与代码围栏并列的 ```json 围栏）：
 
@@ -382,17 +384,18 @@ crw --version                             # 版本号
 
 | 命令 | 0 | 1 | 2 |
 |------|---|---|---|
-| `crw run` / `crw resume` | 完成且干净 | 达限残留（仍有【严重】） | 运行错误（参数 / 配置 / 模型调用失败等，含顶层兜底） |
+| `crw run` / `crw resume` | 完成且干净 | 达限残留（仍有阻塞问题：默认【严重】，`--strict` 含【一般】） | 运行错误（参数 / 配置 / 模型调用失败等，含顶层兜底） |
 | `crw review` | 完成 | 仅 `--json` 模式：存在【严重】 | 运行错误 |
 | `crw config test` | 全部 OK | 存在失败 | 配置错误 |
+| `crw runs` / `crw show` | 列表 / 详情输出完成（无记录时 `runs` 仍为 0） | — | `show`：记录不存在 / 记录损坏 / 取消选择 |
 | `crw chat` | 会话正常结束且最后一轮干净 | 最后一轮达限残留 | 最后一轮运行错误 / 被中断，或会话异常退出 |
 
 ### 8.2 运行记录格式
 
 - `state.json`：§4.3 状态快照（含 input / review_round / fix_rounds / status / error / history / parent_run_id / strict）。
-- `log.jsonl`：每行一个事件 `{"ts", "node", "event", "iteration"?, "detail"?}`；event ∈ start / end / tool / retry / error。
+- `log.jsonl`：每行一个事件 `{"ts", "node", "event", "iteration"?, "detail"?}`；event ∈ start / end / tool / retry / error / interrupt（`node` 覆盖 encode / review / fix 与引擎级事件 `engine`）。
 - `report.md`：§4.5 报告结构。
-- `review_N.json`：schema = §5.2 契约对象；原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / review）先、`state.json` 后（防状态引用未落盘的结论）。
+- `review_N.json`：schema = §5.2 契约对象；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
 - 写入与自检：临时文件 `.<名称>.tmp` + `os.replace` 原子替换（POSIX 尽力 0600）；列表 / 加载忽略 `*.tmp` 与非目录项；运行目录名白名单校验（`r-` 前缀，防路径穿越）；`log.jsonl` 读取时跳过最后一条不完整行、`detail` 只存截断预览（约 400 字符）；`state.json` 在每个节点结束与失败时各原子写一次（引入并行分支后改为图超级步边界，同一超级步只写一次）；`state.json` 损坏时 `crw show` 降级展示 `log.jsonl` 摘要 + 产物清单 + 可读提示；`status=running` 且长时间无更新（判据 = `max(mtime(state.json), mtime(log.jsonl))` 超过 30 分钟；log 逐事件 append + flush）→ 列表 / 展示标注"可能已中断"（不自动改状态）。
 - 会话相关：`session.json`（会话档案）/ `session.md`（会话总报告）/ `memory/<agent>.jsonl`（按 Agent 记忆）见 §4.7；会话轮次的 `state.json` 额外含 `session_id` / `round_index`；`status` 增 `interrupted`（被中断的本轮，`error.node="interrupt"`）；`crw runs` 跨 `runs/` 与 `sessions/*/rounds/` 两处聚合，会话列取自 `session_id`。
 - runs 列表降级派生（单条坏记录不拖垮列表页）：修复轮数 = `state.fix_rounds` → workspace 中 `code_v*.py` 数 − 1 → "?"；残留严重数 = `state.findings` 计数 → 最新可解析 `review_N.json` 计数 → "?"；状态 = `state.status` → `log.jsonl` 末条 event 推断 → unknown。
