@@ -1,14 +1,15 @@
 """终端渲染管线：行级流式、分级着色与节点阶段展示。
 
-渲染输入由工作流事件驱动（节点开始 / 工具边界 / 重试 / 清单分区 / 节点结束），
-不依赖框架的流式元数据；仅命令面使用本模块（Design §3.1、§8.4）。
+渲染输入由工作流事件驱动（节点开始 / 工具边界 / 重试 / 清单分区 / 节点结束），不依赖框架
+的流式元数据；仅命令面使用本模块（Design §3.1、§8.4）。
 
-M1 为简版渲染：阶段标题 + 事件行 + 清单分区（结论与清单走 stdout，过程叙述走 stderr，
-Design §8.4）；行级流式与分级着色管线（复用矩阵 #6）随 M2/M3 接入，接口不变。
+输出通道（§8.4）：结论 / findings 清单 / 报告走 stdout；模型正文与过程叙述、错误走 stderr。
+``--no-stream`` 时模型正文按阶段缓存、于阶段结束时整体输出（Design §8.1）。
 """
 
 from __future__ import annotations
 
+import datetime
 import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,9 @@ from .workflow import records as records_mod
 from .workflow import state as state_mod
 
 _RULE_WIDTH = 52
+
+#: ``crw review`` 内联审查的单文件行数上限（超出部分不进提示词，并在提示词中明示）
+REVIEW_PROMPT_MAX_LINES = 2000
 
 
 def display_width(text: str) -> int:
@@ -52,11 +56,24 @@ def ask_user(prompt: str) -> str | None:
 
 
 class RunRenderer:
-    """运行过程渲染器：实现引擎的观察者接口（Design §6.2 #6 的阶段序列）。"""
+    """运行过程渲染器：实现引擎的观察者接口（Design §6.2 #6 的阶段序列）。
 
-    def __init__(self, *, out: TextIO | None = None, err: TextIO | None = None) -> None:
+    Args:
+        stream: 是否流式输出模型正文。``False``（``crw run --no-stream``）时按节点缓存
+            正文，于该阶段结束时整体输出。
+        out / err: 输出流；缺省 stdout / stderr。
+    """
+
+    def __init__(
+        self, *, stream: bool = True, out: TextIO | None = None, err: TextIO | None = None
+    ) -> None:
         self._out = out if out is not None else sys.stdout
         self._err = err if err is not None else sys.stderr
+        self.stream = stream
+        self._buffer: list[str] = []
+        self._buffer_node = ""
+        self._suppress_text = False
+        self._line_open = False
 
     def on_event(self, event: Mapping[str, Any]) -> None:
         """按事件类型输出：开始头行与阶段行 / 重试 / 工具 / 错误 / 中断。"""
@@ -66,22 +83,72 @@ class RunRenderer:
         text = "" if detail is None else str(detail)
         if node == "engine" and kind == "start":
             run_id = str(event.get("run_id") or "?")
-            _write(self._err, f"── 运行 {run_id} " + "─" * _RULE_WIDTH)
-            _write(self._err, f"[输入] {text}")
+            self._line(f"── 运行 {run_id} " + "─" * _RULE_WIDTH)
+            self._line(f"[输入] {text}")
         elif node == "engine":
             return  # 收尾结论由命令面经 render_result 渲染
         elif kind == "start":
             return  # 阶段标题由对应的结束事件给出
         elif kind == "end":
-            _write(self._err, f"[{engine_mod.node_label(node)}] {text}")
+            self.flush_text()
+            self._suppress_text = False
+            self._line(f"[{engine_mod.node_label(node)}] {text}")
         elif kind == "retry":
-            _write(self._err, f"[{engine_mod.node_label(node)}] 重试：{text}")
+            # Design §4.6：重试的第二次模型输出不重复渲染正文，只给一行提示
+            self.discard_text()
+            self._suppress_text = True
+            self._line(f"[{engine_mod.node_label(node)}] 重试：{text}")
         elif kind == "tool":
-            _write(self._err, f"[{engine_mod.node_label(node)}] 工具：{text}")
+            self._line(f"[{engine_mod.node_label(node)}] 工具：{text}")
         elif kind == "error":
-            _write(self._err, f"[{engine_mod.node_label(node)}] 错误：{text}")
+            self.flush_text()
+            self._suppress_text = False
+            self._line(f"[{engine_mod.node_label(node)}] 错误：{text}")
         elif kind == "interrupt":
-            _write(self._err, f"[{engine_mod.node_label(node)}] {text}")
+            self.flush_text()
+            self._suppress_text = False
+            self._line(f"[{engine_mod.node_label(node)}] {text}")
+
+    def on_delta(self, node: str, text: str) -> None:
+        """模型正文增量：流式直接输出；``--no-stream`` 时按节点缓存到阶段结束。
+
+        契约重试后再来的正文不再渲染：前一次输出已经流出去过，把重试的正文再渲染一遍只会
+        让用户看到两段重复叙述（Design §4.6 的重试语义）；非流式下重试阶段的缓存同样丢弃。
+        """
+        if self._suppress_text:
+            return
+        if self.stream:
+            _write_raw(self._err, text)
+            self._line_open = not text.endswith("\n")
+            return
+        if node != self._buffer_node:
+            # 换节点前先把上一段缓存吐出去：少了 end 事件时也不至于把正文丢掉
+            self.flush_text()
+            self._buffer_node = node
+        self._buffer.append(text)
+
+    def flush_text(self) -> None:
+        """把缓存的模型正文整体输出（阶段结束 / 出错前的收尾）。"""
+        if not self._buffer:
+            return
+        text = "".join(self._buffer).strip("\n")
+        self._buffer = []
+        if text:
+            self._line(text)
+
+    def _line(self, text: str) -> None:
+        """输出一整行：上一次若是未以换行收尾的流式正文，先补一个换行。
+
+        模型正文不一定以换行结束（实测存在），不补的话阶段行会粘在正文尾部。
+        """
+        if self._line_open:
+            self._err.write("\n")
+            self._line_open = False
+        _write(self._err, text)
+
+    def discard_text(self) -> None:
+        """丢弃缓存的正文（契约重试时前次输出不再渲染）。"""
+        self._buffer = []
 
     def on_review(
         self,
@@ -325,3 +392,52 @@ def _input_line(state: Mapping[str, Any]) -> str:
 def _write(stream: TextIO, text: str) -> None:
     print(text, file=stream)
     stream.flush()
+
+
+def _write_raw(stream: TextIO, text: str) -> None:
+    """原样写出（不经 print 的换行与转义），用于流式模型正文。"""
+    stream.write(text)
+    stream.flush()
+
+
+def review_json_report(merged: Mapping[str, Any]) -> str:
+    """``crw review --json`` 的 Markdown 报告（``-o`` 与 ``--json`` 可同时使用）。"""
+    stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["# crw 审查报告", "", f"> 生成时间：{stamp}（--json 模式）", ""]
+    for entry in merged.get("files") or []:
+        lines += [f"## {entry['file']}", "", f"**整体评价**：{entry['summary']}", ""]
+        for finding in entry.get("findings") or []:
+            uncertain = "（不确定）" if finding.get("uncertain") else ""
+            lines += [
+                (
+                    f"- **【{finding.get('severity') or '未分级'}】** "
+                    f"`{finding.get('location') or '（未定位）'}` — "
+                    f"{finding.get('issue') or ''}{uncertain}"
+                ),
+                f"  修改建议：{finding.get('suggestion') or '（无）'}",
+            ]
+        lines.append("")
+    # 单文件时顶层 summary 与 files[0].summary 同文，跳过"总体评价"段避免重复；
+    # 无可用结果（files 为空）时该段是唯一承载结论的地方，必须保留
+    if len(merged.get("files") or []) != 1:
+        lines += ["## 总体评价", "", str(merged.get("summary") or ""), ""]
+    return "\n".join(lines)
+
+
+def review_text_report(files: Sequence[tuple[str, str]], answers: Sequence[str | None]) -> str:
+    """非 ``--json`` 模式的 Markdown 报告：结论原文嵌入（本身即 Markdown）。
+
+    ``answers`` 与 ``files`` 逐位对齐，``None`` 表示该文件审查失败（保留标题并标注缺章）。
+    按位置对齐而非按显示名查表：同名的两个路径不会互相覆盖结论，标题清单与正文恒一致。
+    """
+    stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# crw 审查报告",
+        "",
+        f"> 生成时间：{stamp}",
+        f"> 审查对象：{', '.join(name for name, _ in files)}",
+        "",
+    ]
+    for (display_name, _), answer in zip(files, answers, strict=True):
+        lines += [f"## {display_name}", "", answer or "[该文件审查失败，结论不可用]", ""]
+    return "\n".join(lines)

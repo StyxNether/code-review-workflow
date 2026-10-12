@@ -206,7 +206,7 @@ Finding：
 - 审查契约校验失败：附错误清单重试一次（重试的第二次模型输出不重复渲染正文——前次输出仅进 log，`event=retry`；重试不计审查轮次）；仍失败按节点失败处理。
 - 落盘失败（state / log / report）：按运行失败处理（`status=failed`、退出码 2），stderr 给出可读原因与已保留产物路径；report 生成失败时退出码 2 并指向 state.json；`--out` 复制失败不影响运行结论（stderr 警示，退出码仍按运行状态）。
 - 中断（Ctrl+C）：写盘序列 = log 追加 interrupt 事件 → 原子写 `state.json`（`status=failed`、`error.node="interrupt"`、finished_at）→ 退出码 2；第二次 Ctrl+C 放弃写盘（"尽力"语义）。
-- 任务级预算护栏（M2）：单节点请求的 token / 字符估算超阈值（`CRW_MAX_CONTEXT_TOKENS`，默认 100000）→ 停止工具 + 注入收尾指令（保留已达结论并标注可能不完整）；模型端 `context_length` 类 400 → 可读中文报错（建议分段审查或改用更大窗口模型）。
+- 任务级预算护栏：单节点请求的 token / 字符估算超阈值（`CRW_MAX_CONTEXT_TOKENS`，默认 100000）→ 停止工具 + 注入收尾指令（保留已达结论并标注可能不完整；工具轮次上限同机制，触达事实并入阶段摘要进 log 与时间线）；模型端 `context_length` 类 400 → 可读中文报错（建议分段审查或改用更大窗口模型）。
 - 恢复：`crw resume`（Should）；失败运行的诊断信息在 `crw show` 中可见。
 
 ### 4.7 会话目录与产物（会话模式）
@@ -256,7 +256,7 @@ Finding：
 ```
 
 - **校验规则**：顶层为对象；`iteration` = 本次审查序号（= `review_round`，1-based）；`code_version` = 当前版本号且 `file` = `code_v{code_version}.py`；`findings` 为数组（**可为空** = 本轮无问题，进入 clean 判定）；逐条：severity 枚举、location / issue 非空字符串、suggestion 字符串（可空）、uncertain 缺省补 false、`id` 由校验层按序生成；`summary` 缺省补 ""；未知字段忽略并原样保留；校验失败 → 附错误清单重试一次。
-- **执行有效性门禁**：本轮须有至少一次成功工具事件（或内联送达记录）；`findings` 为空时 `summary` 不得为空串——否则视为"审查未执行"，重试一次 / 按节点失败（防"空数组即通过"逃逸）。工具事件的判定随 M2 的 Agent 运行时接入（M1 假节点以"契约文本即内联送达记录"满足该门禁）。
+- **执行有效性门禁**：本轮须有至少一次成功工具事件（或内联送达记录）；`findings` 为空时 `summary` 不得为空串——否则视为"审查未执行"，重试一次 / 按节点失败（防"空数组即通过"逃逸）。工具事件的判定由审查节点交回的 `review_evidence`（本轮成功工具事件数 > 0）实现；`crw review` 的内联送达与不接工具的注入桩按"内联送达记录"视为满足该门禁。
 - **权威字段的缺失与不符**：`iteration` / `code_version` / `file` 缺失时由校验层补权威值；给出但与权威值不符即违规（防模型自报版本号错位）。
 - **重试接缝**：包装层经 `node(state, *, retry_feedback=None)` 回传错误清单（节点协议见 §3.1）；重试前 engine 发 `event=retry`，第二次模型输出的正文增量只进 log、不重复渲染。重试不计审查轮次。
 
@@ -429,7 +429,7 @@ crw --version                             # 版本号
 ### 9.1 可测试性接缝（pytest 约定）
 
 - 数据目录重定向：配置与运行记录的根目录均经 `CRW_HOME` 解析（默认 `~/.crw`；`config_path()` 与 records 同源）；conftest 统一指向 `tmp_path`，测试不写真实用户目录。
-- 注入接口：run_id 生成器与时钟由 engine 构造参数注入（默认实现 + 测试固定值，保证可断言）；`workflow/graph.py` 的 `build_graph(nodes=…)` 接受节点覆盖表——M1 假节点与 M2 真实节点共用该接缝；模型注入沿用既有 `model=` 注入模式并由 runtime 暴露。
+- 注入接口：run_id 生成器与时钟由 engine 构造参数注入（默认实现 + 测试固定值，保证可断言）；`workflow/graph.py` 的 `build_graph(nodes=…)` 接受节点覆盖表——脚本化假节点与真实 Agent 节点共用该接缝（缺省装配由引擎经 `agents.build_nodes` 给出，覆盖表逐键替换）；模型注入沿用既有 `model=` 注入模式并由 runtime 暴露。
 - 网络闸门：conftest 阻断 socket 兜底"禁真实网络"（LLM 一律 mock）。
 - 事件断言：以 `log.jsonl` 行与 `state.json` 快照为断言对象（行为级）。
 
@@ -490,7 +490,7 @@ crw --version                             # 版本号
 
 1. **加状态字段**（如需要）：改 `workflow/state.py`，并同步本 §4.3 表格；
 2. **写节点函数**：`def my_node(state) -> dict`——只读所需字段、只返回要更新的字段；禁止落盘 / 打印（过程输出走 runtime 回调）；
-3. **注册到图**：在 `workflow/graph.py` 的 `build_graph(*, nodes: Mapping[str, Callable] | None = None)` 中加节点与边；`nodes` 为"节点名 → 函数"的覆盖表（逐键替换、未给的键用缺省装配：M1 假实现 / M2 起真实实现），测试与假实现注入走同一入口；
+3. **注册到图**：在 `workflow/graph.py` 的 `build_graph(*, nodes=…, defaults=…)` 中加节点与边；`nodes` 为"节点名 → 函数"的覆盖表（逐键替换），`defaults` 为缺省装配（生产路径 = `agents.build_nodes(runtime)` 的真实 Agent 节点，测试 = 脚本化假节点）；两者都缺时显式报错，不静默少接节点；
 4. **并行 / 扇出**：同一超级步的多写者必须二选一——① reducer（仅用于需**跨轮累积**的字段，如 `history`；注意其累积语义，快照测试须排序断言）；② **"独立 key + 汇合节点"（按轮替换语义的字段一律此法：汇合节点显式覆盖、无条件写，未运行分支的旧值不得残留）**。两分支的 findings id 由汇合节点统一重编号，去重键 `(location, issue)` 取较严重者；不变量 `review_round == fix_rounds + 1` 调整为"每轮审查汇合完成时"成立；`recursion_limit` 须按新图节点 / 边数复算。否则 LangGraph 运行时会抛 `InvalidUpdateError` 或污染状态；
 5. **涉及模型**：复用 `agents/runtime.py` 装配（不新造调用栈）；产出必须定义契约并在 `workflow/contracts.py` 注册校验（含重试规则）；
 6. **条件路由**：写成只读 state 的纯函数；`clean` 判定等派生逻辑放 workflow 层；
@@ -502,6 +502,6 @@ crw --version                             # 版本号
 
 ### 12.3 Backlog（未决功能池，新功能想法先入池再排期）
 
-并行多视角审查（若未在 M3 落地）；运行对比与审阅历史 diff；运行记录与 `.crw/sessions` 容量策略（保留上限 / 清理）；`~/.cra/models.json` 导入（若未在 M3 落地）；Web 编排界面（评估）；多文件工作流与多语言审查扩展；跨会话长期记忆（当前语义为"记忆随会话存续、新会话从零开始"，见 §4.7 / D12）；会话内的并行审查（会话层就绪后评估）。
+并行多视角审查（若未在 M3 落地）；运行对比与审阅历史 diff；环境变量侧的供应商泛化（`CRW_API_KEY` / `CRW_PROVIDER`：当前 env 回退路径固定按 DeepSeek 变量名取 key）；`~/.crw/models.json` 中 `base_url` 的严格校验（要求可解析出主机名，收紧"key 串用"检测的假阴性）；运行记录与 `.crw/sessions` 容量策略（保留上限 / 清理）；`~/.cra/models.json` 导入（若未在 M3 落地）；Web 编排界面（评估）；多文件工作流与多语言审查扩展；跨会话长期记忆（当前语义为"记忆随会话存续、新会话从零开始"，见 §4.7 / D12）；会话内的并行审查（会话层就绪后评估）。
 
 > **出池记录（2026-10-12）**：**轮次指定增强**已定稿并进入规格正文——轮次模式与来源优先级见 §4.4、会话意图与参数契约见 §5.4、配置项见 §8.3；**会话模式**已立项（D12），落 M4，不再留在未决池。

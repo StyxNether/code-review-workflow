@@ -209,7 +209,7 @@ def new_state(
         input_descriptor: 输入描述（requirement / file）。
         workspace: 运行工作区绝对路径（产物落盘根）。
         max_iterations: 修复轮次上限；``max_iterations_source`` 记录其来源。
-        model: 本次运行的模型标识（M1 为内置假节点标识）。
+        model: 本次运行的模型标识（``供应商/模型名``，Design §4.3）。
         created_at: 开始时间戳（ISO 8601，由注入时钟给出）。
         rounds_mode: 轮次语义（M1 恒为 up-to，exact 随 M4 落地）。
         strict: 是否启用加严干净判定（Design §4.4）。

@@ -8,9 +8,11 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import fakes
 import pytest
 from support import read_sample, sample_path
 
+from crw import config as config_mod
 from crw.workflow import contracts, records
 from crw.workflow import engine as engine_mod
 from crw.workflow import state as state_mod
@@ -87,8 +89,15 @@ def severe_finding(issue: str = "除零风险", location: str = "code_v1.py:5") 
 def make_engine(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str], **kwargs: Any
 ) -> engine_mod.WorkflowEngine:
+    """构造引擎：**恒注入**脚本化假节点整表（生产缺省装配是真实 Agent 节点，需模型与网络）。
+
+    ``nodes`` 逐键并入假节点整表，用例只需给出关心的一两个键；本 helper 不支持"完全不注入"
+    ——要跑真实装配请直接构造 ``WorkflowEngine``（那是 CLI 路径，由 test_cli 覆盖）。
+    """
     kwargs.setdefault("clock", fixed_clock)
     kwargs.setdefault("run_id_factory", run_id_sequence)
+    overrides = dict(kwargs.pop("nodes", None) or {})
+    kwargs["nodes"] = {**fakes.SCRIPTED_NODES(), **overrides}
     return engine_mod.WorkflowEngine(**kwargs)
 
 
@@ -817,11 +826,16 @@ def test_max_iterations_source_is_recorded_verbatim(
 def test_run_request_records_labels_for_future_milestones(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """会话字段与模型标识按入参写入（M1 不实现会话，但记录结构须可扩展，Design §4.7）。"""
+    """会话字段与模型标识按入参写入（会话未实现，但记录结构须可扩展，Design §4.7）。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(
         engine_mod.RunRequest(
             requirement="写一个计算器",
-            model_label="some-provider/some-model",
+            resolved=config_mod.ResolvedModel(
+                model="some-model",
+                base_url="https://example.invalid/v1",
+                api_key="placeholder-key",
+                provider="some-provider",
+            ),
             parent_run_id="r-20261011-0001",
             session_id="s-20261012-0001",
             round_index=2,
@@ -917,3 +931,49 @@ def test_clean_stage_line_mentions_advice_only_when_present(
     )
     assert "建议不影响判定" not in plain_review["summary"]
     assert "建议不影响判定" in advice_review["summary"]
+
+
+# ---- 护栏触达信息并入阶段摘要 / 失败原因（Design §4.6）----
+
+
+def test_notices_are_appended_to_the_stage_summary() -> None:
+    assert engine_mod._append_notices("第 1 轮：0 严重", ["工具调用已达上限（1 轮）"]) == (
+        "第 1 轮：0 严重（工具调用已达上限（1 轮），结论可能不完整）"
+    )
+
+
+def test_no_notices_leaves_the_summary_untouched() -> None:
+    assert engine_mod._append_notices("第 1 轮：0 严重", []) == "第 1 轮：0 严重"
+
+
+def test_the_runtime_is_rebuilt_for_every_run(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """同一引擎实例被复用执行两次时，运行时按请求重建（不串用上次的模型 / no_exec / 上下文根）。"""
+    built: list[str] = []
+
+    class _StubRuntime:
+        def run(self, **kwargs: Any) -> Any:
+            raise RuntimeError("stub 运行时：本用例只验证装配是否重建")
+
+        def drain_notices(self) -> list[str]:
+            return []
+
+    def factory(emit: Any, delta: Any) -> Any:
+        built.append("built")
+        return _StubRuntime()
+
+    # 只覆盖编码节点 → 审查 / 修复走缺省装配，必然经运行时工厂（make_engine 会注入整表，故此处直接构造）
+    engine = engine_mod.WorkflowEngine(
+        nodes={"encode": fakes.fake_encode},
+        runtime_factory=factory,
+        clock=fixed_clock,
+        run_id_factory=run_id_sequence,
+    )
+
+    first = engine.execute(engine_mod.RunRequest(requirement="写一个计算器"))
+    second = engine.execute(engine_mod.RunRequest(requirement="写一个计算器"))
+
+    assert first.exit_code == engine_mod._EXIT_ERROR
+    assert second.exit_code == engine_mod._EXIT_ERROR
+    assert len(built) == 2  # 第二次运行没有复用第一次的运行时

@@ -267,6 +267,103 @@ def judge_clean(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) 
     return blocking_count(findings, strict=strict) == 0
 
 
+# ---- crw review 的报告契约（前作 files[] 形态，Design §6.4）----
+
+
+def review_report_errors(data: Any) -> list[str]:
+    """``crw review --json`` 报告的 schema 校验；返回错误清单（空 = 通过）。
+
+    沿用前作的 ``files[]`` 形态（Design §6.4：保持既有消费方式）：顶层
+    ``{"files": [{file, findings, summary}], "summary"}``。**会就地补全** ``uncertain``
+    缺省值（`False`）——本函数既校验也归一，调用方拿到的是补全后的同一对象；``files``
+    为空是唯一允许的空数组例外（表示"没有可用的审查结果"，由
+    :func:`merge_review_reports` 产出，不是模型输出）。
+    """
+    if not isinstance(data, dict):
+        return ["顶层必须是 JSON 对象"]
+    files = data.get("files")
+    if not isinstance(files, list) or not files:
+        return ["files 必须是非空数组"]
+    errors: list[str] = []
+    for index, entry in enumerate(files):
+        where = f"files[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{where} 必须是对象")
+            continue
+        if not isinstance(entry.get("file"), str) or not entry.get("file"):
+            errors.append(f"{where}.file 必须是非空字符串")
+        if not isinstance(entry.get("summary"), str):
+            errors.append(f"{where}.summary 必须是字符串")
+        findings = entry.get("findings")
+        if not isinstance(findings, list):
+            errors.append(f"{where}.findings 必须是数组")
+            continue
+        for item_index, finding in enumerate(findings):
+            item_where = f"{where}.findings[{item_index}]"
+            if not isinstance(finding, dict):
+                errors.append(f"{item_where} 必须是对象")
+                continue
+            if finding.get("severity") not in SEVERITIES:
+                errors.append(f"{item_where}.severity 必须是 严重/一般/建议 之一")
+            for key in ("location", "issue"):
+                if not isinstance(finding.get(key), str) or not finding.get(key):
+                    errors.append(f"{item_where}.{key} 必须是非空字符串")
+            if not isinstance(finding.get("suggestion"), str):
+                errors.append(f"{item_where}.suggestion 必须是字符串")
+            uncertain = finding.get("uncertain", False)
+            if not isinstance(uncertain, bool):
+                errors.append(f"{item_where}.uncertain 必须是布尔值")
+            else:
+                finding["uncertain"] = uncertain  # 补全缺省，输出满足完整 schema
+    return errors
+
+
+def parse_review_report(answer: str) -> dict[str, Any]:
+    """从模型回答中提取并校验 ``files[]`` 报告；失败抛 :class:`ContractViolation`。
+
+    围栏可选：``crw review --json`` 的提示词要求纯 JSON，但模型常加围栏，此处宽容剥离。
+    """
+    text = answer.strip()
+    if text.startswith("```"):
+        newline = text.find("\n")
+        text = text[newline + 1 :] if newline != -1 else text[3:]
+        text = text.rstrip()
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ContractViolation(["回答中未找到 JSON 对象"])
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ContractViolation([f"JSON 解析失败：{exc}"]) from exc
+    errors = review_report_errors(data)
+    if errors:
+        raise ContractViolation(errors)
+    if not isinstance(data.get("summary"), str):
+        data["summary"] = ""  # 模型省略顶层 summary 时补全，下游消费口径稳定
+    return data
+
+
+def merge_review_reports(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """多文件的 ``files[]`` 片段合并为统一形态；单文件直接透传其 summary。
+
+    入参须是 :func:`parse_review_report` 校验过的条目（``file`` / ``summary`` 齐备）；
+    字段缺失时按可读占位兜底，不抛 ``KeyError``——这是展示层，不该因一条残缺条目整体炸掉。
+    ``entries`` 为空（全部文件审查失败）时返回 ``files: []`` + 说明性 summary，是
+    ``files`` 允许为空的唯一场景。
+    """
+    if not entries:
+        return {"files": [], "summary": "没有可用的审查结果。"}
+    files = list(entries)
+    if len(files) == 1:
+        return {"files": files, "summary": str(files[0].get("summary") or "")}
+    summary = "；".join(
+        f"{entry.get('file') or '（未命名文件）'}：{entry.get('summary') or ''}" for entry in files
+    )
+    return {"files": files, "summary": summary}
+
+
 def blocking_count(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) -> int:
     """阻塞性结论条数（默认只数【严重】，``strict`` 下并入【一般】）。
 

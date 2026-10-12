@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .. import agents as agents_mod
+from .. import config as config_mod
 from . import contracts, records
 from . import graph as graph_mod
 from . import state as state_mod
@@ -30,8 +32,8 @@ DEFAULT_MAX_ITERATIONS = 3
 #: 失败信息与事件 detail 的显示上限（沿用 Design §8.2 的 400 字符惯例）
 MAX_ERROR_CHARS = 400
 
-#: 缺省装配的模型标识（M1 未接真实模型；M2 起由 CLI 传入实际标识）
-FAKE_MODEL_LABEL = "内置假节点（未接模型）"
+#: 未提供模型配置时的模型标识占位（仅程序化调用会走到）
+UNRESOLVED_MODEL_LABEL = "（未解析模型）"
 
 _EXIT_SUCCESS = 0
 _EXIT_RESIDUAL = 1
@@ -40,6 +42,8 @@ _EXIT_ERROR = 2
 Clock = Callable[[], str]
 Timer = Callable[[], float]
 RunIdFactory = Callable[[], str]
+#: 缺省节点装配所需的运行时工厂：收到事件 / 增量回调，返回单任务 Agent 运行时
+RuntimeFactory = Callable[[agents_mod.EventSink, agents_mod.DeltaSink], agents_mod.AgentRuntime]
 
 
 def local_now() -> str:
@@ -71,6 +75,9 @@ class RunObserver(Protocol):
     def on_event(self, event: Mapping[str, Any]) -> None:
         """节点 / 引擎事件（比 log.jsonl 多带渲染所需附加键，如运行号）。"""
 
+    def on_delta(self, node: str, text: str) -> None:
+        """模型正文增量（渲染层据此流式输出；不落盘——正文由节点产物承载）。"""
+
     def on_review(
         self,
         *,
@@ -96,6 +103,9 @@ class _NullObserver:
 
     def on_event(self, event: Mapping[str, Any]) -> None:
         """忽略事件。"""
+
+    def on_delta(self, node: str, text: str) -> None:
+        """忽略正文增量。"""
 
     def on_review(
         self,
@@ -129,7 +139,13 @@ class RunRequest:
     rounds_mode: str = state_mod.ROUNDS_UP_TO
     strict: bool = False
     no_exec: bool = False
-    model_label: str = FAKE_MODEL_LABEL
+    resolved: config_mod.ResolvedModel | None = None
+    """本次运行的模型连接（命令面经 ``config.resolve`` 解析）。
+
+    缺省（``None``）时：完全注入 ``nodes`` 的运行不受影响；需要缺省装配时由运行时按
+    环境变量回退（``CRW_`` → ``CRA_`` → ``SE_CodeAgent``）构建模型，无 key 则给可读运行失败。
+    """
+
     parent_run_id: str | None = None
     session_id: str | None = None
     round_index: int | None = None
@@ -143,6 +159,11 @@ class RunRequest:
         return state_mod.InputDescriptor(
             kind=state_mod.INPUT_REQUIREMENT, requirement=self.requirement or ""
         )
+
+    @property
+    def model_label(self) -> str:
+        """模型标识（写入 ``state["model"]``，Design §4.3）：``供应商/模型名``。"""
+        return self.resolved.label() if self.resolved is not None else UNRESOLVED_MODEL_LABEL
 
 
 @dataclass(frozen=True)
@@ -182,7 +203,9 @@ class WorkflowEngine:
     """运行驱动：组织运行目录、事件、快照、报告与退出码（Design §3.1）。
 
     Args:
-        nodes: 节点覆盖表（逐键替换缺省假节点），测试与 M2 真实装配共用同一接缝。
+        nodes: 节点覆盖表（逐键替换缺省装配），测试与真实装配共用同一接缝。
+        runtime_factory: 缺省装配所需的 Agent 运行时工厂 ``(emit, on_delta) -> runtime``；
+            缺省用 agents 层按 ``request.resolved`` 装配。完全注入 ``nodes`` 时不会被调用。
         clock: 时钟（返回 ISO 8601 字符串）；默认 :func:`local_now`。
         timer: 单调计时源（毫秒耗时）；默认 :func:`time.monotonic`。
         run_id_factory: 运行号生成器；默认按注入时钟的日期 + ``records.new_run_id`` 碰撞重试。
@@ -193,12 +216,14 @@ class WorkflowEngine:
         self,
         *,
         nodes: Mapping[str, NodeFn] | None = None,
+        runtime_factory: RuntimeFactory | None = None,
         clock: Clock | None = None,
         timer: Timer | None = None,
         run_id_factory: RunIdFactory | None = None,
         observer: RunObserver | None = None,
     ) -> None:
         self._nodes = dict(nodes) if nodes else None
+        self._runtime_factory = runtime_factory
         self._clock = clock or local_now
         self._timer = timer or time.monotonic
         self._run_id_factory = run_id_factory or self._default_run_id_factory
@@ -210,6 +235,9 @@ class WorkflowEngine:
         self._current_started_at = ""
         self._current_started = 0.0
         self._latest: dict[str, Any] | None = None
+        self._runtime: agents_mod.AgentRuntime | None = None
+        self._no_exec = False
+        self._request: RunRequest | None = None
 
     # ---- 对外入口 ----
 
@@ -226,6 +254,11 @@ class WorkflowEngine:
         self._run_dir = run_dir
         self._workspace = run_dir / "workspace"
         self._log_path = run_dir / "log.jsonl"
+        self._request = request
+        self._no_exec = request.no_exec
+        # 同一引擎实例被复用执行多次时，运行时必须按本次请求重建：它绑定了模型、上下文根
+        # 与 no_exec，串用会让第二次运行拿着上一次的装配跑
+        self._runtime = None
         initial = state_mod.new_state(
             run_id=run_id,
             input_descriptor=request.input_descriptor(),
@@ -279,7 +312,7 @@ class WorkflowEngine:
 
     def _drive(self, initial: RunState) -> dict[str, Any]:
         """驱动图执行：节点边界快照原子写，返回最后一个超级步的状态。"""
-        resolved = graph_mod.resolve_nodes(self._nodes)
+        resolved = graph_mod.resolve_nodes(self._nodes, defaults=self._default_nodes())
         wrapped = {name: self._wrap_node(name, fn) for name, fn in resolved.items()}
         app = graph_mod.build_graph(nodes=wrapped)
         recursion_limit = 2 * int(initial["max_iterations"]) + 8
@@ -302,6 +335,66 @@ class WorkflowEngine:
             last_text = text
         return latest
 
+    def _default_nodes(self) -> dict[str, NodeFn] | None:
+        """缺省节点装配（真实 Agent 节点）；``nodes`` 已覆盖全部节点时返回 ``None``。
+
+        运行时只在确需缺省装配时构建：完全注入节点的测试不触碰模型与配置。
+        """
+        if self._nodes and set(graph_mod.NODE_NAMES) <= set(self._nodes):
+            return None
+        runtime = self._make_runtime()
+        return agents_mod.build_nodes(
+            runtime, roots=[self._workspace_path()], no_exec=self._no_exec
+        )
+
+    def _make_runtime(self) -> agents_mod.AgentRuntime:
+        """构建（或复用）本次运行的 Agent 运行时。"""
+        if self._runtime is not None:
+            return self._runtime
+        if self._runtime_factory is not None:
+            self._runtime = self._runtime_factory(self._emit, self._delta)
+        else:
+            self._runtime = agents_mod.build_runtime(
+                resolved=self._request.resolved if self._request else None,
+                emit=self._emit,
+                on_delta=self._delta,
+            )
+        return self._runtime
+
+    def _delta(self, node: str, text: str) -> None:
+        """模型正文增量 → 观察者（只渲染，不落盘；增量本身不是产物）。"""
+        self._notify_observer(lambda: self._observer.on_delta(node, text))
+
+    def _drain_notices(self) -> list[str]:
+        """取走运行时的护栏触达记录（工具轮次 / 上下文预算），并入阶段摘要。"""
+        if self._runtime is None:
+            return []
+        try:
+            return self._runtime.drain_notices()
+        except Exception:  # noqa: BLE001 — 摘要附加信息不得影响运行结论
+            return []
+
+    def _emit(self, event: Mapping[str, Any]) -> None:
+        """落盘一条事件并转交观察者（Design §5.1）；log 写入失败按运行失败处理。
+
+        节点级事件（``encode`` / ``review`` / ``fix``）缺 ``iteration`` 时按当前节点轮次
+        补齐——运行时只知道自己服务于哪个节点，轮次口径由引擎掌握（工具事件据此可归轮）。
+        """
+        payload = dict(event)
+        if (
+            self._current is not None
+            and payload.get("node") == self._current[0]
+            and payload.get("iteration") is None
+        ):
+            payload["iteration"] = self._current[1]
+        record = {"ts": self._clock(), **payload}
+        if self._log_path is not None:
+            try:
+                records.append_log_event(self._log_path, record)
+            except OSError as exc:
+                raise PersistenceError(f"log.jsonl 写入失败：{exc}") from exc
+        self._notify_observer(lambda: self._observer.on_event(record))
+
     def _wrap_node(self, name: str, fn: NodeFn) -> NodeFn:
         """节点包装：事件、契约校验与重试、产物落盘、history 追加（Design §3.1、§4.6）。"""
 
@@ -320,6 +413,8 @@ class WorkflowEngine:
                 raise
             except Exception as exc:
                 message = _readable_error(exc)
+                # 护栏触达信息一并带上：节点在"工具/预算已达上限"之后失败时，这是最有力的线索
+                message = _append_notices(message, self._drain_notices())
                 duration = self._elapsed_ms()
                 self._emit(
                     {"node": name, "event": "error", "iteration": round_number, "detail": message}
@@ -333,6 +428,7 @@ class WorkflowEngine:
                     duration_ms=duration,
                 ) from exc
             duration = self._elapsed_ms()
+            summary = _append_notices(summary, self._drain_notices())
             self._emit({"node": name, "event": "end", "iteration": round_number, "detail": summary})
             self._render_listing(listing)
             self._current = None
@@ -377,25 +473,33 @@ class WorkflowEngine:
     def _produce_review(
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """审查节点：契约校验 → ``workspace/review_N.json`` 落盘 → clean 判定（Design §5.2）。"""
+        """审查节点：契约校验 → ``workspace/review_N.json`` 落盘 → clean 判定（Design §5.2）。
+
+        执行有效性门禁由审查节点交回的 ``review_evidence`` 决定（本轮是否至少一次成功
+        工具事件）；不返回该键的节点（脚本化假节点 / 注入桩）按"内联送达记录"视为满足。
+        """
         round_number = state_mod.round_number_for_review(state)
         version = state_mod.code_version(state)
         file_name = state_mod.code_file_name(version)
         output = _call_node(fn, state, retry_feedback=None)
+        evidence = bool(output.get(agents_mod.REVIEW_EVIDENCE_KEY, True))
         try:
             result = contracts.parse_review_output(
                 _node_text(output, "review_text"),
                 review_round=round_number,
                 code_version=version,
                 file_name=file_name,
+                has_tool_evidence=evidence,
             )
         except ContractViolation as exc:
             output = self._retry("review", round_number, fn, state, str(exc))
+            evidence = bool(output.get(agents_mod.REVIEW_EVIDENCE_KEY, True)) or evidence
             result = contracts.parse_review_output(
                 _node_text(output, "review_text"),
                 review_round=round_number,
                 code_version=version,
                 file_name=file_name,
+                has_tool_evidence=evidence,
             )
         path = self._workspace_path() / state_mod.review_file_name(round_number)
         self._write_artifact(path, json.dumps(result.contract, ensure_ascii=False, indent=2) + "\n")
@@ -673,16 +777,6 @@ class WorkflowEngine:
         except OSError as exc:
             raise PersistenceError(f"产物 {path.name} 写入失败：{exc}") from exc
 
-    def _emit(self, event: Mapping[str, Any]) -> None:
-        """落盘一条事件并转交观察者（Design §5.1）；log 写入失败按运行失败处理。"""
-        record = {"ts": self._clock(), **event}
-        if self._log_path is not None:
-            try:
-                records.append_log_event(self._log_path, record)
-            except OSError as exc:
-                raise PersistenceError(f"log.jsonl 写入失败：{exc}") from exc
-        self._notify_observer(lambda: self._observer.on_event(record))
-
     def _notify_observer(self, callback: Callable[[], None]) -> None:
         """执行渲染回调并隔离输出流故障。
 
@@ -893,6 +987,13 @@ def build_report(
         lines.append(f"- 说明：{_cell(error.get('message'))}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _append_notices(summary: str, notices: Sequence[str]) -> str:
+    """把运行时的护栏触达记录并入阶段摘要（进 log.jsonl 与时间线，Design §4.6）。"""
+    if not notices:
+        return summary
+    return f"{summary}（{'；'.join(notices)}，结论可能不完整）"
 
 
 def _cell(value: Any) -> str:

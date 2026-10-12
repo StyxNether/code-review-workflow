@@ -313,3 +313,122 @@ def test_scan_fences_reports_labels_and_content_in_order() -> None:
         ("text", "旁白"),
         ("json", "{}"),
     ]
+
+
+# ---- crw review 报告契约（前作 files[] 形态，Design §6.4）----
+
+
+def _report(**overrides: object) -> dict:
+    entry = {
+        "file": "a.py",
+        "findings": [
+            {
+                "severity": "严重",
+                "location": "a.py:1",
+                "issue": "问题",
+                "suggestion": "建议",
+                "uncertain": False,
+            }
+        ],
+        "summary": "整体评价",
+    }
+    entry.update(overrides)
+    base = {"files": [entry], "summary": "整体评价"}
+    return base
+
+
+def test_review_report_accepts_the_documented_shape() -> None:
+    assert contracts.review_report_errors(_report()) == []
+
+
+def test_review_report_fills_uncertain_default() -> None:
+    data = _report(
+        findings=[{"severity": "一般", "location": "a.py:2", "issue": "问题", "suggestion": ""}]
+    )
+
+    assert contracts.review_report_errors(data) == []
+    assert data["files"][0]["findings"][0]["uncertain"] is False
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        ([], "顶层必须是 JSON 对象"),
+        ({"files": []}, "files 必须是非空数组"),
+        ({"files": ["x"]}, "必须是对象"),
+        ({"files": [{"file": "", "summary": "", "findings": []}]}, "file 必须是非空字符串"),
+        ({"files": [{"file": "a.py", "findings": []}]}, "summary 必须是字符串"),
+        ({"files": [{"file": "a.py", "summary": "", "findings": {}}]}, "findings 必须是数组"),
+        (
+            {"files": [{"file": "a.py", "summary": "", "findings": [{"severity": "致命"}]}]},
+            "severity 必须是",
+        ),
+        (
+            {
+                "files": [
+                    {
+                        "file": "a.py",
+                        "summary": "",
+                        "findings": [
+                            {"severity": "严重", "location": "", "issue": "x", "suggestion": ""}
+                        ],
+                    }
+                ]
+            },
+            "location 必须是非空字符串",
+        ),
+        (
+            {
+                "files": [
+                    {
+                        "file": "a.py",
+                        "summary": "",
+                        "findings": [
+                            {
+                                "severity": "严重",
+                                "location": "a.py:1",
+                                "issue": "x",
+                                "suggestion": "",
+                                "uncertain": "yes",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "uncertain 必须是布尔值",
+        ),
+    ],
+)
+def test_review_report_reports_schema_errors(data: object, match: str) -> None:
+    assert any(match in error for error in contracts.review_report_errors(data))
+
+
+def test_parse_review_report_strips_fences_and_fills_summary() -> None:
+    payload = json.dumps(
+        {"files": [{"file": "a.py", "findings": [], "summary": "干净。"}]}, ensure_ascii=False
+    )
+
+    parsed = contracts.parse_review_report(f"```json\n{payload}\n```")
+
+    assert parsed["summary"] == ""  # 缺省的顶层 summary 补为空串（单文件合并时按文件摘要回填）
+
+
+def test_parse_review_report_rejects_text_without_json() -> None:
+    with pytest.raises(contracts.ContractViolation, match="未找到 JSON 对象"):
+        contracts.parse_review_report("这次回答全是散文。")
+
+
+def test_parse_review_report_rejects_broken_json() -> None:
+    with pytest.raises(contracts.ContractViolation, match="JSON 解析失败"):
+        contracts.parse_review_report('{"files": [}')
+
+
+def test_merge_review_reports_single_and_multiple() -> None:
+    single = {"file": "a.py", "findings": [], "summary": "干净。"}
+    assert contracts.merge_review_reports([single]) == {"files": [single], "summary": "干净。"}
+
+    other = {"file": "b.py", "findings": [], "summary": "也可接受。"}
+    merged = contracts.merge_review_reports([single, other])
+    assert merged["summary"] == "a.py：干净。；b.py：也可接受。"
+
+    assert contracts.merge_review_reports([])["files"] == []

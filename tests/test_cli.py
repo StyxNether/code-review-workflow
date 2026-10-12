@@ -1,17 +1,26 @@
-"""命令面测试：版本、帮助、参数解析、输入契约与 run / runs / show 实现（无真实网络调用）。"""
+"""命令面测试：版本、帮助、参数解析、输入契约与 run / runs / show / review / config。
+
+run 路径经假模型驱动真实 Agent 节点——"流程怎么走"由脚本化响应决定，"怎么接起来"走的是
+与真实运行完全相同的代码；测试内无任何真实网络调用。
+"""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import io
+import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 
+import fakes
 import pytest
-from support import sample_path
+from support import read_sample, sample_path
 
 import crw.cli
 import crw.render
+from crw import config as config_mod
 from crw.cli import build_parser, main
 from crw.workflow import records
 from crw.workflow import state as state_mod
@@ -302,8 +311,6 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
     ("argv", "command"),
     [
         (["resume", "r-20261011-1a2b"], "resume"),
-        (["review", "src/crw/cli.py"], "review"),
-        (["config"], "config"),
         (["graph"], "graph"),
         (["uninstall"], "uninstall"),
     ],
@@ -311,20 +318,39 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
 def test_commands_still_placeholders_report_not_implemented(
     argv: list[str], command: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """M1 已实现 run / runs / show；其余命令仍为占位（M2/M3 落地）。"""
+    """M2 已实现 run / runs / show / review / config；resume / graph / uninstall 待 M3。"""
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert command in captured.err
 
 
-# ---- run / runs / show 实现（Design §8.1）----
+def test_run_without_configuration_points_to_crw_config(capsys: pytest.CaptureFixture[str]) -> None:
+    """未配置供应商：给可读指引并退出 2，不产生运行记录（Design §8.1 的运行错误）。"""
+    assert main(["run", "写一个计算器"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "尚未配置模型供应商" in captured.err
+    assert "crw config" in captured.err
+    assert records.list_runs() == []
+
+
+# ---- run：真实 Agent 节点（经假模型驱动，Design §8.1）----
+
+#: 假模型给编码节点的产出（可编译的最小模块）
+CLEAN_CODE = '"""计算器。"""\n\n\ndef main() -> None:\n    print("ok")\n'
 
 
 def test_run_with_requirement_prints_conclusion_and_persists_record(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """需求文本路径：假节点默认装配即可干净跑通（本轮生效选项 -f / --max-iter）。"""
+    """需求文本路径：编码 → 审查 →（干净）收尾，产物与运行记录落盘。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
     assert main(["run", "写一个命令行四则运算计算器"]) == 0
 
     captured = capsys.readouterr()
@@ -332,14 +358,46 @@ def test_run_with_requirement_prints_conclusion_and_persists_record(
     assert "运行记录" in captured.out
     assert "[编码]" in captured.err  # 过程叙述走 stderr（Design §8.4）
     assert "[审查]" in captured.err
+    assert "[审查] 工具：" in captured.err  # 工具调用过程可见
 
     (summary,) = records.list_runs()
     assert summary.status == state_mod.STATUS_SUCCESS
     assert summary.fix_rounds == 0
     assert summary.residual_severe == 0
+    state = records.read_state(summary.path)
+    assert state is not None
+    assert state["model"] == "DeepSeek/deepseek-flash"  # 真实模型标识（Design §4.3）
 
 
-def test_run_with_syntax_fixture_reports_the_fix_cycle(capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_records_tool_events_in_the_log(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """工具调用过程进 log.jsonl（状态追踪与演示的时间线来源，Design §5.1）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
+    assert main(["run", "写一个计算器"]) == 0
+
+    (summary,) = records.list_runs()
+    events = records.read_events(summary.path / "log.jsonl")
+    tools = [event for event in events if event["event"] == "tool"]
+    assert tools and all(event["node"] == "review" for event in tools)
+    assert "read_file" in tools[0]["detail"]
+    assert tools[0].get("iteration") == 1  # 工具事件归属审查第 1 轮
+
+
+def test_run_with_syntax_fixture_reports_the_fix_cycle(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """修复循环：首审含【严重】→ 修复 → 复审干净（退出码 0）。"""
+    configured_provider()
+    fake_chat_model.load(
+        fakes.fix_cycle_script(code=read_sample("syntax_error.py"), fixed_code=CLEAN_CODE)
+    )
+
     assert main(["run", "-f", str(sample_path("syntax_error.py"))]) == 0
 
     captured = capsys.readouterr()
@@ -353,9 +411,16 @@ def test_run_with_syntax_fixture_reports_the_fix_cycle(capsys: pytest.CaptureFix
 
 
 def test_run_with_divide_by_zero_fixture_residual(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """达限残留：退出码 1 + 残留清单（Design §4.4）。"""
+    configured_provider()
+    fake_chat_model.load(
+        fakes.residual_script(code=read_sample("divide_by_zero.py"), location="code_v2.py:7")
+    )
+
     assert main(["run", "--max-iter", "1", "-f", str(sample_path("divide_by_zero.py"))]) == 1
 
     captured = capsys.readouterr()
@@ -366,6 +431,109 @@ def test_run_with_divide_by_zero_fixture_residual(
     assert summary.residual_severe == 1
 
 
+def test_review_without_any_tool_call_is_rejected(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """执行有效性门禁（Design §5.2）：审查一次工具都没调、却报"无问题" → 不许通过。
+
+    首轮与重试都没有工具事件 → 按节点失败处理（退出码 2），而不是把空数组当"干净"。
+    """
+    configured_provider()
+    fake_chat_model.load(
+        fakes.requirement_input_with_clean_reviews(code=CLEAN_CODE, reviews=2, with_tools=False)
+    )
+
+    assert main(["run", "写一个计算器"]) == 2
+
+    captured = capsys.readouterr()
+    assert "运行失败" in captured.err
+    assert "执行证据" in captured.err or "审查未执行" in captured.err
+    (summary,) = records.list_runs()
+    state = records.read_state(summary.path)
+    assert state is not None and state["status"] == state_mod.STATUS_FAILED
+
+
+def test_run_no_exec_does_not_register_the_execution_tool(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """``--no-exec``：工具注册层不注册 run_python（模型侧根本看不到该工具，Design §8.1）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
+    assert main(["run", "写一个计算器", "--no-exec"]) == 0
+
+    bound = [name for tools in fake_chat_model.bound_tools for name in tools]
+    assert bound  # 确实发生过工具绑定
+    assert "run_python" not in bound
+    assert "read_file" in bound
+
+
+def test_run_streams_model_text_and_no_stream_buffers_it(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--no-stream`` 不丢内容：两种模式都完整输出模型正文（Design §8.1）。
+
+    流式与缓存的**差别**（立即写出 / 阶段结束整体写出）由 tests/test_render.py 的渲染器用例
+    锁定——在整段 stderr 文本上两者的行序相同，只有写入时机不同，这里只保证内容可读。
+    """
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
+    assert main(["run", "写一个计算器"]) == 0
+    streamed = capsys.readouterr().err
+    assert "实现说明" in streamed  # 模型正文（编码节点的说明段）
+
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+    assert main(["run", "写一个计算器", "--no-stream"]) == 0
+    buffered = capsys.readouterr().err
+
+    assert "实现说明" in buffered  # 内容不丢
+    assert "```json" in buffered  # 审查契约也完整输出（不是只留摘要）
+    assert "[编码] 生成 code_v1.py" in buffered  # 阶段标题在正文之后（阶段收尾时才落这一行）
+
+
+def test_run_out_copies_final_code_and_report(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--out``：最终代码复制为 code_final.py，报告一并复制（Design §4.5）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+    out_dir = tmp_path / "deliver"
+
+    assert main(["run", "写一个计算器", "--out", str(out_dir)]) == 0
+
+    assert (out_dir / "code_final.py").read_text(encoding="utf-8") == CLEAN_CODE.strip("\n") + "\n"
+    assert "结论" in (out_dir / "report.md").read_text(encoding="utf-8")
+    assert "已复制" in capsys.readouterr().err
+
+
+def test_run_out_avoids_overwriting_existing_outputs(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """重名加序号：已有 code_final.py 时写到 code_final_2.py，不覆盖用户文件（Design §4.5）。"""
+    configured_provider()
+    out_dir = tmp_path / "deliver"
+    out_dir.mkdir()
+    (out_dir / "code_final.py").write_text("# 用户自己的文件\n", encoding="utf-8")
+
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+    assert main(["run", "写一个计算器", "--out", str(out_dir)]) == 0
+
+    assert (out_dir / "code_final.py").read_text(encoding="utf-8") == "# 用户自己的文件\n"
+    assert (out_dir / "code_final_2.py").is_file()
+    assert (out_dir / "report_2.md").is_file()
+
+
 @pytest.mark.parametrize(
     ("argv", "expected_source"),
     [
@@ -374,9 +542,16 @@ def test_run_with_divide_by_zero_fixture_residual(
     ],
 )
 def test_run_records_max_iterations_source(
-    argv: list[str], expected_source: str, capsys: pytest.CaptureFixture[str]
+    argv: list[str],
+    expected_source: str,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """轮次取值来源：命令行显式给出记 cli，否则记内置默认（Design §4.4）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
     assert main(argv) == 0
     capsys.readouterr()
 
@@ -396,7 +571,13 @@ def test_run_reports_unreadable_file_as_run_error(capsys: pytest.CaptureFixture[
     assert records.list_runs() == []  # 输入读不到：不产生运行记录
 
 
-def test_runs_lists_the_six_columns(capsys: pytest.CaptureFixture[str]) -> None:
+def test_runs_lists_the_six_columns(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     main(["run", "写一个计算器"])
     capsys.readouterr()
 
@@ -413,7 +594,19 @@ def test_runs_without_records_is_not_an_error(capsys: pytest.CaptureFixture[str]
     assert "暂无运行记录" in capsys.readouterr().out
 
 
-def test_show_renders_the_record(capsys: pytest.CaptureFixture[str]) -> None:
+def test_show_renders_the_record(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_provider()
+    fake_chat_model.load(
+        fakes.fix_cycle_script(
+            code=read_sample("syntax_error.py"),
+            fixed_code=CLEAN_CODE,
+            location="code_v1.py:7",
+        )
+    )
     main(["run", "-f", str(sample_path("syntax_error.py"))])
     capsys.readouterr()
     (summary,) = records.list_runs()
@@ -429,8 +622,13 @@ def test_show_renders_the_record(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_show_without_run_id_offers_selection(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     main(["run", "写一个计算器"])
     capsys.readouterr()
     monkeypatch.setattr(crw.render, "ask_user", lambda prompt: "1")
@@ -443,8 +641,13 @@ def test_show_without_run_id_offers_selection(
 
 
 def test_show_without_run_id_and_cancelled_selection(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     main(["run", "写一个计算器"])
     capsys.readouterr()
     monkeypatch.setattr(crw.render, "ask_user", lambda prompt: None)
@@ -474,8 +677,20 @@ def test_show_rejects_invalid_run_id_format(capsys: pytest.CaptureFixture[str]) 
     assert "运行号格式非法" in capsys.readouterr().err
 
 
-def test_run_state_file_records_the_cli_options(capsys: pytest.CaptureFixture[str]) -> None:
-    """本轮生效选项（-f / --max-iter）与其余选项的占位口径都写进状态快照。"""
+def test_run_state_file_records_the_cli_options(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """选项落进状态快照：``--max-iter 0``（只审不修）与 ``--strict``。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_tool_call("read_file", path="code_v1.py"),
+            fakes.ai_text(fakes.review_fence([fakes.finding(location="code_v1.py:7")])),
+        ]
+    )
+
     assert (
         main(["run", "-f", str(sample_path("divide_by_zero.py")), "--max-iter", "0", "--strict"])
         == 1
@@ -591,10 +806,390 @@ def test_run_reports_non_utf8_input_readably(
 
 
 def test_run_writes_nothing_to_the_real_user_directory(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """运行记录根目录随 CRW_HOME 走：测试用例不会写真实用户目录（Design §9.1）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
     assert main(["run", "写一个计算器"]) == 0
     capsys.readouterr()
 
-    assert records.runs_root().is_relative_to(tmp_path)
+    (summary,) = records.list_runs()
+    assert summary.path.is_relative_to(tmp_path)
+
+
+# ---- crw review：单 Agent 审查（Design §8.1 / §6.4）----
+
+
+def test_review_file_prints_conclusion_and_never_creates_a_run(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """文本模式：结论走 stdout、过程走 stderr，且**不产生运行记录**。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_text(
+                "【严重】sample.py:1 — 示例问题。\n修改建议：修正它。\n\n整体评价：需要修复。"
+            )
+        ]
+    )
+
+    assert main(["review", str(sample_path("divide_by_zero.py"))]) == 0
+
+    captured = capsys.readouterr()
+    assert "【严重】" in captured.out
+    assert "正在审查" in captured.err
+    assert records.list_runs() == []
+
+
+def test_review_json_mode_reports_severe_with_exit_code_1(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--json``：结构化输出走 stdout，存在【严重】时退出码 1（Design §8.1）。"""
+    configured_provider()
+    report = {
+        "files": [
+            {
+                "file": "sample.py",
+                "findings": [fakes.finding(location="sample.py:3")],
+                "summary": "存在除零风险。",
+            }
+        ],
+        "summary": "存在除零风险。",
+    }
+    fake_chat_model.load([fakes.ai_text(json.dumps(report, ensure_ascii=False))])
+
+    assert main(["review", "--json", str(sample_path("divide_by_zero.py"))]) == 1
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["files"][0]["findings"][0]["severity"] == "严重"
+
+
+def test_review_json_mode_clean_exits_zero(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--json`` 且无【严重】：退出码 0；顶层 summary 缺省时按文件摘要补全。"""
+    configured_provider()
+    report = {"files": [{"file": "sample.py", "findings": [], "summary": "未见阻塞问题。"}]}
+    fake_chat_model.load([fakes.ai_text(json.dumps(report, ensure_ascii=False))])
+
+    assert main(["review", "--json", str(sample_path("divide_by_zero.py"))]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["files"][0]["findings"] == []
+    assert payload["summary"] == "未见阻塞问题。"
+
+
+def test_review_writes_markdown_report(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-o``：Markdown 报告落盘（stdout 仍出结论，报告路径提示走 stderr）。"""
+    configured_provider()
+    fake_chat_model.load([fakes.ai_text("整体评价：可以接受。")])
+    target = tmp_path / "report.md"
+
+    assert main(["review", "-o", str(target), str(sample_path("syntax_error.py"))]) == 0
+
+    text = target.read_text(encoding="utf-8")
+    assert text.startswith("# crw 审查报告")
+    assert "整体评价：可以接受。" in text
+    assert "报告已写入" in capsys.readouterr().err
+
+
+def test_review_directory_expands_first_level_text_files(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """目录入参：展开第一层文本文件，跳过隐藏文件与二进制文件（Design §8.1）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (tmp_path / "bin.dat").write_bytes(b"\x00\x01\x02")
+    fake_chat_model.load([fakes.ai_text("审查结论一。"), fakes.ai_text("审查结论二。")])
+
+    assert main(["review", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert "a.py" in captured.out and "b.py" in captured.out  # 多文件逐个带标题
+    assert "审查结论一。" in captured.out and "审查结论二。" in captured.out
+    assert "SECRET=1" not in captured.out and "SECRET=1" not in captured.err
+    assert "已跳过二进制文件" in captured.err
+    assert len(fake_chat_model.requests) == 2
+
+
+def test_review_reads_stdin(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-``：读 stdin（Design §8.1）。"""
+    configured_provider()
+    fake_chat_model.load([fakes.ai_text("stdin 内容的审查结论。")])
+    monkeypatch.setattr("sys.stdin", io.StringIO("print('hi')\n"))
+
+    assert main(["review", "-"]) == 0
+
+    assert "stdin 内容的审查结论。" in capsys.readouterr().out
+
+
+def test_review_no_exec_hides_the_execution_tool(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """``--no-exec``：审查侧同样不注册 run_python。"""
+    configured_provider()
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", "--no-exec", str(sample_path("syntax_error.py"))]) == 0
+
+    bound = [name for tools in fake_chat_model.bound_tools for name in tools]
+    assert bound and "run_python" not in bound
+
+
+def test_review_missing_path_is_a_run_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["review", "no/such/file.py"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "路径不存在" in captured.err
+
+
+def test_review_reports_model_failure_with_exit_code_2(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """单文件审查失败：stderr 可读报错 + 退出码 2。"""
+    configured_provider()
+    fake_chat_model.load([RuntimeError("模型连接中断")])
+
+    assert main(["review", str(sample_path("syntax_error.py"))]) == 2
+
+    assert "审查失败" in capsys.readouterr().err
+
+
+# ---- crw config：供应商配置与连通性自检（Design §8.3）----
+
+
+def test_config_test_without_providers_is_a_config_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["config", "test"]) == 2
+
+    assert "尚无供应商配置" in capsys.readouterr().err
+
+
+def test_config_test_reports_each_provider(
+    configured_provider: Callable[[], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``config test``：逐供应商探测，全部 OK 退出 0（探测结果经桩注入，无真实网络）。"""
+    configured_provider()
+    monkeypatch.setattr(config_mod, "test_provider", lambda entry: ("ok", ""))
+
+    assert main(["config", "test"]) == 0
+
+    assert "DeepSeek（deepseek-flash）：OK" in capsys.readouterr().out
+
+
+def test_config_test_reports_failures_with_exit_code_1(
+    configured_provider: Callable[[], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_provider()
+    monkeypatch.setattr(config_mod, "test_provider", lambda entry: ("auth", "401 unauthorized"))
+
+    assert main(["config", "test"]) == 1
+
+    out = capsys.readouterr().out
+    assert "401（key 无效）" in out
+    assert "401 unauthorized" in out
+
+
+def test_config_interactive_adds_a_provider_and_writes_models_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """交互式配置：选预设 → 用预填清单 → key 存明文 → 设默认 → 退出，落盘可解析。"""
+    answers = iter(
+        [
+            "1",  # 菜单：添加 / 更新供应商
+            "2",  # 供应商类型：DeepSeek（第 1 项是自定义）
+            "",  # 接入点：回车用官方
+            "",  # 模型清单：用预填
+            "placeholder-key",  # API key
+            "1",  # key 存储方式：明文写入 models.json
+            "4",  # 菜单：设置默认模型
+            "1",  # 供应商
+            "1",  # 模型
+            "0",  # 退出
+        ]
+    )
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "供应商 'DeepSeek' 已添加。" in out
+    data = config_mod.load_raw()
+    assert data["default"] == "DeepSeek/deepseek-flash"
+    entry = data["providers"][0]
+    assert entry["base_url"] == "https://api.deepseek.com"
+    assert entry["api_key"] == "placeholder-key"
+    assert "placeholder-key" not in out  # key 不回显（菜单只打码展示）
+
+
+def test_config_interactive_reports_a_broken_file(capsys: pytest.CaptureFixture[str]) -> None:
+    """损坏的 models.json：给可读原因 + 修复指引，退出 2（Design §8.1）。"""
+    config_mod.config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_mod.config_path().write_text("{ 不是 JSON", encoding="utf-8")
+
+    assert main(["config"]) == 2
+
+    captured = capsys.readouterr()
+    assert "配置错误" in captured.err  # 错误走 stderr（与 config test 同口径，Design §8.4）
+    assert "手工修复" in captured.err
+    assert "配置错误" not in captured.out
+
+
+# ---- config 交互的取消语义与边界（自审问题回归）----
+
+
+def test_config_add_provider_is_cancelled_when_key_input_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """key 输入被中断（``None``）≠ 空 key：整个添加取消，不留下半成品供应商。"""
+    answers = iter(["1", "2", "", ""])
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: None)
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "未添加该供应商" in out
+    assert config_mod.load_raw().get("providers") in (None, [], {})
+
+
+def test_config_key_storage_choice_reasks_on_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """key 存储方式输错时重新询问，不把笔误静默当成"明文落盘"。"""
+    answers = iter(
+        [
+            "1",  # 添加供应商
+            "2",  # DeepSeek 预设
+            "",  # 接入点默认
+            "",  # 用预填模型清单
+            "placeholder-key",  # key 明文（_read_key 走同一迭代器）
+            "3",  # 无效选择 → 应重问
+            "1",  # 明文写入
+            "0",  # 退出
+        ]
+    )
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, None))
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "无效选择，请重新输入。" in out
+    assert config_mod.load_raw()["providers"][0]["api_key"] == "placeholder-key"
+
+
+def test_config_add_model_reports_an_existing_model_without_a_fake_overwrite_prompt(
+    configured_provider: Callable[[], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_provider()
+    answers = iter(
+        ["3", "1", "1", "deepseek-flash", "0", "0"]
+    )  # 菜单 3 → 供应商 1 → 添加模型 → 重名 → 返回 → 退出
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "未重复添加" in out
+    assert config_mod.load_raw()["providers"][0]["models"] == ["deepseek-flash"]
+
+
+def test_config_errors_are_masked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """配置错误的文本同样遮蔽密钥形态（错误通道统一口径，终端输出常被重定向保存）。"""
+    fake_key = "sk-" + "k" * 24
+    monkeypatch.setattr(
+        config_mod,
+        "resolve",
+        lambda **kwargs: (_ for _ in ()).throw(
+            config_mod.ConfigError(f"供应商条目损坏，疑似含 {fake_key}")
+        ),
+    )
+
+    assert main(["run", "写一个计算器"]) == 2
+
+    err = capsys.readouterr().err
+    assert fake_key not in err
+    assert "sk-***" in err
+
+
+def test_review_stdin_is_size_limited(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``crw review -`` 的 stdin 读取同样有上限（与单文件同口径，防内存无界）。"""
+    monkeypatch.setattr(crw.tools.fs, "MAX_READ_BYTES", 16)
+    monkeypatch.setattr("sys.stdin", io.StringIO("x" * 100))
+
+    assert main(["review", "-"]) == 2
+
+    assert "标准输入超过读取上限" in capsys.readouterr().err
+
+
+def test_run_out_without_artifacts_reports_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--out`` 但运行没有产物时给出提示，而不是静默跳过。"""
+    crw.cli._export_outputs(engine_result_without_dir(), Path("unused"))  # type: ignore[arg-type]
+
+    assert "--out 已跳过" in capsys.readouterr().err
+
+
+def engine_result_without_dir() -> object:
+    """一个 run_dir 为 None 的结果视图（模拟目录都无法创建的情形）。"""
+    from crw.workflow import engine as engine_mod
+
+    return engine_mod.RunResult(
+        run_id="",
+        run_dir=None,
+        status="failed",
+        exit_code=2,
+        review_round=0,
+        fix_rounds=0,
+        clean=False,
+        findings=(),
+        error_node="engine",
+        error_message="运行目录创建失败",
+        interrupted=False,
+        state={},
+    )

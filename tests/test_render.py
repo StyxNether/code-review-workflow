@@ -457,3 +457,157 @@ def test_completed_run_points_to_the_report() -> None:
     )
 
     assert "(报告 report.md)" in out.getvalue().replace("（", "(").replace("）", ")")
+
+
+# ---- 流式正文与 --no-stream（Design §8.1）----
+
+
+def make_stream_renderer(stream: bool) -> tuple[render.RunRenderer, StringIO, StringIO]:
+    out, err = StringIO(), StringIO()
+    return render.RunRenderer(stream=stream, out=out, err=err), out, err
+
+
+def test_streamed_text_is_written_as_it_arrives() -> None:
+    renderer, _, err = make_stream_renderer(True)
+
+    renderer.on_delta("review", "第一段")
+    assert err.getvalue() == "第一段"  # 未等到阶段结束就已落笔
+
+    renderer.on_delta("review", "第二段")
+    assert err.getvalue() == "第一段第二段"
+
+
+def test_no_stream_buffers_text_until_the_stage_ends() -> None:
+    renderer, _, err = make_stream_renderer(False)
+
+    renderer.on_delta("review", "第一段")
+    renderer.on_delta("review", "第二段")
+    assert err.getvalue() == ""  # 整体输出：阶段结束前不出正文
+
+    renderer.on_event(
+        {"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：0 严重"}
+    )
+
+    assert "第一段第二段" in err.getvalue()
+    assert err.getvalue().index("第一段第二段") < err.getvalue().index("[审查] 第 1 轮")
+
+
+def test_retried_text_is_not_rendered_again() -> None:
+    """契约重试：重试后的正文不再渲染（前次已流出，重复渲染只会让人看到两段叙述）。"""
+    renderer, _, err = make_stream_renderer(True)
+
+    renderer.on_delta("review", "第一次的输出")
+    renderer.on_event({"node": "review", "event": "retry", "iteration": 1, "detail": "输出缺围栏"})
+    renderer.on_delta("review", "第二次的输出")
+    renderer.on_event({"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：干净"})
+
+    text = err.getvalue()
+    assert "第一次的输出" in text
+    assert "第二次的输出" not in text
+    assert "重试：输出缺围栏" in text
+
+
+def test_buffer_drops_text_from_a_retried_stage_in_no_stream_mode() -> None:
+    renderer, _, err = make_stream_renderer(False)
+
+    renderer.on_delta("review", "第一次的输出")
+    renderer.on_event({"node": "review", "event": "retry", "iteration": 1, "detail": "输出缺围栏"})
+    renderer.on_event({"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：干净"})
+
+    assert "第一次的输出" not in err.getvalue()
+
+
+def test_error_event_flushes_pending_text_before_the_report_line() -> None:
+    renderer, _, err = make_stream_renderer(False)
+
+    renderer.on_delta("encode", "正在写代码……")
+    renderer.on_event({"node": "encode", "event": "error", "iteration": 1, "detail": "超时"})
+
+    text = err.getvalue()
+    assert "正在写代码……" in text
+    assert text.index("正在写代码……") < text.index("[编码] 错误：超时")
+
+
+# ---- crw review 的报告渲染（Design §6.4 / §8.1）----
+
+
+def test_review_text_report_lists_every_file() -> None:
+    """逐位对齐：失败的位（None）标"结论不可用"，成功位嵌结论原文。"""
+    files = [("a.py", "内容一"), ("b.py", "内容二")]
+
+    text = render.review_text_report(files, ["结论一", None])
+
+    assert text.startswith("# crw 审查报告")
+    assert "## a.py" in text and "结论一" in text
+    assert "## b.py" in text and "[该文件审查失败，结论不可用]" in text
+
+
+def test_review_json_report_renders_findings_and_skips_duplicate_summary() -> None:
+    merged = {
+        "files": [
+            {
+                "file": "a.py",
+                "findings": [
+                    {
+                        "severity": "严重",
+                        "location": "a.py:1",
+                        "issue": "问题",
+                        "suggestion": "建议",
+                        "uncertain": True,
+                    }
+                ],
+                "summary": "存在阻塞问题。",
+            }
+        ],
+        "summary": "存在阻塞问题。",
+    }
+
+    text = render.review_json_report(merged)
+
+    assert "- **【严重】** `a.py:1` — 问题（不确定）" in text
+    assert "修改建议：建议" in text
+    assert "## 总体评价" not in text  # 单文件不重复顶层 summary
+
+
+def test_review_json_report_keeps_the_overall_section_when_nothing_was_reviewable() -> None:
+    """files 为空时"总体评价"是唯一承载结论的地方（Design §8.1 的报告不能空壳）。"""
+    text = render.review_json_report({"files": [], "summary": "没有可用的审查结果。"})
+
+    assert "## 总体评价" in text
+    assert "没有可用的审查结果。" in text
+
+
+def test_review_json_report_keeps_the_overall_section_for_multiple_files() -> None:
+    merged = {
+        "files": [
+            {"file": "a.py", "findings": [], "summary": "干净。"},
+            {"file": "b.py", "findings": [], "summary": "也干净。"},
+        ],
+        "summary": "a.py：干净。；b.py：也干净。",
+    }
+
+    text = render.review_json_report(merged)
+
+    assert "## 总体评价" in text
+    assert "a.py：干净。；b.py：也干净。" in text
+
+
+def test_streamed_text_without_trailing_newline_is_not_glued_to_the_stage_line() -> None:
+    """流式正文末尾没有换行时，紧随其后的阶段行另起一行（实测模型正文有时不以换行收尾）。"""
+    renderer, _, err = make_stream_renderer(True)
+
+    renderer.on_delta("review", "结论写到一半就停了")
+    renderer.on_event({"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：干净"})
+
+    lines = [line for line in err.getvalue().splitlines() if line.strip()]
+    assert lines[0] == "结论写到一半就停了"
+    assert lines[1] == "[审查] 第 1 轮：干净"
+
+
+def test_streamed_text_ending_with_newline_keeps_a_single_newline() -> None:
+    renderer, _, err = make_stream_renderer(True)
+
+    renderer.on_delta("review", "整段正文\n")
+    renderer.on_event({"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：干净"})
+
+    assert err.getvalue() == "整段正文\n[审查] 第 1 轮：干净\n"
