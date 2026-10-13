@@ -190,9 +190,24 @@ def route_after_review(state: Mapping[str, Any]) -> str:
     """
     if state.get("clean"):
         return END
-    if int(state.get("fix_rounds", 0)) >= int(state.get("max_iterations", 0)):
+    if _state_int(state, "fix_rounds") >= _state_int(state, "max_iterations"):
         return END
     return "fix"
+
+
+def _state_int(state: Mapping[str, Any], key: str) -> int:
+    """状态里的整数字段：缺失 / ``None`` / 非法值按 0 处理。
+
+    条件边是纯函数、跑在框架调度路径上：这里抛 ``TypeError`` 会把整个运行变成
+    框架层崩溃。0 是保守方向——``max_iterations`` 缺失时直接收尾（不凭空多修一轮）。
+    """
+    value = state.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+    return value
 
 
 def merge_review_node(state: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -241,9 +256,9 @@ def mermaid_flowchart(*, parallel_review: bool = False) -> str:
 
 _SINGLE_MERMAID = """flowchart TD
     start(["开始"])
-    encode["编码 Agent：生成初始代码 code_v1.py"]
+    encode["编码 Agent：生成初始代码版本 code_v1/（1..n 个文件）"]
     review["审查 Agent：读文件 / 运行核实 → findings"]
-    fix["修复 Agent：按 findings 逐条处置 → code_vN+1.py"]
+    fix["修复 Agent：按 findings 逐条处置 → code_vN+1/"]
     finish(["收尾：report.md（干净通过退出码 0 / 达限残留退出码 1）"])
 
     start -- "需求文本" --> encode
@@ -256,11 +271,11 @@ _SINGLE_MERMAID = """flowchart TD
 
 _PARALLEL_MERMAID = """flowchart TD
     start(["开始"])
-    encode["编码 Agent：生成初始代码 code_v1.py"]
+    encode["编码 Agent：生成初始代码版本 code_v1/（1..n 个文件）"]
     review_correctness["审查 Agent·正确性视角：并行分支，写 findings_correctness"]
     review_security["审查 Agent·安全性视角：并行分支，写 findings_security"]
     merge_reviews["汇合：按 (location, issue) 去重取较严重者、统一重编号 id、审查轮次 +1"]
-    fix["修复 Agent：按合并 findings 逐条处置 → code_vN+1.py"]
+    fix["修复 Agent：按合并 findings 逐条处置 → code_vN+1/"]
     finish(["收尾：report.md（干净通过退出码 0 / 达限残留退出码 1）"])
 
     start -- "需求文本" --> encode

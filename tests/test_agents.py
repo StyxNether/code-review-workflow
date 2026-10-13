@@ -296,7 +296,7 @@ class TestGuardrails:
 
 class TestNodeAssembly:
     def test_encode_node_stages_the_model_text(self, workspace: Path) -> None:
-        model = fakes.ScriptedChatModel(responses=[fakes.ai_text(fakes.python_fence("print(1)"))])
+        model = fakes.ScriptedChatModel(responses=[fakes.ai_text(fakes.file_fence("print(1)"))])
         nodes = agents_mod.build_nodes(make_runtime(model), roots=[workspace])
 
         output = nodes["encode"]({"input": {"kind": "requirement", "requirement": "写一个计算器"}})
@@ -380,7 +380,7 @@ class TestNodeAssembly:
             responses=[
                 fakes.ai_text(
                     fakes.fix_fence(
-                        "print(2)",
+                        {"main.py": "print(2)"},
                         [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
                     )
                 )
@@ -390,9 +390,10 @@ class TestNodeAssembly:
 
         output = fix(
             {
-                "current_code": str(workspace / "code_v1.py"),
+                "current_version_dir": str(workspace / "code_v1"),
+                "version_files": ["main.py"],
                 "findings": [
-                    {"id": "f-1", "severity": "严重", "location": "code_v1.py:1", "issue": "x"}
+                    {"id": "f-1", "severity": "严重", "location": "main.py:1", "issue": "x"}
                 ],
                 "fix_rounds": 0,
             }
@@ -522,7 +523,7 @@ def test_state_helpers_used_by_the_nodes() -> None:
     """节点读的轮次 / 版本口径与状态层同源（避免两处各算一份）。"""
     state = {"review_round": 2, "fix_rounds": 1}
 
-    assert state_mod.code_file_name(state_mod.code_version(state)) == "code_v2.py"
+    assert state_mod.code_version_dir_name(state_mod.code_version(state)) == "code_v2"
     assert state_mod.round_number_for_review(state) == 3
 
 
@@ -592,7 +593,11 @@ def test_task_prompt_json_examples_are_parseable() -> None:
     from crw.agents import prompts
 
     review_prompt = prompts.review_task_prompt(
-        file_name="code_v1.py", review_round=1, code_version=1, allow_exec=True
+        version_label="code_v1",
+        files=["main.py", "util.py"],
+        review_round=1,
+        code_version=1,
+        allow_exec=True,
     )
     examples = re.findall(r"\{.*\}", review_prompt, flags=re.DOTALL)
     assert examples
@@ -612,3 +617,94 @@ def test_unknown_review_view_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="未知的审查视角"):
         prompts_mod.reviewer_system_prompt("correctnes")
+
+
+def test_guardrail_notices_are_cleared_across_runs(workspace: Path) -> None:
+    """护栏触达记录按任务清空（含重发变体的 guardrail）：上一任务的触达不残留到下一任务。"""
+    model = fakes.ScriptedChatModel(responses=[fakes.ai_text("一。"), fakes.ai_text("二。")])
+    runtime = make_runtime(model, max_context_tokens=1)
+
+    runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="任务一",
+        registry=review_registry(workspace),
+    )
+    first = runtime.drain_notices()
+    runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="任务二",
+        registry=review_registry(workspace),
+    )
+    second = runtime.drain_notices()
+
+    assert first and second  # 预算=1，两次都触达
+    assert len(second) == len(first)  # 不累积：第二次只含本任务的记录
+
+
+def test_parallel_tool_calls_in_one_message_are_counted(workspace: Path) -> None:
+    """同一条消息里的多个并行工具调用按真实 index 回放：两个都要被计数（fakes 的 index 回归）。"""
+    from langchain_core.messages import AIMessage
+
+    (workspace / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (workspace / "b.py").write_text("print(2)\n", encoding="utf-8")
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_file", "args": {"path": "a.py"}, "id": "call-a"},
+            {"name": "read_file", "args": {"path": "b.py"}, "id": "call-b"},
+        ],
+    )
+    model = fakes.ScriptedChatModel(responses=[message, fakes.ai_text("结论。")])
+    runtime = make_runtime(model)
+
+    result = runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="审查",
+        registry=review_registry(workspace),
+    )
+
+    assert result.tool_events == 2
+
+
+def test_fix_task_prompt_lists_relative_paths_for_the_fences() -> None:
+    """修复清单用版本内相对路径（= file= 声明口径），读取路径的版本前缀只在步骤说明里。
+
+    真实演示暴露：清单带 code_v1/ 前缀而围栏要求不带前缀，模型照清单产出带前缀的路径，
+    覆盖检查判缺全体文件。
+    """
+    from crw.agents import prompts
+
+    prompt = prompts.fix_task_prompt(
+        version_label="code_v2",
+        files=["main.py", "todos.py"],
+        version=2,
+        findings=[fakes.finding(location="main.py:1")],
+        allow_exec=True,
+    )
+
+    assert "- main.py" in prompt and "- todos.py" in prompt
+    assert "code_v2/main.py" in prompt  # 读取路径带前缀（步骤说明里给出）
+    assert "不要带版本目录前缀" in prompt
+
+
+def test_drain_notices_for_only_takes_the_named_node(workspace: Path) -> None:
+    """按节点取护栏记录：并行分支各自只回收自己的，不误取仍在运行的另一个分支。"""
+    model = fakes.ScriptedChatModel(responses=[fakes.ai_text("一。"), fakes.ai_text("二。")])
+    runtime = make_runtime(model, max_context_tokens=1)
+    registry = review_registry(workspace)
+
+    runtime.run(
+        node="review_correctness",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="任务一",
+        registry=registry,
+    )
+
+    # 只按节点过滤：先要别的节点拿不到、再拿自己的，取走后清空
+    assert runtime.drain_notices_for("review_security") == []
+    notices = runtime.drain_notices_for("review_correctness")
+    assert notices
+    assert runtime.drain_notices_for("review_correctness") == []

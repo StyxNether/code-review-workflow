@@ -29,7 +29,10 @@ RUN_ID_PATTERN = re.compile(r"^r-[0-9]{8}-[0-9a-f]{4}$")
 _INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
 _REVIEW_NAME_PATTERN = re.compile(r"^review_([0-9]+)\.json$")
-_CODE_NAME_PATTERN = re.compile(r"^code_v([0-9]+)\.py$")
+_CODE_VERSION_DIR_PATTERN = re.compile(r"^code_v([0-9]+)$")
+
+#: 旧单文件格式的产物名（M3.5 起版本 = 目录；该形态记录只用于识别并提示"记录来自旧格式"）
+_LEGACY_CODE_NAME_PATTERN = re.compile(r"^code_v([0-9]+)\.py$")
 
 #: 事件 detail 只存截断预览（Design §8.2）
 DETAIL_PREVIEW_CHARS = 400
@@ -57,6 +60,8 @@ class RunSummary:
     path: Path
     stale: bool = False
     """``status=running`` 且长时间无更新：可能已中断（Design §8.2，只标注不改状态）。"""
+    model: str = ""
+    """本次运行的模型标识（``供应商/模型名（思考：…）``口径，Design §8.3 的回显要求）。"""
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,10 @@ class RoundReport:
     """一轮审查与紧随其后的修复处置（报告与 `crw show` 的逐轮数据）。"""
 
     round_number: int
-    file_name: str
+    version_label: str
+    """本轮审查基于的版本目录显示名（如 ``code_v1/``）。"""
+    files: list[str]
+    """本轮审查覆盖的版本内文件清单（来自 review 契约顶层 ``files``）。"""
     review: Mapping[str, Any]
     fixes: Mapping[str, Any] | None = field(default=None)
 
@@ -213,23 +221,66 @@ def read_rounds(run_path: Path) -> list[RoundReport]:
             continue
         round_number = int(match.group(1))
         fixes = _read_json_object(workspace / state_mod.fixes_file_name(round_number))
-        file_name = str(review.get("file") or state_mod.code_file_name(round_number))
+        version = review.get("code_version")
+        version_number = int(version) if isinstance(version, int) else round_number
+        files = review.get("files")
         rounds.append(
-            RoundReport(round_number=round_number, file_name=file_name, review=review, fixes=fixes)
+            RoundReport(
+                round_number=round_number,
+                version_label=f"{state_mod.code_version_dir_name(version_number)}/",
+                files=[str(item) for item in files] if isinstance(files, list) else [],
+                review=review,
+                fixes=fixes,
+            )
         )
     return sorted(rounds, key=lambda item: item.round_number)
 
 
 def run_artifacts(run_path: Path) -> list[Path]:
-    """运行目录内可见产物（顶层文件 + 工作区文件，忽略临时文件与子目录）。"""
+    """运行目录内可见产物：顶层文件、工作区文件与版本目录内的全部文件。
+
+    版本目录（``workspace/code_v*/``，Design §4.2.2）逐文件展开——产物清单要能直接
+    指到具体文件；其余子目录不展开。临时文件与隐藏文件一律忽略。
+    """
     artifacts: list[Path] = []
-    for directory in (run_path, run_path / "workspace"):
-        artifacts.extend(
-            path
-            for path in _iter_dir(directory)
-            if path.is_file() and not path.name.startswith(".") and not path.name.endswith(".tmp")
-        )
+    workspace = run_path / "workspace"
+    for directory in (run_path, workspace):
+        for path in _iter_dir(directory):
+            if path.is_dir():
+                if directory is workspace and _CODE_VERSION_DIR_PATTERN.fullmatch(path.name):
+                    artifacts.extend(_version_dir_files(path))
+                continue
+            if not path.name.startswith(".") and not path.name.endswith(".tmp"):
+                artifacts.append(path)
     return artifacts
+
+
+def _version_dir_files(version_dir: Path) -> list[Path]:
+    """版本目录内的文件（含子目录，posix 相对路径的层级原样保留）。
+
+    ``__pycache__`` / ``*.pyc`` 是执行核实（run_python）落下的运行时副产物，
+    不属于版本内容，不进产物清单。
+    """
+    files: list[Path] = []
+    for path in sorted(version_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(version_dir)
+        if path.name.startswith(".") or path.name.endswith(".tmp"):
+            continue
+        if path.suffix == ".pyc" or "__pycache__" in relative.parts:
+            continue
+        files.append(path)
+    return files
+
+
+def is_legacy_record(state: Mapping[str, Any]) -> bool:
+    """是否旧单文件格式的记录（M3.5 前的 ``current_code`` 形态，Design §4.2.2）。
+
+    旧记录已按用户指示清理、不做迁移：show / resume 遇到时给一行可读提示并按
+    "记录不可用"退出，而不是崩溃或静默出错。
+    """
+    return "current_code" in state and "current_version_dir" not in state
 
 
 def list_runs(*, root: Path | None = None) -> list[RunSummary]:
@@ -359,6 +410,7 @@ def _summarize(path: Path) -> RunSummary:
         residual_severe=residual,
         path=path,
         stale=is_stale_running(state, path),
+        model=_state_str(state, "model"),
     )
 
 
@@ -382,12 +434,16 @@ def _infer_status(path: Path) -> str:
 
 
 def _count_code_versions(path: Path) -> int | None:
+    """最大版本号 − 1（降级派生的修复轮数；版本 = ``workspace/code_v*/`` 目录）。
+
+    版本号从 1 起，故结果 ≥ 0；``code_v0/`` 之类手工造的异常目录按 0 兜底，不产出负数。
+    """
     versions = [
         int(match.group(1))
         for entry in _iter_dir(path / "workspace")
-        if (match := _CODE_NAME_PATTERN.fullmatch(entry.name))
+        if (match := _CODE_VERSION_DIR_PATTERN.fullmatch(entry.name))
     ]
-    return max(versions) - 1 if versions else None
+    return max(0, max(versions) - 1) if versions else None
 
 
 def _latest_review_severe(path: Path) -> int | None:
@@ -445,7 +501,15 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
 
 
 def _preview(value: Any) -> str:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # detail 含不可 JSON 序列化对象（集合 / 自定义类）时回退 repr：
+            # 日志预览不得因为内容形态把整次运行变成"log 写入失败"
+            text = repr(value)
     if len(text) <= DETAIL_PREVIEW_CHARS:
         return text
     return f"{text[:DETAIL_PREVIEW_CHARS]}…（已截断）"

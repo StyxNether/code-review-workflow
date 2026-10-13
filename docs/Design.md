@@ -105,15 +105,15 @@ tests/
 ```mermaid
 flowchart TD
     A["输入：需求文本 或 代码文件（-f）"] --> B{"输入类型"}
-    B -- "需求文本" --> C["encode 编码 Agent：生成初始代码（code_v1.py）"]
-    B -- "代码文件" --> D["纳入工作区（code_v1.py）"]
+    B -- "需求文本" --> C["encode 编码 Agent：生成初始代码版本（code_v1/，1..n 个文件）"]
+    B -- "代码文件" --> D["纳入工作区（code_v1/）"]
     C --> E["review 审查 Agent：读文件 / 运行核实 → findings（结构化）"]
     D --> E
     E --> F{"无【严重】问题？"}
     F -- "是（干净）" --> G["收尾：report.md（干净通过）· 退出码 0"]
     F -- "否" --> H{"已达修复轮次上限？"}
     H -- "是" --> I["收尾：report.md 附残留问题清单 · 退出码 1"]
-    H -- "否" --> J["fix 修复 Agent：按 findings 逐条修复 → code_v2.py…"]
+    H -- "否" --> J["fix 修复 Agent：按 findings 逐条修复 → 新版本 code_vN+1/"]
     J --> E
 ```
 
@@ -123,9 +123,9 @@ flowchart TD
 
 | 节点 | 输入 | 输出 | 工具 | 失败模式 |
 |------|------|------|------|----------|
-| encode 编码 Agent | 需求文本（+ 可选上下文） | 代码文件 `code_v1`（写入运行工作区）+ 简要说明（输出格式见 §4.2.1） | 无（纯生成） | 抽取失败 / 空输出 → 重试一次 → 仍失败按节点失败 |
-| review 审查 Agent | 当前代码文件 | findings 结构化清单（§5.2 契约），经校验后写入状态（校验 / 重试在 workflow 层包装完成） | `list_dir` / `read_file` / `run_python`（核实用；`--no-exec` 关闭执行） | 契约校验失败 → 附错误清单重试一次 → 仍失败按节点失败 |
-| fix 修复 Agent | 当前代码 + findings | 修复后代码 `code_vN+1` + fixes 清单（逐条对应 findings id，§5.2）（输出格式见 §4.2.1） | `read_file` / `run_python`（内联验证修复，可关） | 抽取失败 → 重试一次 → 仍失败按节点失败；内容与上版逐字节相同 → 视为"本轮未产生改动"（不失败，继续复审，报告标注） |
+| encode 编码 Agent | 需求文本（+ 可选上下文） | 代码版本目录 `code_v1/`（1..n 个文件 + manifest，写入运行工作区）+ 简要说明（输出格式见 §4.2.2） | 无（纯生成） | 抽取失败 / 空输出 / 缺 `file=` 声明 → 重试一次 → 仍失败按节点失败 |
+| review 审查 Agent | 当前版本目录内**全部文件**（清单来自状态 `version_files`） | findings 结构化清单（§5.2 契约，location = 版本内相对路径:行号），经校验后写入状态（校验 / 重试在 workflow 层包装完成） | `list_dir` / `read_file` / `run_python`（核实用；`--no-exec` 关闭执行） | 契约校验失败 → 附错误清单重试一次 → 仍失败按节点失败 |
+| fix 修复 Agent | 当前版本 + findings | 修复后的**完整版本** `code_vN+1/`（版本内全部文件 + manifest，可附删除申请）+ fixes 清单（逐条对应 findings id，§5.2）（输出格式见 §4.2.2） | read_file / run_python（内联验证修复，可关） | 抽取失败 / 缺文件覆盖 → 重试一次 → 仍失败按节点失败；整版本 `路径 → sha256` 与上版相同 → 视为"本轮未产生改动"（不失败，继续复审，报告标注） |
 
 收尾（非 Agent 节点，由 engine 执行）：生成 `report.md`（结论、时间线、逐轮 findings、产物清单）并确定退出码。
 
@@ -133,22 +133,28 @@ flowchart TD
 
 - **输出格式（M3 及之前：单文件）**：编码 Agent = 恰好一个 ```python 围栏（全部代码合并到**单个 Python 文件**）+ 围栏外简要说明；修复 Agent = 恰好一个 ```python 围栏 + 恰好一个 ```json fixes 围栏 + 围栏外说明。**M3.5 起解除单文件硬约束**，目标形态见 §4.2.2。
 - **落盘执行者**：抽取与落盘在 workflow 包装层 / engine 完成（节点只返回文本与结构化数据，自身不落盘）。
-- **抽取规则（Markdown 语义）**：围栏闭合需同长或更长、语言标签 `python` / `py` 不区分大小写；编码场景要求**恰好一个** python 围栏，修复场景**取第一个** python 围栏与**第一个** json 围栏、其余围栏忽略并记 log（计入该轮阶段摘要）；**缺少必需围栏**或内容为空 → 附重试反馈重试一次 → 仍失败按节点失败。
-- **落盘顺序（原子）**：先写 `workspace/code_v(N+1).py`（临时文件 + 替换），再写该轮处置 `workspace/fixes_N.json`（N = 修复轮次，与 `review_N.json` 按 finding id 配对），最后更新 `state.current_code`；失败不产生半写文件。
-- **`-f` 输入**：由 CLI 读取、按代码文本标准化（去首尾空行、统一以单个换行结尾）后落 `workspace/code_v1.py`（原始路径记入 `input.source_path`，报告标注"原文件名 → 工作区名"映射）；标准化保证版本间"逐字节相同"的比较口径一致。
+- **抽取规则（Markdown 语义）**：围栏闭合需同长或更长、语言标签 `python` / `py` 不区分大小写；M3.5 起编码 / 修复的围栏抽取按 §4.2.2 的目录形态重述（每文件一个带 `file=` 声明的 python 围栏），多余的围栏忽略并记 log（计入该轮阶段摘要）；**缺少必需围栏**或内容为空 → 附重试反馈重试一次 → 仍失败按节点失败。
+- **落盘顺序（原子）**：先写 `workspace/code_v(N+1)/` 内的全部文件（每个文件临时文件 + 替换），再写该版本目录内的 `manifest.json`，随后写该轮处置 `workspace/fixes_N.json`（N = 修复轮次，与 `review_N.json` 按 finding id 配对），最后更新 `state.current_version_dir` 与 `state.version_files`；失败不产生半写文件。
+- **`-f` 输入**：由 CLI 读取、按代码文本标准化（去首尾空行、统一以单个换行结尾）后包成目录版本 `workspace/code_v1/<原文件名>`（原始路径记入 `input.source_path`，报告标注"原文件 → 工作区"映射）；标准化保证版本间"逐字节相同"的比较口径一致。
 - **修复验证**：修复 Agent 的 `run_python` 使用内联 `code=<候选代码>` 执行（不依赖未落盘文件）；`--no-exec` 下跳过验证并在报告标注。
 
 ### 4.2.2 多文件产出（M3.5 目标形态）
 
 一个**代码版本 = 一个目录**（`workspace/code_v1/`）：目录内是该版本的全部文件（相对路径即工作区内的相对路径），
-另由引擎生成 `manifest.json`（文件清单 + 每个文件的 sha256 + 行数）。单文件只是"目录里只有一个文件"的特例，
-因此 §4.2.1 的抽取 / 落盘 / 原子性 / 逐字节比较语义全部按"目录"重述。
+并由引擎在**版本目录内**生成 `manifest.json`（文件清单 + 每个文件的 sha256 + 行数）。单文件只是"目录里只有
+一个文件"的特例，因此 §4.2.1 的抽取 / 落盘 / 原子性 / 逐字节比较语义全部按"目录"重述。
+读取版本内容**以 `manifest.json` 清单为准**（清单缺失时才退回全目录读取）：`manifest.json` 是引擎落盘时写的
+权威文件清单，执行核实（`run_python`）可能把字节码（`__pycache__/`、`*.pyc`）甚至被测程序自己写出的数据文件
+留在版本目录里——这些**运行时副产物**不属于版本内容，也不进产物清单、不进 resume 复制、不参与整版本指纹比较；
+`--out` 复制版本目录同样以清单为准。执行侧从源头收紧：`run_python` 的子进程环境设 `PYTHONDONTWRITEBYTECODE=1`
+（一次性核实不需要字节码缓存），不再产生 `__pycache__`。
 
 - **输入**：需求文本 → 编码 Agent 产出 1..n 个文件；`-f` 单文件输入 → **同样包成目录版本**
   （`code_v1/<原文件名>`，不做特殊路径分支，用户裁决 2026-10-13"改"）；`resume` → 复制父版本目录为新版本目录（`code_v1/`）。
 - **编码 / 修复的输出契约**：每个文件一个 python 围栏，围栏 info 形如 ` ```python file=<相对路径> `；
   路径必须是版本内的**相对**路径（拒绝绝对路径与 `..`），重复路径取最后一个并在阶段摘要记"已忽略重复声明"；
-  修复另给出恰好一个 ```json fixes 围栏，且**必须给出版本内的全部文件**——只给改动文件会让版本不完整，
+  修复另给出恰好一个 ```json fixes 围栏，且**必须给出版本内的全部文件**（声明删除的可不出内容——
+  未确认删除时引擎从上一版本原样保留，版本完整性由引擎兜底）——只给改动文件会让版本不完整，
   与"按文件审查 / 逐字节比较 / resume 从版本目录出发"的语义冲突。
   删除文件用显式声明 `{"deleted": ["<相对路径>", …]}` 提出，**执行前必须取得用户确认**（见下）。
 - **审查**：一次审查覆盖版本内**所有**文件（审查 Agent 用 `list_dir` / `read_file` 自行读取）；findings 的 `location`
@@ -184,7 +190,8 @@ flowchart TD
 | `parallel_review` | bool | 是否并行双视角审查（`--parallel-review`；汇合形态见 §12.2） | engine |
 | `session_id` | str? | 所属会话号（会话轮次写入；`crw run` 一次性运行为空） | engine（初始化） |
 | `round_index` | int? | 会话内轮次序号（从 1 起；非会话运行为空） | engine（初始化） |
-| `current_code` | str | 最新代码文件路径 | encode / fix |
+| `current_version_dir` | str | 最新版本目录路径（`workspace/code_vN/`） | engine（物化）/ encode / fix |
+| `version_files` | list[str] | 当前版本内的文件清单（版本内相对路径，posix 风格；节点构造任务提示词用，节点不接触文件） | engine（物化）/ encode / fix |
 | `findings` | list[Finding] | 最新一轮审查结论 | review / 汇合 |
 | `findings_correctness` / `findings_security` | list[Finding] | 并行双视角的两个分支结论（**独立 key**，避免同超级步多写者冲突）；汇合后由 `findings` 承载权威结论，故不持久化（不进 state.json） | review 分支 |
 | `clean` | bool | 最新一轮是否干净（engine 依契约判定；`--strict` 影响判据） | engine |
@@ -199,10 +206,10 @@ flowchart TD
 Finding：
 
 ```json
-{"id": "f-1", "severity": "严重|一般|建议", "location": "code_v1.py:18", "issue": "…", "suggestion": "…", "uncertain": false}
+{"id": "f-1", "severity": "严重|一般|建议", "location": "parser.py:18", "issue": "…", "suggestion": "…", "uncertain": false}
 ```
 
-`id` 由契约校验层按序生成（`f-1`、`f-2`…）并随 `review_N.json` 落盘（供修复逐条对应）；`location` 使用工作区实名（`code_vN.py`）。
+`id` 由契约校验层按序生成（`f-1`、`f-2`…）并随 `review_N.json` 落盘（供修复逐条对应）；`location` 为**版本内相对路径**加行号（如 `parser.py:18`、`pkg/util.py:7`）。
 
 ### 4.4 分支与循环语义
 
@@ -212,7 +219,7 @@ Finding：
 - **轮次取值来源与优先级**：命令行 `--max-iter`/`--rounds-mode`（显式）> 本次用户消息的结构化提取值（会话模式，§5.4）> 配置默认（`~/.crw/settings.json`，§8.3）> 内置 3 / `up-to`；全部受硬上限约束，来源记入 `max_iterations_source`。越界语义分开：**命令行越界 = 参数错误（退出码 2）**；**消息提取值越界 = 夹到上限执行并在报告与时间线标注**（那是意图理解）。
 - **早退**：`up-to` 模式下首轮审查即干净 → 直接收尾，不进入修复。
 - **输入模式**：代码文件输入跳过 encode，其余流程一致。
-- **续跑**：`crw resume <运行号>` 仅当父运行存在 `current_code` 时可用（否则可读错误，退出码 2）；把父运行最新代码复制为新运行 `workspace/code_v1.py`（`input.kind=file`），`parent_run_id` 写入状态；`--max-iter`/`--rounds-mode`/`--strict`/`--no-exec` 由本次命令行决定，未显式给出的轮次设置**继承父运行**（来源标 `parent`），无父设置时退回配置默认；父运行的 `--strict` 与审查形态（`--parallel-review`）一并继承——续跑是"接着修"，换判定标准或换审查方式会让结论不可比；`--no-exec` 例外（它不进状态快照，命令面无法区分"显式关闭"与"从未设置"，故按未设置处理）。新运行轮次从 `review_round=1`/`fix_rounds=0` 重新计数；报告标注父运行与父残留摘要。
+- **续跑**：`crw resume <运行号>` 仅当父运行存在 `current_version_dir`（旧单文件格式记录除外——给一行可读提示 + 退出码 2）时可用（否则可读错误，退出码 2）；把父运行最新版本目录复制为新运行 `workspace/code_v1/`（`input.kind=file`，源记 `input.source_path`），`parent_run_id` 写入状态；`--max-iter`/`--rounds-mode`/`--strict`/`--no-exec` 由本次命令行决定，未显式给出的轮次设置**继承父运行**（来源标 `parent`），无父设置时退回配置默认；父运行的 `--strict` 与审查形态（`--parallel-review`）一并继承——续跑是"接着修"，换判定标准或换审查方式会让结论不可比；`--no-exec` 例外（它不进状态快照，命令面无法区分"显式关闭"与"从未设置"，故按未设置处理）。新运行轮次从 `review_round=1`/`fix_rounds=0` 重新计数；报告标注父运行与父残留摘要。
 
 ### 4.5 运行目录与产物
 
@@ -222,8 +229,10 @@ Finding：
 ├── state.json           # 状态快照（§4.3）
 ├── log.jsonl            # 事件流（每行一条 JSON 事件）
 └── workspace/
-    ├── code_v1.py       # 各版本代码（保留全部历史版本）
-    ├── code_v2.py
+    ├── code_v1/         # 各版本代码（保留全部历史版本；目录 + manifest.json）
+    │   ├── main.py
+    │   └── manifest.json
+    ├── code_v2/
     ├── review_1.json    # 各轮审查结论（结构化；并行双视角时为汇合结果）
     ├── review_1_correctness.json   # 并行双视角：正确性视角的原始结论
     ├── review_1_security.json      # 并行双视角：安全性视角的原始结论
@@ -231,8 +240,8 @@ Finding：
     └── fixes_1.json     # 各轮修复处置（逐条对应 findings id，与 review_N.json 配对）
 ```
 
-- 报告结构：运行摘要（输入 / 模型 / 状态 / 审查与修复次数）→ 时间线（节点事件表）→ 逐轮问题清单（标题固定为"第 i 轮审查（基于 `code_v{i}.py`）"，含"问题 ← 处置"对照）→ 产物清单与路径（`-f` 输入标注"原文件名 → 工作区名"映射）。
-- `--out <目录>`：将最终代码复制为 `<out>/code_final.py`（连同 report.md；重名加序号），便于在项目目录内取用产物。
+- 报告结构：运行摘要（输入 / 模型（含思考挡位）/ 状态 / 审查与修复次数）→ 时间线（节点事件表）→ 逐轮问题清单（标题固定为"第 i 轮审查（基于 `code_v{i}/`）"，问题按文件分组、含"问题 ← 处置"对照与删除处置标注）→ 产物清单与路径（`-f` 输入标注"原文件 → 工作区"映射）。
+- `--out <目录>`：将最终版本**整目录**复制为 `<out>/code_final/`（含 manifest.json；连同 report.md；重名成对加序号），便于在项目目录内取用产物。
 - 运行记录属**用户目录数据**（不随仓库分发，默认 `~/.crw`，可用 `CRW_HOME` 覆盖）；不含密钥，含生成代码与审查结论。清理策略：`crw uninstall` 分级确认后清理（见 §6.2 #8）；容量上限策略入 Backlog。
 
 ### 4.6 错误处理与恢复
@@ -262,7 +271,7 @@ Finding：
   `runs/` 与 `sessions/*/rounds/` 两处查找（`crw show` / `crw resume` 对两处一致可用）。
 - 每轮记录与 `crw run` **同构**：同一套 state/log/report/workspace 代码，仅父目录不同，且 `state.json` 多
   `session_id` / `round_index` 两个字段；`crw runs` 扫两处并多一列"会话"。
-- **代码版本号跨轮连续递增**（`code_v1.py` → `code_v2.py` …）：会话内是同一份代码在演进，报告里的"第几版"始终指向同一文件。
+- **代码版本号跨轮连续递增**（`code_v1/` → `code_v2/` …）：会话内是同一份代码在演进，报告里的"第几版"始终指向同一文件。
 - 记忆文件每行一条消息（角色 / 文本 / 时间 / 来源轮次），**只追加、不改写**（对供应商前缀缓存友好）；压缩时追加一条
   `{"kind": "compaction", …}` 记录并保留旧行于磁盘（仅不再参与后续请求）。
 - 会话结束写 `session.md`（各轮结论演进 + 最终状态 + 剩余建议）；`crw uninstall` 的清理范围包含 `sessions/`。
@@ -272,7 +281,7 @@ Finding：
 ### 5.1 状态共享与消息载体
 
 - **共享状态**：三节点读写同一运行状态（§4.3 schema）——节点只读写自己负责的字段，引擎串起流转与循环判定。
-- **消息载体（双层）**：① 状态字段（`findings`、`current_code` 等）；② 工作区文件（代码版本、`review_N.json`）。结构化结论既是状态也是文件——可审计、可重放、可被下游逐条引用。
+- **消息载体（双层）**：① 状态字段（`findings`、`current_version_dir` 等）；② 工作区文件（代码版本、`review_N.json`）。结构化结论既是状态也是文件——可审计、可重放、可被下游逐条引用。
 - **过程事件**：每次节点执行与工具调用写入 `log.jsonl`，作为状态追踪与演示的时间线来源。
 
 ### 5.2 结构化交接契约（审查 → 修复）
@@ -283,17 +292,17 @@ Finding：
 {
   "iteration": 1,
   "code_version": 1,
-  "file": "code_v1.py",
+  "files": ["main.py", "pkg/util.py"],
   "findings": [
-    {"id": "f-1", "severity": "严重|一般|建议", "location": "code_v1.py:18", "issue": "…", "suggestion": "…", "uncertain": false}
+    {"id": "f-1", "severity": "严重|一般|建议", "location": "parser.py:18", "issue": "…", "suggestion": "…", "uncertain": false}
   ],
   "summary": "该轮整体评价"
 }
 ```
 
-- **校验规则**：顶层为对象；`iteration` = 本次审查序号（= `review_round`，1-based）；`code_version` = 当前版本号且 `file` = `code_v{code_version}.py`；`findings` 为数组（**可为空** = 本轮无问题，进入 clean 判定）；逐条：severity 枚举、location / issue 非空字符串、suggestion 字符串（可空）、uncertain 缺省补 false、`id` 由校验层按序生成；`summary` 缺省补 ""；未知字段忽略并原样保留；校验失败 → 附错误清单重试一次。
+- **校验规则**：顶层为对象；`iteration` = 本次审查序号（= `review_round`，1-based）；`code_version` = 当前版本号，`files` 为版本内文件清单（缺省由校验层按 manifest 补权威值，给出即必须与之一致）；`findings` 为数组（**可为空** = 本轮无问题，进入 clean 判定）；逐条：severity 枚举、location（版本内相对路径加行号）/ issue 非空字符串、suggestion 字符串（可空）、uncertain 缺省补 false、`id` 由校验层按序生成；`summary` 缺省补 ""；未知字段忽略并原样保留（旧单文件契约的 `file` 键被丢弃）；校验失败 → 附错误清单重试一次。
 - **执行有效性门禁**：本轮须有至少一次成功工具事件（或内联送达记录）；`findings` 为空时 `summary` 不得为空串——否则视为"审查未执行"，重试一次 / 按节点失败（防"空数组即通过"逃逸）。工具事件的判定由审查节点交回的 `review_evidence`（本轮成功工具事件数 > 0）实现；`crw review` 的内联送达与不接工具的注入桩按"内联送达记录"视为满足该门禁。
-- **权威字段的缺失与不符**：`iteration` / `code_version` / `file` 缺失时由校验层补权威值；给出但与权威值不符即违规（防模型自报版本号错位）。
+- **权威字段的缺失与不符**：`iteration` / `code_version` / `files` 缺失时由校验层补权威值；给出但与权威值不符即违规（防模型自报版本号错位）。
 - **重试接缝**：包装层经 `node(state, *, retry_feedback=None)` 回传错误清单（节点协议见 §3.1）；重试前 engine 发 `event=retry`，第二次模型输出的正文增量只进 log、不重复渲染。重试不计审查轮次。
 
 修复 Agent 的输出契约（与代码围栏并列的 ```json 围栏）：
@@ -366,7 +375,7 @@ Finding：
 
 ### 6.4 契约继承说明
 
-审查结论契约与前作对齐、但并非同构——差异：① 本项目为**单文件版本化平铺结构**（顶层 `{iteration, code_version, file, findings, summary}`），前作为多文件 `files[]` + 顶层 summary；② 新增 `iteration` / `code_version` / `id` 字段；③ `file` / `location` 为工作区实名（`code_vN.py`）；④ 校验逻辑为新实现（前作校验仅在 `review --json` 分支）。`crw review --json` 保持前作 `files[]` 形态以兼容既有消费方式；提示词经验与"问题描述协议"可直接迁移。
+审查结论契约与前作对齐、但并非同构——差异：① 本项目为**版本目录化平铺结构**（顶层 `{iteration, code_version, files, findings, summary}`，M3.5 起 `files` 为版本内清单），前作为任意路径的 `files[]` + 顶层 summary；② 新增 `iteration` / `code_version` / `id` 字段；③ `files` / `location` 为版本内相对路径（`main.py`、`parser.py:18`）；④ 校验逻辑为新实现（前作校验仅在 `review --json` 分支）。`crw review --json` 保持前作 `files[]` 形态以兼容既有消费方式；提示词经验与"问题描述协议"可直接迁移。
 
 ## 7. 关键决策记录（ADR）
 
@@ -404,10 +413,10 @@ crw uninstall                             # 卸载
 crw --version                             # 版本号
 ```
 
-`crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--parallel-review`、`--out <目录>`、`--model / --provider`、`--no-stream`。
+`crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--parallel-review`、`--out <目录>`、`--model / --provider`、`--thinking <挡位|off>`（快捷切换思考挡位，可与 `--model/--provider` 同用；只认内置等级表，表外名称 = 参数错误并列出可用挡位）、`--no-stream`。
 `--parallel-review` = 并行双视角审查（正确性 + 安全性同轮审查、汇合去重，§12.2）；显式开关，默认关闭——开启后每轮审查的调用量约翻倍。`crw graph --parallel-review` 导出该形态的图。
 `crw chat` 选项：`-f, --file <文件>`（以既有代码开始会话）、`--resume <会话号>`、`--max-iter`、`--rounds-mode`、`--strict`、`--no-exec`、`--model / --provider`、`--no-stream`。
-`crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`。
+`crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`、`--thinking <挡位|off>`。
 
 补充约定：
 
@@ -416,7 +425,7 @@ crw --version                             # 版本号
 - `crw chat`：进入会话模式（§4.7）；用户消息由编排节点解释为 `code | review | review_fix | ask`（§5.4）；**单口对话**（仅编排节点面向用户）；
   中断语义：**Ctrl+C 一次 = 中断本轮**（本轮落盘 `status=interrupted`、回提示符、会话保留），**两次 = 退出会话**；`/exit` 与 EOF 为正常退出；
   每轮结束汇报含结构化 `next_action`（done / review_again / fix_again）与"轮次使用情况"；`--resume <会话号>` 恢复记忆、代码版本与轮次设置。
-- `crw runs` 输出列：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数。
+- `crw runs` 输出列：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型（含思考挡位口径）。
 - `crw show` 输出：运行摘要 / 时间线（含每节点的工具调用数与工具调用明细）/ 逐轮 findings 表（含"未收敛"标注与逐条处置）/ 产物路径 /（失败或中断时）错误与"已中断"标注（陈旧 running 标注"可能已中断"）；摘要数据取自 `state.json`（损坏时**降级展示** `log.jsonl` 摘要 + 产物清单，并在 stdout 与 stderr 各给一行说明），逐轮表数据来源 = `workspace/review_*.json`。
 - `crw show` 的"记录损坏"口径（定稿）：**降级展示照给，退出码照实为 2**——人读仍拿得到可用信息，脚本化消费能察觉异常。
 - `crw graph`：输出规范化 mermaid（`__start__`/END 映射为可读标签、条件边标签中文映射）；与实现的一致性核对以节点/边集合快照测试为准（§4.1 为概念图）。
@@ -440,7 +449,7 @@ crw --version                             # 版本号
 - `state.json`：§4.3 状态快照（含 input / review_round / fix_rounds / status / error / history / parent_run_id / strict）。
 - `log.jsonl`：每行一个事件 `{"ts", "node", "event", "iteration"?, "detail"?}`；event ∈ start / end / tool / retry / error / interrupt（`node` 覆盖 encode / review / fix 与引擎级事件 `engine`）。
 - `report.md`：§4.5 报告结构。
-- `review_N.json`：schema = §5.2 契约对象（并行双视角时是汇合结果）；`review_N_<视角>.json`：并行双视角各分支的原始结论（同一 schema）；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
+- `review_N.json`：schema = §5.2 契约对象（含顶层 `files` 清单；并行双视角时是汇合结果）；`review_N_<视角>.json`：并行双视角各分支的原始结论（同一 schema）；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
 - 写入与自检：临时文件 `.<名称>.tmp` + `os.replace` 原子替换（POSIX 尽力 0600）；列表 / 加载忽略 `*.tmp` 与非目录项；运行目录名白名单校验（`r-` 前缀，防路径穿越）；`log.jsonl` 读取时跳过最后一条不完整行、`detail` 只存截断预览（约 400 字符）；`state.json` 在每个节点结束与失败时各原子写一次（引入并行分支后改为图超级步边界，同一超级步只写一次）；`state.json` 损坏时 `crw show` 降级展示 `log.jsonl` 摘要 + 产物清单 + 可读提示；`status=running` 且长时间无更新（判据 = `max(mtime(state.json), mtime(log.jsonl))` 超过 30 分钟；log 逐事件 append + flush）→ 列表 / 展示标注"可能已中断"（不自动改状态）。
 - 会话相关：`session.json`（会话档案）/ `session.md`（会话总报告）/ `memory/<agent>.jsonl`（按 Agent 记忆）见 §4.7；会话轮次的 `state.json` 额外含 `session_id` / `round_index`；`status` 增 `interrupted`（被中断的本轮，`error.node="interrupt"`）；`crw runs` 跨 `runs/` 与 `sessions/*/rounds/` 两处聚合，会话列取自 `session_id`。
 - runs 列表降级派生（单条坏记录不拖垮列表页）：修复轮数 = `state.fix_rounds` → workspace 中 `code_v*.py` 数 − 1 → "?"；残留严重数 = `state.findings` 计数 → 最新可解析 `review_N.json` 计数 → "?"；状态 = `state.status` → `log.jsonl` 末条 event 推断 → unknown。
@@ -460,14 +469,25 @@ crw --version                             # 版本号
 
   | 等级名 | 发送方式 | 备注 |
   |---|---|---|
-  | `off` / `none` / `disabled` | `extra_body={"thinking": {"type": "disabled"}}`（首选）或 `reasoning_effort="none"` | 关闭思考；两通道按表内顺序回退 |
+  | `off` / `disabled` | `extra_body={"thinking": {"type": "disabled"}}` | 关闭思考（DeepSeek 等兼容层支持 Anthropic 风格参数） |
+  | `none` | `reasoning_effort="none"`（OpenAI / DeepSeek 均以 none 表示关闭思考） | 关闭思考的第二通道，按名分派 |
   | `minimal` / `low` / `medium` / `high` | `reasoning_effort="<等级>"` | OpenAI 系与 DeepSeek 系（DeepSeek 官方示例用 `high`） |
   | `max` | `extra_body={"thinking": {"type": "enabled"}}` + `reasoning_effort="high"` | 供应商自定义的"最高档" |
   | `enabled`（布尔开关） | `extra_body={"enable_thinking": true}` | 部分国产兼容端点（以官网为准） |
   | `budget:<n>`（数值预算） | `extra_body={"thinking_budget": n}` | 供应商自定义预算 |
 
-  实现轮须**查各预配置供应商官网**回填挡位（已核实：DeepSeek 支持 `thinking.type` 与 `reasoning_effort`；
-  `langchain-openai 1.7.0` / `openai 3.28.0` 均把 `reasoning_effort` 作一等参数并支持 `extra_body`；`thinking` 非一等参数，必须走 `extra_body`）。
+  实现轮已**查各预配置供应商官网回填**（查证日 2026-10-14）：
+  - **DeepSeek**：`thinking.type` 与 `reasoning_effort`（V4 系档位 `none/low/high/max`）→ 预填 `off/none/low/high/max`；
+  - **Kimi**：`kimi-k3` 用 `reasoning_effort`（`low/high/max`，无 `thinking` 参数）→ 预填 `low/high`；
+    `kimi-k2.6` 支持 `thinking.type=disabled` → 预填 `off`（其开启走 `thinking.type=enabled`，与内置 `enabled` 的
+    `enable_thinking` 通道不同，故不预填）；
+  - **OpenAI**：`reasoning_effort=none/low/medium/high`（GPT-5.1 起 `none` 取代 `minimal`）→ 按此预填；
+  - **阿里云百炼**：`enable_thinking`（布尔）与 `thinking_budget` 走 `extra_body` → 预填 `enabled`（关闭通道为
+    `enable_thinking=false`，与内置 `off` 通道不同，故不预填）；
+  - **Z.ai / BigModel（GLM-5.3 系）**：**不支持关闭思考**（`thinking.type=disabled` 报错），正确通道
+    `thinking.type=enabled` 与内置任何名字的映射都不完全一致 → **不预填**，交用户裁决（告知已列入收尾总结）。
+  - 已核实（锁定版本行为）：`langchain-openai 1.7.0` / `openai 3.28.0` 均把 `reasoning_effort` 作一等参数并支持
+    `extra_body`；`thinking` 非一等参数，必须走 `extra_body`。
   **官网查不到挡位的供应商不猜、不预填**：在收尾总结里**逐条列出交给用户**（用户裁决 2026-10-13："查不到的告诉我，
   我去找"），界面与文档同步留空并提示"可自定义输入"。
 - `crw config` 新增菜单项「模型思考挡位」：选供应商 → 选模型 → 勾选该模型支持的挡位（内置表多选 + 自定义名称输入）

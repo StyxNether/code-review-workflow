@@ -78,8 +78,8 @@ def test_review_round_and_code_version_align_at_each_review_boundary(
 
 
 def test_artifact_names_follow_the_directory_contract() -> None:
-    """产物命名与 Design §4.5 的目录契约一致。"""
-    assert state_mod.code_file_name(2) == "code_v2.py"
+    """产物命名与 Design §4.5 的目录契约一致（版本 = 目录 + manifest，Design §4.2.2）。"""
+    assert state_mod.code_version_dir_name(2) == "code_v2"
     assert state_mod.review_file_name(3) == "review_3.json"
     assert state_mod.fixes_file_name(3) == "fixes_3.json"
 
@@ -106,15 +106,16 @@ def test_snapshot_fills_defaults_for_missing_fields() -> None:
 
 
 def test_snapshot_coerces_paths_and_nested_values() -> None:
-    """Path 与嵌套结构归一为 JSON 可序列化形态（workspace / current_code 为 str）。"""
+    """Path 与嵌套结构归一为 JSON 可序列化形态（workspace / current_version_dir 为 str）。"""
     state = make_state(
-        workspace=Path("runs/x/workspace"), current_code=Path("runs/x/workspace/code_v1.py")
+        workspace=Path("runs/x/workspace"),
+        current_version_dir=Path("runs/x/workspace/code_v1"),
     )
 
     snapshot = state_mod.snapshot(state)
 
     assert snapshot["workspace"] == str(Path("runs/x/workspace"))
-    assert str(snapshot["current_code"]).endswith("code_v1.py")
+    assert str(snapshot["current_version_dir"]).endswith("code_v1")
     json.dumps(snapshot)  # 不抛 = 可序列化
 
 
@@ -158,3 +159,8 @@ def test_summarize_input_truncates_long_requirement() -> None:
 
     assert len(summary) == 20
     assert summary.endswith("…")
+
+
+def test_persisted_fields_and_defaults_stay_in_sync() -> None:
+    """持久化字段表与默认值表必须键同序同：漏同步只会在快照取值时以 KeyError 暴露。"""
+    assert list(state_mod.PERSISTED_FIELDS) == list(state_mod._DEFAULTS)

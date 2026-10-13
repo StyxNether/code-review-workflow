@@ -48,11 +48,17 @@ def _isolate_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     配置层的回退链（CRW_ → CRA_ → SE_CodeAgent）会读它们；不清掉的话，同一份用例
     在有 key 的机器上会走"已配置"分支、换台机器又走"未配置"分支。
     """
-    for name in [*_SDK_ENV_VARS, *(list(os.environ))]:
-        if name == _LEGACY_KEY_ENV or name.startswith(_CREDENTIAL_PREFIXES):
+    for name in [*(list(os.environ)), *_SDK_ENV_VARS]:
+        if name == "CRW_HOME":
+            # 数据目录重定向变量（_isolate_data_dir 设置）必须保留：
+            # 前缀删除若不慎命中它，测试会写进真实 ~/.crw（顺序无关的显式豁免）
+            continue
+        if (
+            name == _LEGACY_KEY_ENV
+            or name.startswith(_CREDENTIAL_PREFIXES)
+            or name in _SDK_ENV_VARS
+        ):
             monkeypatch.delenv(name, raising=False)
-    for name in _SDK_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

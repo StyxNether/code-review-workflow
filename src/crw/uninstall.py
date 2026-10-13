@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -80,6 +81,8 @@ class Inventory:
     registered_env_vars: list[str]
     registry_path: Path
     registry_exists: bool
+    registry_corrupt: bool
+    """登记文件存在但不可解析（与"合法但为空清单"区分：只有前者算未完成的清理项）。"""
     data_dir: Path
     data_dir_exists: bool
     home_override: str
@@ -124,6 +127,7 @@ def collect_inventory(
         registered_env_vars=list(config_mod.registered_env_vars()),
         registry_path=registry,
         registry_exists=registry.exists(),
+        registry_corrupt=_registry_parse_failed(registry),
         data_dir=data_path,
         data_dir_exists=data_path.exists(),
         home_override=override,
@@ -311,16 +315,27 @@ def _run_program_tiers(io: UninstallIO, inventory: Inventory) -> bool:
     return False
 
 
+def _registry_parse_failed(registry: Path) -> bool:
+    """登记文件存在但无法解析出字符串数组清单（合法但为空清单不算损坏）。"""
+    if not registry.exists():
+        return False
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    names = data.get("env_vars") if isinstance(data, dict) else None
+    return not isinstance(names, list)
+
+
 def _run_env_tier(io: UninstallIO, inventory: Inventory) -> bool:
     """③ 本程序登记的环境变量：确认后清理；返回是否发生失败。"""
     names = inventory.registered_env_vars
     if not names:
-        if inventory.registry_exists:
-            # 登记文件在却读不出清单：与"确实无登记"分开提示，避免本程序设置过的
-            # 变量因文件损坏被静默漏清理；按"未完成的清理项"计（退出码 2）——报错
-            # 文案配成功退出码会让脚本化调用者把"可能漏清变量"当成完全成功
+        if inventory.registry_corrupt:
+            # 登记文件在却解析不出清单：与"确实无登记"（含合法空清单）分开提示，避免
+            # 本程序设置过的变量因文件损坏被静默漏清理；按"未完成的清理项"计（退出码 2）
             io.fail(
-                f"环境变量登记文件 {inventory.registry_path} 存在但内容为空或已损坏，"
+                f"环境变量登记文件 {inventory.registry_path} 已损坏，"
                 "无法识别本程序设置过的变量；请手工核对（本次按未完成清理计）。"
             )
             return True
@@ -447,6 +462,12 @@ def _data_dir_block_reason(data_dir: Path, home_override: str) -> str | None:
         target = data_dir
     if (target / ".git").exists():
         return "该目录是一个 Git 仓库（本程序绝不删除仓库目录）"
+    try:
+        home = Path.home().resolve()
+    except OSError:  # pragma: no cover — 解析不出主目录时跳过该道保险
+        home = None
+    if home is not None and (target == home or home.is_relative_to(target)):
+        return "该目录是用户主目录或其上级（本程序绝不删除）"
     cwd = _current_dir()
     if cwd is not None and (cwd == target or cwd.is_relative_to(target)):
         return "该目录是当前工作目录或其上级（删除会连带当前工作目录）"

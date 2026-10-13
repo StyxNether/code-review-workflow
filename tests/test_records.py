@@ -53,6 +53,7 @@ def write_run(
 
 def test_data_dir_follows_crw_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """数据目录经 CRW_HOME 解析（Design §8.3/§9.1）：测试不写真实用户目录。"""
+    monkeypatch.setenv(config.HOME_ENV, str(tmp_path / "crw-home"))  # 用例自洽：不依赖夹具顺序
     assert config.data_dir().is_relative_to(tmp_path)
     assert records.runs_root() == config.data_dir() / "runs"
 
@@ -211,22 +212,23 @@ def test_read_state_rejects_broken_records(tmp_path: Path, content: str) -> None
 def test_read_rounds_pairs_reviews_with_fixes(tmp_path: Path) -> None:
     run_path = write_run(
         workspace={
-            "code_v1.py": "print(1)\n",
-            "review_1.json": json.dumps({"iteration": 1, "file": "code_v1.py", "findings": []}),
+            "code_v1/main.py": "print(1)\n",
+            "review_1.json": json.dumps({"iteration": 1, "files": ["main.py"], "findings": []}),
             "fixes_1.json": json.dumps({"round": 1, "fixes": []}),
             "review_2.json": json.dumps({"iteration": 2, "findings": []}),
             "review_x.json": "{}",
-            "code_v9.py": "print(9)\n",
         }
     )
 
     rounds = records.read_rounds(run_path)
 
     assert [item.round_number for item in rounds] == [1, 2]
-    assert rounds[0].file_name == "code_v1.py"
+    assert rounds[0].version_label == "code_v1/"
+    assert rounds[0].files == ["main.py"]
     assert rounds[0].fixes is not None
     assert rounds[1].fixes is None
-    assert rounds[1].file_name == "code_v2.py"  # file 缺失时按轮次推出工作区实名
+    assert rounds[1].version_label == "code_v2/"  # code_version 缺失时按轮次推出版本目录
+    assert rounds[1].files == []
 
 
 def test_run_artifacts_skip_temporary_and_hidden_files(tmp_path: Path) -> None:
@@ -276,9 +278,9 @@ def test_list_runs_derives_columns_from_workspace_and_reviews() -> None:
             {"ts": "t", "node": "engine", "event": "end", "detail": "residual"},
         ],
         workspace={
-            "code_v1.py": "print(1)\n",
-            "code_v2.py": "print(2)\n",
-            "code_v3.py": "print(3)\n",
+            "code_v1/main.py": "print(1)\n",
+            "code_v2/main.py": "print(2)\n",
+            "code_v3/main.py": "print(3)\n",
             "review_1.json": json.dumps({"findings": [{"severity": "严重"}]}),
             "review_2.json": json.dumps({"findings": [{"severity": "严重"}, {"severity": "严重"}]}),
         },
@@ -458,3 +460,15 @@ def test_fresh_or_finished_runs_are_not_flagged_stale() -> None:
 def test_stale_detection_ignores_non_running_and_missing_state(tmp_path: Path) -> None:
     assert records.is_stale_running(None, tmp_path) is False
     assert records.is_stale_running({"status": state_mod.STATUS_SUCCESS}, tmp_path) is False
+
+
+def test_log_preview_falls_back_for_unserialisable_details(tmp_path: Path) -> None:
+    """detail 含不可 JSON 序列化对象时回退 repr：日志预览不得把整次写日志弄崩。"""
+    path = tmp_path / "log.jsonl"
+
+    records.append_log_event(
+        path, {"ts": "t", "node": "engine", "event": "start", "detail": {1, 2}}
+    )
+
+    line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert "{" in str(line["detail"]) and "}" in str(line["detail"])  # set 的 repr 形态

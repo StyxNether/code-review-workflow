@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fakes
 import pytest
+from langgraph.graph import END
 from support import node_state as state_for
 
 from crw.workflow import graph as graph_mod
@@ -215,9 +216,9 @@ def test_agents_layer_node_names_match_the_graph_declaration() -> None:
 
 SNAPSHOT_SINGLE = """flowchart TD
     start(["开始"])
-    encode["编码 Agent：生成初始代码 code_v1.py"]
+    encode["编码 Agent：生成初始代码版本 code_v1/（1..n 个文件）"]
     review["审查 Agent：读文件 / 运行核实 → findings"]
-    fix["修复 Agent：按 findings 逐条处置 → code_vN+1.py"]
+    fix["修复 Agent：按 findings 逐条处置 → code_vN+1/"]
     finish(["收尾：report.md（干净通过退出码 0 / 达限残留退出码 1）"])
 
     start -- "需求文本" --> encode
@@ -230,11 +231,11 @@ SNAPSHOT_SINGLE = """flowchart TD
 
 SNAPSHOT_PARALLEL = """flowchart TD
     start(["开始"])
-    encode["编码 Agent：生成初始代码 code_v1.py"]
+    encode["编码 Agent：生成初始代码版本 code_v1/（1..n 个文件）"]
     review_correctness["审查 Agent·正确性视角：并行分支，写 findings_correctness"]
     review_security["审查 Agent·安全性视角：并行分支，写 findings_security"]
     merge_reviews["汇合：按 (location, issue) 去重取较严重者、统一重编号 id、审查轮次 +1"]
-    fix["修复 Agent：按合并 findings 逐条处置 → code_vN+1.py"]
+    fix["修复 Agent：按合并 findings 逐条处置 → code_vN+1/"]
     finish(["收尾：report.md（干净通过退出码 0 / 达限残留退出码 1）"])
 
     start -- "需求文本" --> encode
@@ -249,3 +250,17 @@ SNAPSHOT_PARALLEL = """flowchart TD
     fix -- "扇出：同一超级步并行" --> review_correctness
     fix -- "扇出：同一超级步并行" --> review_security
 """
+
+
+def test_route_after_review_tolerates_missing_or_invalid_rounds() -> None:
+    """条件边跑在框架调度路径上：缺键 / None / 非法值不得抛异常（保守按 0 收尾）。"""
+    assert graph_mod.route_after_review({"clean": False}) == END
+    assert (
+        graph_mod.route_after_review({"clean": False, "fix_rounds": None, "max_iterations": None})
+        == END
+    )
+    assert (
+        graph_mod.route_after_review({"clean": False, "fix_rounds": "坏", "max_iterations": 3})
+        == "fix"
+    )
+    assert graph_mod.route_after_review({"clean": True, "fix_rounds": 99}) == END

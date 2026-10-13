@@ -22,6 +22,7 @@ LangChain / LangGraph 类型（消息、图对象、流事件）不越出本模�
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -258,13 +259,14 @@ class _ToolBridgeMiddleware(AgentMiddleware):
             else:
                 if isinstance(response, ToolMessage):
                     response = _normalize_framework_error(response)
-        content = (
-            response.content
-            if isinstance(response, ToolMessage) and isinstance(response.content, str)
-            else ""
-        )
-        if not content.startswith(ERROR_PREFIX):
+        if (
+            isinstance(response, ToolMessage)
+            and isinstance(response.content, str)
+            and not response.content.startswith(ERROR_PREFIX)
+        ):
             self.counter["ok"] += 1
+        # 非 ToolMessage 返回值（框架版本相关的其它形态）：不记成功——执行有效性门禁
+        # 宁可少认一次成功（保守方向），也不能把未知形态虚增成"工具已执行"
         return response
 
 
@@ -334,7 +336,10 @@ class AgentRuntime:
             self._chat_model: BaseChatModel = model
         elif resolved is not None:
             self._chat_model = llm.create_model(
-                resolved.model, api_key=resolved.api_key, base_url=resolved.base_url
+                resolved.model,
+                api_key=resolved.api_key,
+                base_url=resolved.base_url,
+                thinking=resolved.thinking,
             )
         else:
             self._chat_model = llm.create_model()
@@ -349,6 +354,9 @@ class AgentRuntime:
         self._graphs: dict[tuple[str, int], Any] = {}
         self._guardrails: dict[tuple[str, int], _GuardrailMiddleware] = {}
         self._bridges: dict[tuple[str, int], _ToolBridgeMiddleware] = {}
+        # 并行双视角的两个分支在别的线程里共用本 runtime：图的按需编译（_graph_for 的
+        # 读-建-写）与护栏记录的清空 / 取用都必须串行，避免重复编译与记录错位
+        self._lock = threading.RLock()
 
     def run(
         self,
@@ -370,8 +378,12 @@ class AgentRuntime:
             LLMError: 模型调用失败（已翻译为可读中文，不含 SDK 类型）。
             RuntimeError: 模型未给出最终回答等协议级失败。
         """
-        graph, bridge, guardrail = self._graph_for(node, system_prompt, registry)
-        guardrail.notices.clear()
+        graph, bridge, _ = self._graph_for(node, system_prompt, registry)
+        with self._lock:
+            # 清空**全部**变体的护栏记录（含重发用的无工具变体）：drain_notices 遍历全部
+            # guardrail，只清当前变体会让残留在别处的触达记录被后续任务误报为本轮触达
+            for item in self._guardrails.values():
+                item.notices.clear()
         tool_events = 0
         problem: str | None = None
         for attempt in range(1, _ANSWER_RETRY_ATTEMPTS + 1):
@@ -403,7 +415,7 @@ class AgentRuntime:
             # "正文里带回工具调用标记 / 收官回答为空"是协议层的偶发故障（实测 DeepSeek 系），
             # 不是内容问题：重发一次，并把这次重发记进事件流（Design §8.2 的 retry 事件）。
             self._emit({"node": node, "event": "retry", "detail": problem})
-        truncated = _finish_reason(answer.message) == "length"
+        truncated = answer.message is not None and _finish_reason(answer.message) == "length"
         text = answer.text
         if truncated:
             text += _LENGTH_TRUNCATION_NOTICE
@@ -412,9 +424,26 @@ class AgentRuntime:
     def drain_notices(self) -> list[str]:
         """取走并清空护栏触达记录（引擎并入阶段摘要，进 log.jsonl 与时间线）。"""
         notices: list[str] = []
-        for guardrail in self._guardrails.values():
-            notices.extend(guardrail.notices)
-            guardrail.notices.clear()
+        with self._lock:
+            for guardrail in self._guardrails.values():
+                notices.extend(guardrail.notices)
+                guardrail.notices.clear()
+        return notices
+
+    def drain_notices_for(self, node: str) -> list[str]:
+        """只取该节点变体的护栏触达记录（并行分支各自只回收自己的）。
+
+        并行双视角下两个分支共用本 runtime：全局 drain 会把**另一个仍在运行的分支**
+        刚触达的记录一并取走并归到当前节点上。按节点（缓存键首项）过滤后，
+        每条触达只会进入产生它的那个节点的阶段摘要。
+        """
+        notices: list[str] = []
+        with self._lock:
+            for key, guardrail in self._guardrails.items():
+                if key[0] != node:
+                    continue
+                notices.extend(guardrail.notices)
+                guardrail.notices.clear()
         return notices
 
     def model_label(self) -> str:
@@ -454,34 +483,39 @@ class AgentRuntime:
         *,
         tools_enabled: bool = True,
     ) -> tuple[Any, _ToolBridgeMiddleware, _GuardrailMiddleware]:
-        """按节点取（或建）编译后的 agent 图与配套 middleware。
+        """按节点取（或建）编译后的 agent 图与配套 middleware（并发安全）。
 
         图谱缓存按 (节点, 工具集) 维度：同一运行内每个节点的系统提示词与工具集都是常量，
         重复调用（如 ``crw review`` 逐文件审查）复用同一图，避免重复编译；``tools_enabled=False``
-        的"无工具"变体只在回答重发时用到。
+        的"无工具"变体只在回答重发时用到。并行双视角的两个分支会同时到达这里（不同线程），
+        读-建-写整体加锁：重复编译浪费事小，**两个分支各自拿到半初始化的缓存条目**才是隐患。
+        缓存键用 ``id(registry)`` 是安全的：缓存里的编译图经 ``_bridge_tool`` 的闭包
+        **强引用**着该 registry，条目存活期内其 id 不可能被回收复用；registry 生命周期
+        与 runtime 一致（同一运行内按节点构造一次），不会出现"新 registry 命中旧图"。
         """
         key = (node, id(registry), tools_enabled)
-        cached = self._graphs.get(key)
-        if cached is not None:
-            return cached, self._bridges[key], self._guardrails[key]
-        bridge = _ToolBridgeMiddleware(registry)
-        guardrail = _GuardrailMiddleware(
-            max_rounds=self.max_tool_rounds, max_context_tokens=self.max_context_tokens
-        )
-        graph = create_agent(
-            model=self._chat_model,
-            tools=(
-                [_bridge_tool(registry, tool_def) for tool_def in registry.definitions()]
-                if tools_enabled
-                else []
-            ),
-            system_prompt=system_prompt,
-            middleware=[bridge, guardrail],
-        )
-        self._graphs[key] = graph
-        self._bridges[key] = bridge
-        self._guardrails[key] = guardrail
-        return graph, bridge, guardrail
+        with self._lock:
+            cached = self._graphs.get(key)
+            if cached is not None:
+                return cached, self._bridges[key], self._guardrails[key]
+            bridge = _ToolBridgeMiddleware(registry)
+            guardrail = _GuardrailMiddleware(
+                max_rounds=self.max_tool_rounds, max_context_tokens=self.max_context_tokens
+            )
+            graph = create_agent(
+                model=self._chat_model,
+                tools=(
+                    [_bridge_tool(registry, tool_def) for tool_def in registry.definitions()]
+                    if tools_enabled
+                    else []
+                ),
+                system_prompt=system_prompt,
+                middleware=[bridge, guardrail],
+            )
+            self._graphs[key] = graph
+            self._bridges[key] = bridge
+            self._guardrails[key] = guardrail
+            return graph, bridge, guardrail
 
 
 def _bridge_tool(registry: ToolRegistry, tool_def: Tool) -> StructuredTool:

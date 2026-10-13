@@ -23,7 +23,25 @@ MAX_READ_BYTES = 10 * 1024 * 1024
 TEXT_SNIFF_BYTES = 8192
 
 #: list_dir 忽略这些目录与所有点开头的隐藏目录
-IGNORED_DIRS = {".venv", "__pycache__", ".git", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+IGNORED_DIRS = {
+    ".venv",
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    # 常见的大体积构建 / 依赖目录：列出来只会刷爆模型上下文，对审查没有价值
+    "node_modules",
+    "dist",
+    "build",
+    "vendor",
+}
+
+#: read_file 返回文本的字符上限：行数上限（400 行）挡不住"少换行的大文件"（单行 JSON /
+#: minified 产物），再设字符闸门保证回传模型的内容有界
+MAX_READ_OUTPUT_CHARS = 60_000
+#: list_dir 树形输出的行数上限（超大目录截断并提示按子目录深入）
+MAX_LIST_LINES = 400
 
 #: 结构化错误文本的统一前缀（注册表与运行时按它区分"工具失败"与"正常结果"）
 ERROR_PREFIX = "错误："
@@ -93,7 +111,13 @@ def resolve_in_roots(roots: Sequence[Path], raw: str) -> tuple[Path | None, str 
 
 
 def list_dir(roots: Sequence[Path], path: str = ".") -> str:
-    """返回目录的两层树（本层 + 每个子目录的一层），忽略忽略名单与隐藏目录。"""
+    """返回目录的两层树（本层 + 每个子目录的一层），忽略忽略名单与隐藏目录。
+
+    输出有行数上限：超大目录（真实仓库常见）截断并提示用 ``path`` 定位子目录——
+    列表刷爆模型上下文比"看不全"更糟。
+    """
+    if not isinstance(path, str) or not path.strip():
+        return f"{ERROR_PREFIX}path 必须是非空字符串（相对上下文根）"
     root, error = resolve_in_roots(roots, path)
     if error is not None:
         return error
@@ -113,10 +137,24 @@ def list_dir(roots: Sequence[Path], path: str = ".") -> str:
             continue
         if entry.is_dir():
             lines.append(f"├── {entry.name}/")
-            lines.extend(_list_child_dir(entry))
+            lines.extend(_list_child_dir(entry, budget=MAX_LIST_LINES - len(lines)))
         else:
             lines.append(f"├── {entry.name}")
+        if len(lines) >= MAX_LIST_LINES:
+            lines.append(
+                f"{ERROR_PREFIX[2:]}（目录过大，已按 {MAX_LIST_LINES} 行上限截断：请用 path 指定子目录）"
+            )
+            break
     return "\n".join(lines)
+
+
+def _int_or_error(value: object, name: str) -> str | None:
+    """行号参数校验：模型可能把整数写成字符串，给出可读原因而不是让比较抛 TypeError。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"{ERROR_PREFIX}{name} 必须是 1-based 整数行号，当前值：{value!r}"
+    return None
 
 
 def read_file(
@@ -124,9 +162,17 @@ def read_file(
 ) -> str:
     """带行号读取文本文件；1-based 闭区间 ``[start, end]``，单次上限 ``MAX_READ_LINES`` 行。
 
-    二进制文件返回结构化错误（null 字节嗅探：``errors='replace'`` 会把二进制读成乱码
-    刷爆上下文，嗅探才能给模型可操作的提示）。
+    输出另有 ``MAX_READ_OUTPUT_CHARS`` 字符上限：行数上限挡不住少换行的大文件
+    （单行 JSON / minified 产物），字符闸门保证回传模型的内容有界。二进制文件返回
+    结构化错误（null 字节嗅探：``errors='replace'`` 会把二进制读成乱码刷爆上下文，
+    嗅探才能给模型可操作的提示）。
     """
+    if not isinstance(path, str) or not path.strip():
+        return f"{ERROR_PREFIX}path 必须是非空字符串（相对上下文根）"
+    for value, name in ((start, "start"), (end, "end")):
+        type_error = _int_or_error(value, name)
+        if type_error is not None:
+            return type_error
     target, error = resolve_in_roots(roots, path)
     if error is not None:
         return error
@@ -171,6 +217,12 @@ def read_file(
     output = f"{path}（共 {total} 行，显示 {start_line}-{end_line} 行）\n{numbered}"
     if end_line < total and end_line - start_line + 1 == MAX_READ_LINES:
         output += f"\n（已按单次 {MAX_READ_LINES} 行上限截断：请用 start={end_line + 1} 继续读取）"
+    if len(output) > MAX_READ_OUTPUT_CHARS:
+        output = (
+            output[:MAX_READ_OUTPUT_CHARS]
+            + f"\n（输出超过 {MAX_READ_OUTPUT_CHARS} 字符上限，已截断；"
+            "该文件换行很少，请改用 offset 无法细分的部分——建议对超大单行文件用其他方式处理）"
+        )
     return output
 
 
@@ -192,8 +244,12 @@ def file_line(path: str, line: int) -> str:
     return f"{path}:{line}"
 
 
-def _list_child_dir(directory: Path) -> list[str]:
-    """子目录的一层内容（第二层），同样应用忽略规则；不递归第三层。"""
+def _list_child_dir(directory: Path, *, budget: int) -> list[str]:
+    """子目录的一层内容（第二层），同样应用忽略规则；不递归第三层。
+
+    ``budget`` 是剩余可用的行数预算：单个大目录（几万条目）不得在 list_dir 的
+    外层截断检查之前把整份清单塞进输出——预算内截断并给提示。
+    """
     try:
         children = sorted(directory.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
     except OSError:
@@ -202,6 +258,9 @@ def _list_child_dir(directory: Path) -> list[str]:
     for child in children:
         if _is_skipped_entry(child):
             continue
+        if len(lines) >= max(0, budget):
+            lines.append("│   └── …（条目过多已截断）")
+            break
         suffix = "/" if child.is_dir() else ""
         lines.append(f"│   ├── {child.name}{suffix}")
     if not lines:

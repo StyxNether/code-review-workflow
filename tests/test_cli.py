@@ -22,6 +22,7 @@ import crw.cli
 import crw.render
 from crw import config as config_mod
 from crw.cli import build_parser, main
+from crw.workflow import engine as engine_mod
 from crw.workflow import records
 from crw.workflow import state as state_mod
 
@@ -81,7 +82,7 @@ def test_run_defaults() -> None:
     assert args.command == "run"
     assert args.requirement is None
     assert args.file is None
-    assert args.max_iter == 3
+    assert args.max_iter == engine_mod.DEFAULT_MAX_ITERATIONS
     assert args.strict is False
     assert args.no_exec is False
     assert args.out is None
@@ -386,7 +387,9 @@ def test_run_with_syntax_fixture_reports_the_fix_cycle(
     """修复循环：首审含【严重】→ 修复 → 复审干净（退出码 0）。"""
     configured_provider()
     fake_chat_model.load(
-        fakes.fix_cycle_script(code=read_sample("syntax_error.py"), fixed_code=CLEAN_CODE)
+        fakes.fix_cycle_script(
+            code=read_sample("syntax_error.py"), fixed_code=CLEAN_CODE, name="syntax_error.py"
+        )
     )
 
     assert main(["run", "-f", str(sample_path("syntax_error.py"))]) == 0
@@ -395,7 +398,7 @@ def test_run_with_syntax_fixture_reports_the_fix_cycle(
     assert "【严重】" in captured.out  # findings 清单走 stdout
     assert "f-1 → 已修复" in captured.out
     assert "完成：干净通过（共 2 轮审查 / 1 轮修复）" in captured.out
-    assert "第 1 轮（code_v1.py）：1 严重" in captured.err
+    assert "第 1 轮（code_v1/，1 个文件）：1 严重" in captured.err
 
     (summary,) = records.list_runs()
     assert summary.fix_rounds == 1
@@ -409,7 +412,11 @@ def test_run_with_divide_by_zero_fixture_residual(
     """达限残留：退出码 1 + 残留清单（Design §4.4）。"""
     configured_provider()
     fake_chat_model.load(
-        fakes.residual_script(code=read_sample("divide_by_zero.py"), location="code_v2.py:7")
+        fakes.residual_script(
+            code=read_sample("divide_by_zero.py"),
+            name="divide_by_zero.py",
+            location="divide_by_zero.py:7",
+        )
     )
 
     assert main(["run", "--max-iter", "1", "-f", str(sample_path("divide_by_zero.py"))]) == 1
@@ -486,7 +493,9 @@ def test_run_streams_model_text_and_no_stream_buffers_it(
     assert "实现说明" in buffered  # 正文内容不丢
     assert "已收到代码块" in buffered  # 代码围栏只留形状摘要（不刷屏）
     assert "已收到 JSON 结论" in buffered  # 审查契约同理：校验后按分级清单呈现
-    assert "[编码] 生成 code_v1.py" in buffered  # 阶段摘要行在正文之后（阶段收尾时才落这一行）
+    assert (
+        "[编码] 生成 code_v1/（1 个文件" in buffered
+    )  # 阶段摘要行在正文之后（阶段收尾时才落这一行）
 
 
 def test_run_out_copies_final_code_and_report(
@@ -495,14 +504,17 @@ def test_run_out_copies_final_code_and_report(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--out``：最终代码复制为 code_final.py，报告一并复制（Design §4.5）。"""
+    """``--out``：最终版本目录整目录复制为 code_final/，报告一并复制（Design §4.2.2）。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     out_dir = tmp_path / "deliver"
 
     assert main(["run", "写一个计算器", "--out", str(out_dir)]) == 0
 
-    assert (out_dir / "code_final.py").read_text(encoding="utf-8") == CLEAN_CODE.strip("\n") + "\n"
+    assert (out_dir / "code_final" / "main.py").read_text(encoding="utf-8") == CLEAN_CODE.strip(
+        "\n"
+    ) + "\n"
+    assert (out_dir / "code_final" / "manifest.json").is_file()
     assert "结论" in (out_dir / "report.md").read_text(encoding="utf-8")
     assert "已复制" in capsys.readouterr().err
 
@@ -512,17 +524,18 @@ def test_run_out_avoids_overwriting_existing_outputs(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
 ) -> None:
-    """重名加序号：已有 code_final.py 时写到 code_final_2.py，不覆盖用户文件（Design §4.5）。"""
+    """重名加序号：已有 code_final/ 时写到 code_final_2/，不覆盖用户文件（Design §4.5）。"""
     configured_provider()
     out_dir = tmp_path / "deliver"
     out_dir.mkdir()
-    (out_dir / "code_final.py").write_text("# 用户自己的文件\n", encoding="utf-8")
+    (out_dir / "code_final").mkdir()
+    (out_dir / "code_final" / "keep.txt").write_text("# 用户自己的文件\n", encoding="utf-8")
 
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     assert main(["run", "写一个计算器", "--out", str(out_dir)]) == 0
 
-    assert (out_dir / "code_final.py").read_text(encoding="utf-8") == "# 用户自己的文件\n"
-    assert (out_dir / "code_final_2.py").is_file()
+    assert (out_dir / "code_final" / "keep.txt").read_text(encoding="utf-8") == "# 用户自己的文件\n"
+    assert (out_dir / "code_final_2" / "main.py").is_file()
     assert (out_dir / "report_2.md").is_file()
 
 
@@ -563,7 +576,7 @@ def test_run_reports_unreadable_file_as_run_error(capsys: pytest.CaptureFixture[
     assert records.list_runs() == []  # 输入读不到：不产生运行记录
 
 
-def test_runs_lists_the_six_columns(
+def test_runs_lists_the_designed_columns(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
@@ -576,7 +589,15 @@ def test_runs_lists_the_six_columns(
     assert main(["runs"]) == 0
 
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0].split() == ["运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数"]
+    assert lines[0].split() == [
+        "运行号",
+        "时间",
+        "输入摘要",
+        "状态",
+        "修复轮数",
+        "残留严重数",
+        "模型",
+    ]
     assert any("写一个计算器" in line for line in lines[1:])  # 数据行（不依赖表头 / 分隔行序）
 
 
@@ -596,7 +617,8 @@ def test_show_renders_the_record(
         fakes.fix_cycle_script(
             code=read_sample("syntax_error.py"),
             fixed_code=CLEAN_CODE,
-            location="code_v1.py:7",
+            name="syntax_error.py",
+            location="syntax_error.py:7",
         )
     )
     main(["run", "-f", str(sample_path("syntax_error.py"))])
@@ -609,7 +631,7 @@ def test_show_renders_the_record(
     assert f"── 运行 {summary.run_id}" in text
     assert "[状态] 干净通过" in text
     assert "时间线：" in text and "逐轮审查：" in text
-    assert "【严重】code_v1.py:7" in text and "← 处置：已修复" in text
+    assert "【严重】syntax_error.py:7" in text and "← 处置：已修复" in text
     assert "report.md" in text
 
 
@@ -678,8 +700,12 @@ def test_run_state_file_records_the_cli_options(
     configured_provider()
     fake_chat_model.load(
         [
-            fakes.ai_tool_call("read_file", path="code_v1.py"),
-            fakes.ai_text(fakes.review_fence([fakes.finding(location="code_v1.py:7")])),
+            fakes.ai_tool_call("read_file", path="code_v1/divide_by_zero.py"),
+            fakes.ai_text(
+                fakes.review_fence(
+                    [fakes.finding(location="divide_by_zero.py:7")], files=["divide_by_zero.py"]
+                )
+            ),
         ]
     )
 
@@ -1185,3 +1211,213 @@ def engine_result_without_dir() -> object:
         interrupted=False,
         state={},
     )
+
+
+# ---- M3.5：旧单文件记录守卫与思考挡位回显（Design §4.2.2、§8.3） ----
+
+
+def _write_legacy_record(run_id: str = "r-20261012-0001") -> str:
+    """造一条旧单文件格式的运行记录（带 current_code、无 current_version_dir）。"""
+    run_dir = records.create_run_dir(run_id)
+    state = {
+        "run_id": run_id,
+        "input": {"kind": "file", "source_path": "legacy.py"},
+        "workspace": str(run_dir / "workspace"),
+        "review_round": 1,
+        "fix_rounds": 0,
+        "max_iterations": 3,
+        "current_code": str(run_dir / "workspace" / "code_v1.py"),
+        "findings": [],
+        "status": "success",
+        "model": "DeepSeek/deepseek-flash",
+        "created_at": "2026-10-12T09:00:00+08:00",
+        "finished_at": "2026-10-12T09:01:00+08:00",
+    }
+    records.atomic_write_text(run_dir / "state.json", json.dumps(state, ensure_ascii=False))
+    return run_id
+
+
+def test_show_rejects_legacy_single_file_records(capsys: pytest.CaptureFixture[str]) -> None:
+    """旧格式记录不做兼容：一行可读提示 + 退出码 2，不崩溃（用户裁决 2026-10-13）。"""
+    run_id = _write_legacy_record()
+
+    assert main(["show", run_id]) == 2
+
+    captured = capsys.readouterr()
+    assert "单文件格式" in captured.err and "无法" not in "".join(captured.out)
+
+
+def test_resume_rejects_legacy_single_file_records(
+    configured_provider: Callable[[], dict[str, object]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configured_provider()
+    run_id = _write_legacy_record()
+
+    assert main(["resume", run_id]) == 2
+
+    captured = capsys.readouterr()
+    assert "单文件格式" in captured.err
+    assert len(records.list_runs()) == 1  # 未新建运行
+
+
+def test_run_with_thinking_override_echoes_it_everywhere(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--thinking`` 快捷切换：头行、state.model、报告口径一致（Design §8.3 的回显要求）。"""
+    configured_provider()
+    fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
+
+    assert main(["run", "写一个计算器", "--thinking", "high"]) == 0
+
+    captured = capsys.readouterr()
+    assert "[模型] DeepSeek/deepseek-flash（思考：high）" in captured.err
+    (summary,) = records.list_runs()
+    state = records.read_state(summary.path)
+    assert state is not None
+    assert state["model"] == "DeepSeek/deepseek-flash（思考：high）"
+    assert summary.model == "DeepSeek/deepseek-flash（思考：high）"
+    report = (summary.path / "report.md").read_text(encoding="utf-8")
+    assert "| 模型 | DeepSeek/deepseek-flash（思考：high） |" in report
+
+
+def test_thinking_unknown_level_is_a_parameter_error(
+    configured_provider: Callable[[], dict[str, object]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """表外挡位 = 参数错误（退出码 2，列出可用挡位），不静默夹取（Design §8.3）。"""
+    configured_provider()
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "写一个计算器", "--thinking", "turbo"])
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "未知思考挡位" in captured.err
+    assert "budget:<n>" in captured.err and "high" in captured.err  # 可用挡位清单
+    assert records.list_runs() == []
+
+
+def test_config_menu_sets_model_thinking_levels(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """菜单 6「模型思考挡位」：勾选挡位 + 设默认，写回 models.json 的对象条目形态。"""
+    answers = iter(
+        [
+            "1",  # 菜单：添加供应商
+            "2",  # 类型：DeepSeek
+            "",  # 接入点：官方
+            "",  # 模型清单：用预填
+            "placeholder-key",
+            "1",  # key 存明文
+            "6",  # 菜单：模型思考挡位
+            "1",  # 供应商
+            "1",  # 模型
+            "off,low,high",  # 勾选挡位
+            "high",  # 默认挡位
+            "0",  # 退出
+        ]
+    )
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    data = config_mod.load_raw()
+    models = data["providers"][0]["models"]
+    assert models[0] == {
+        "name": "deepseek-flash",
+        "thinking": {"levels": ["off", "low", "high"], "selected": "high"},
+    }
+
+
+def test_config_menu_thinking_clears_when_told_to(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """菜单 6 输入"清空"：条目退回纯字符串形态（不发送任何思考参数）。"""
+    data: dict = {
+        "providers": [
+            {
+                "name": "DeepSeek",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "placeholder-key",
+                "models": [
+                    {"name": "deepseek-flash", "thinking": {"levels": ["high"], "selected": "high"}}
+                ],
+            }
+        ],
+    }
+    config_mod.save_raw(data)
+    answers = iter(["6", "1", "1", "清空", ""])
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    reloaded = config_mod.load_raw()
+    assert reloaded["providers"][0]["models"] == ["deepseek-flash"]
+
+
+def test_run_out_is_skipped_when_the_run_produced_no_version(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """失败运行没有版本目录：--out 不得把当前工作目录当产物复制（Path("") 退化回归）。"""
+    configured_provider()
+    fake_chat_model.load([fakes.ai_text("没有任何围栏的坏输出"), fakes.ai_text("还是坏输出")])
+    out_dir = tmp_path / "deliver"
+
+    assert main(["run", "写一个计算器", "--out", str(out_dir)]) == 2
+
+    # 产物目录里只应出现报告这一项：不得把当前工作目录（仓库）当版本复制进去
+    assert not (out_dir / "code_final").exists()
+    assert sorted(path.name for path in out_dir.iterdir()) == ["report.md"]
+    assert "已复制" in capsys.readouterr().err
+
+
+def test_run_file_input_respects_the_read_limit(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """-f 输入与 crw review 同口径的读取上限（超限给可读报错，不整文件进内存）。"""
+    import crw.tools.fs
+
+    configured_provider()
+    big = tmp_path / "big.py"
+    big.write_text("# pad\n" * 200, encoding="utf-8")
+    monkeypatch.setattr(crw.tools.fs, "MAX_READ_BYTES", 100)
+
+    assert main(["run", "-f", str(big)]) == 2
+
+    assert "读取上限" in capsys.readouterr().err
+
+
+def test_version_copy_sources_follow_the_manifest(tmp_path: Path) -> None:
+    """``--out`` 复制版本目录时以 manifest 为准：执行副产物（__pycache__ / 数据文件）
+    不得进交付产物（真实演示暴露：--out 曾把 __pycache__ 一并复制）。"""
+    version_dir = tmp_path / "code_v1"
+    version_dir.mkdir()
+    (version_dir / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (version_dir / "notes.txt").write_text("副产物\n", encoding="utf-8")
+    (version_dir / "__pycache__").mkdir()
+    (version_dir / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+    (version_dir / "manifest.json").write_text(
+        json.dumps({"version": 1, "files": [{"path": "main.py", "sha256": "x", "lines": 1}]}),
+        encoding="utf-8",
+    )
+
+    sources = crw.cli._version_copy_sources(version_dir)
+    assert sorted(path.name for path in sources) == ["main.py", "manifest.json"]
+
+    # manifest 缺失（旧目录 / 手工介入）：退回全目录复制，仍排除字节码
+    (version_dir / "manifest.json").unlink()
+    fallback = crw.cli._version_copy_sources(version_dir)
+    assert sorted(path.name for path in fallback) == ["main.py", "notes.txt"]

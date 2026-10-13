@@ -26,6 +26,7 @@ import threading
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TextIO
 
 from rich.console import Console
@@ -288,8 +289,12 @@ def _marker_candidate(partial: str) -> bool:
 
 
 def _marker_of(line: str) -> tuple[str, str] | None:
-    """整行是否为围栏标记；返回 ``(围栏串, 语言标签)``（普通正文返回 ``None``）。"""
-    body = line.rstrip("\n")
+    """整行是否为围栏标记；返回 ``(围栏串, 语言标签)``（普通正文返回 ``None``）。
+
+    行尾同时剥 ``\r``：模型正文若按 CRLF 落行，标记正则的 ``[ \\t]*$`` 匹配不上 ``\r``，
+    非 python/json 标签的围栏会被当成正文整块漏出去。
+    """
+    body = line.rstrip("\r\n")
     match = _MARKER_RE.match(body)
     if match is not None:
         return match.group("fence"), match.group("info").lower()
@@ -341,7 +346,12 @@ class RunRenderer:
                 run_id = str(event.get("run_id") or "?")
                 self._line(f"── 运行 {run_id} " + "─" * _RULE_WIDTH, style="bold")
                 self._line(f"[输入] {text}", style="dim")
-            return  # 收尾结论由命令面经 render_result 渲染
+                model = str(event.get("model") or "")
+                if model:
+                    self._line(f"[模型] {model}", style="dim")
+                return  # 收尾结论由命令面经 render_result 渲染
+            if kind not in ("error", "interrupt"):
+                return  # 引擎级 end 由 render_result 渲染；其余未知事件不在此臆造输出
         if kind == "start":
             with self._lock:
                 self._open_stages.append(node)
@@ -391,9 +401,13 @@ class RunRenderer:
             self._buffers.setdefault(node, []).append(text)
 
     def flush_text(self) -> None:
-        """把所有缓存的正文整体输出（阶段结束 / 出错前的收尾）。"""
+        """把所有缓存的正文整体输出（阶段结束 / 出错前的收尾）。
+
+        遍历"缓冲"与"过滤器"两类暂存：流式写出的节点没有缓冲，但其过滤器里可能仍
+        暂扣着行首片段或待闭合的围栏——只遍历缓冲会把它们丢掉。
+        """
         with self._lock:
-            nodes = list(self._buffers)
+            nodes = list(self._buffers.keys() | self._filters.keys())
         for node in nodes:
             self._end_stage(node, keep_open=True)
 
@@ -409,7 +423,7 @@ class RunRenderer:
         self,
         *,
         round_number: int,
-        file_name: str,
+        version_label: str,
         findings: Sequence[Mapping[str, Any]],
         summary: str,
         view: str | None = None,
@@ -604,7 +618,7 @@ def render_runs(
     out: TextIO | None = None,
     color: bool | None = None,
 ) -> None:
-    """运行列表：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数（Design §8.1）。"""
+    """运行列表：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型（Design §8.1）。"""
     guarded(lambda: _render_runs(summaries, out=out, color=color))
 
 
@@ -618,7 +632,7 @@ def _render_runs(
     if not summaries:
         console.print("（暂无运行记录；先执行 crw run）")
         return
-    header = ("运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数")
+    header = ("运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数", "模型")
     rows = [
         (
             item.run_id,
@@ -627,6 +641,7 @@ def _render_runs(
             engine_mod.status_label(item.status) + ("（可能已中断）" if item.stale else ""),
             _number(item.fix_rounds),
             _number(item.residual_severe),
+            item.model or "（未记录）",
         )
         for item in summaries
     ]
@@ -741,7 +756,7 @@ def _render_detail(
             findings = findings if isinstance(findings, list) else []
             counts = contracts.severity_counts(findings)
             console.print(
-                f"  第 {item.round_number} 轮（{item.file_name}）："
+                f"  第 {item.round_number} 轮（{item.version_label}{len(item.files)} 个文件）："
                 f"{counts[contracts.SEVERE]} 严重 / {counts[contracts.MODERATE]} 一般 / "
                 f"{counts[contracts.ADVICE]} 建议",
                 style="bold",
@@ -939,12 +954,21 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> str:
-    """详情页的输入行：``-f`` / resume 输入标注来源与工作区映射（Design §4.5）。"""
+    """详情页的输入行：``-f`` / resume 输入标注来源与工作区映射（Design §4.5）。
+
+    resume 的来源是父运行的版本目录（名称形如 ``code_vN``），映射口径为
+    "父版本目录 → ``code_v1/``"；``-f`` 为"原文件 → ``code_v1/<原文件名>``"。
+    """
     descriptor = _mapping(state.get("input"))
     if descriptor.get("kind") == state_mod.INPUT_FILE:
+        source = str(descriptor.get("source_path") or "")
+        if re.fullmatch(r"code_v\d+", Path(source).name or ""):
+            return (
+                f"父运行版本目录：{source or '（未记录）'} → {state_mod.code_version_dir_name(1)}/"
+            )
         return (
-            f"文件：{descriptor.get('source_path') or '（未记录路径）'}"
-            f" → {state_mod.code_file_name(1)}"
+            f"文件：{source or '（未记录路径）'}"
+            f" → {state_mod.code_version_dir_name(1)}/{Path(source).name if source else '（未命名）'}"
         )
     if not descriptor:
         return summary.input_summary
@@ -956,7 +980,13 @@ def review_json_report(merged: Mapping[str, Any]) -> str:
     stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines = ["# crw 审查报告", "", f"> 生成时间：{stamp}（--json 模式）", ""]
     for entry in merged.get("files") or []:
-        lines += [f"## {entry['file']}", "", f"**整体评价**：{entry['summary']}", ""]
+        # 展示层不做契约假设：条目缺字段时给占位，不让报告端直接 KeyError
+        lines += [
+            f"## {entry.get('file') or '（未命名文件）'}",
+            "",
+            f"**整体评价**：{entry.get('summary') or ''}",
+            "",
+        ]
         for finding in entry.get("findings") or []:
             uncertain = "（不确定）" if finding.get("uncertain") else ""
             lines += [

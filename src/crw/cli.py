@@ -8,6 +8,7 @@ Design §8.1。输出通道按 §8.4 分流：结论 / findings 清单 / 报告�
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import importlib.metadata
 import json
@@ -23,6 +24,7 @@ from typing import Any
 from . import agents as agents_mod
 from . import config as config_mod
 from . import render
+from . import thinking as thinking_mod
 from . import tools as tools_mod
 from . import uninstall as uninstall_mod
 from .workflow import contracts as contracts_mod
@@ -84,11 +86,32 @@ class _MaxIterAction(argparse.Action):
         namespace.max_iter_source = state_mod.SOURCE_CLI
 
 
+def _thinking_level(text: str) -> str:
+    """解析 ``--thinking``：只认内置等级表（不要求该模型预配置过该挡位，Design §8.3）。
+
+    表外名称按参数错误处理（退出码 2 并列出可用挡位），不静默夹取。
+    """
+    if thinking_mod.is_builtin_level(text):
+        return text.strip()
+    raise argparse.ArgumentTypeError(
+        f"未知思考挡位 {text!r}；可用挡位：{thinking_mod.available_levels_text()}"
+    )
+
+
 def _add_model_options(parser: argparse.ArgumentParser) -> None:
     """添加 run / resume / review 共用的执行与模型覆盖选项。"""
     parser.add_argument("--no-exec", action="store_true", help="禁止运行代码核实")
     parser.add_argument("--model", metavar="名", help="临时覆盖模型")
     parser.add_argument("--provider", metavar="名", help="临时覆盖供应商")
+    parser.add_argument(
+        "--thinking",
+        type=_thinking_level,
+        metavar="挡位",
+        help=(
+            "快捷切换思考挡位（优先于配置，可与 --model/--provider 同用；"
+            f"可用：{thinking_mod.available_levels_text()}）"
+        ),
+    )
 
 
 def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
@@ -235,8 +258,14 @@ def _report_failure(command: str | None, exc: Exception) -> int:
 # ---- 模型解析与运行装配 ----
 
 
-def _resolve_model(model: str | None, provider: str | None, command: str) -> Any:
-    """解析本次运行的模型连接；失败给可读指引并返回 ``None``（调用方退出 2）。"""
+def _resolve_model(
+    model: str | None, provider: str | None, command: str, *, thinking: str | None = None
+) -> Any:
+    """解析本次运行的模型连接；失败给可读指引并返回 ``None``（调用方退出 2）。
+
+    ``thinking``（``--thinking``）优先于配置里的挡位：切换模型的当次就能指定挡位
+    （用户裁决 2026-10-13），不要求该模型预配置过该挡位。
+    """
     try:
         resolved = config_mod.resolve(model=model, provider=provider)
     except config_mod.ConfigError as exc:
@@ -252,6 +281,8 @@ def _resolve_model(model: str | None, provider: str | None, command: str) -> Any
         if legacy_hint:
             print(legacy_hint, file=sys.stderr)
         return None
+    if thinking:
+        resolved = dataclasses.replace(resolved, thinking=thinking)
     return resolved
 
 
@@ -265,28 +296,36 @@ def _legacy_config_hint() -> str:
     return f"提示：检测到前作配置 {legacy}——运行 crw config 可选择导入（不会修改前作文件）。"
 
 
-def _read_input_file(path: Path, *, command: str = "run") -> tuple[str | None, int]:
-    """读取输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。
-
-    ``command`` 只影响报错前缀：resume 读的是父运行的代码版本，报错里写 "crw run" 会把
-    用户引到错误的命令上。
-    """
+def _read_input_file(path: Path) -> tuple[str | None, int]:
+    """读取输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。"""
     if not path.exists():
-        print(f"crw {command}：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
+        print(f"crw run：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
         return None, _EXIT_ERROR
     if path.is_dir():
         print(
-            f"crw {command}：运行失败 — 输入是目录：{path}（-f 需要一个代码文件）",
+            f"crw run：运行失败 — 输入是目录：{path}（-f 需要一个代码文件）",
+            file=sys.stderr,
+        )
+        return None, _EXIT_ERROR
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        print(f"crw run：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
+        return None, _EXIT_ERROR
+    if size > tools_mod.fs.MAX_READ_BYTES:
+        print(
+            f"crw run：运行失败 — 输入文件超过单次读取上限"
+            f"（{tools_mod.fs.MAX_READ_BYTES // 1048576} MB）：{path}",
             file=sys.stderr,
         )
         return None, _EXIT_ERROR
     try:
         return path.read_text(encoding="utf-8"), _EXIT_OK
     except UnicodeDecodeError:
-        print(f"crw {command}：运行失败 — 输入文件不是 UTF-8 文本：{path}", file=sys.stderr)
+        print(f"crw run：运行失败 — 输入文件不是 UTF-8 文本：{path}", file=sys.stderr)
         return None, _EXIT_ERROR
     except OSError as exc:
-        print(f"crw {command}：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
+        print(f"crw run：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
         return None, _EXIT_ERROR
 
 
@@ -304,7 +343,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         source_text, error_code = _read_input_file(source_path)
         if source_text is None:
             return error_code
-    resolved = _resolve_model(args.model, args.provider, "run")
+    resolved = _resolve_model(args.model, args.provider, "run", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
     request = engine_mod.RunRequest(
@@ -318,7 +357,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         parallel_review=bool(args.parallel_review),
         resolved=resolved,
     )
-    engine = engine_mod.WorkflowEngine(observer=render.RunRenderer(stream=not args.no_stream))
+    engine = engine_mod.WorkflowEngine(
+        observer=render.RunRenderer(stream=not args.no_stream),
+        confirm_deletions=_deletion_confirmer(),
+    )
     result = engine.execute(request)
     render.render_result(result, command="run")
     if args.out:
@@ -327,48 +369,110 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _export_outputs(result: engine_mod.RunResult, out_dir: Path) -> None:
-    """``--out``：把最终代码与报告复制到指定目录（Design §4.5；重名加序号）。
+    """``--out``：把最终版本目录与报告复制到指定目录（Design §4.2.2 / §4.5；重名加序号）。
 
+    版本目录整目录复制为 ``<out>/code_final/``（目录内含 manifest.json 与全部文件）；
     复制失败不影响运行结论（Design §4.6）：只向 stderr 警示，退出码仍按运行状态。
     """
     if result.run_dir is None:
         print("crw run：本次运行没有工作目录，--out 已跳过（无产物可复制）。", file=sys.stderr)
         return
-    code_path = Path(str(result.state.get("current_code") or ""))
+    version_text = str(result.state.get("current_version_dir") or "")
+    version_dir = Path(version_text)
     report_path = result.run_dir / "report.md"
     kinds: dict[str, Path] = {}
-    if code_path.is_file():
-        kinds["code_final"] = code_path
+    # 空值必须显式挡住：Path("") 等价于 Path(".")，会把整个当前工作目录当产物复制
+    if version_text and version_dir.is_dir():
+        kinds["code_final"] = version_dir
     if report_path.is_file():
         kinds["report"] = report_path
     if not kinds:
-        print("crw run：--out 无可复制产物（本次运行未产出代码或报告）。", file=sys.stderr)
+        print("crw run：--out 无可复制产物（本次运行未产出代码版本或报告）。", file=sys.stderr)
         return
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(f"crw run：--out 目录创建失败 — {out_dir}（{exc}）", file=sys.stderr)
         return
-    # 代码与报告成对加序号：两者一并落到同一序号，产物目录里不会出现"半新半旧"的一组
+    # 版本目录与报告成对加序号：两者一并落到同一序号，产物目录里不会出现"半新半旧"的一组
     index = 1
     while True:
         suffix = "" if index == 1 else f"_{index}"
-        names = {
-            "code_final": f"code_final{suffix}.py",
-            "report": f"report{suffix}.md",
+        targets = {
+            "code_final": out_dir / f"code_final{suffix}",
+            "report": out_dir / f"report{suffix}.md",
         }
-        targets = {kind: out_dir / names[kind] for kind in kinds}
-        if all(not target.exists() for target in targets.values()):
+        if all(not targets[kind].exists() for kind in kinds):
             break
         index += 1
     for kind, target in targets.items():
-        source = kinds[kind]
+        source = kinds.get(kind)
+        if source is None:
+            continue
         try:
-            records_mod.atomic_write_text(target, source.read_text(encoding="utf-8"))
+            if source.is_dir():
+                for file_path in _version_copy_sources(source):
+                    relative = file_path.relative_to(source)
+                    destination = target / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    records_mod.atomic_write_text(
+                        destination, file_path.read_text(encoding="utf-8")
+                    )
+            else:
+                records_mod.atomic_write_text(target, source.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError) as exc:
-            print(f"crw run：--out 复制失败 — {source.name} → {target}（{exc}）", file=sys.stderr)
+            print(f"crw run：--out 复制失败 — {source} → {target}（{exc}）", file=sys.stderr)
             return
         print(f"已复制：{target}", file=sys.stderr)
+
+
+def _version_copy_sources(version_dir: Path) -> list[Path]:
+    """``--out`` 复制版本目录时的源文件清单：以 manifest.json 为准（含 manifest 自身）。
+
+    manifest 缺失（旧目录 / 手工介入）时退回全目录复制，并排除字节码与隐藏 / 临时文件——
+    执行核实落在版本目录里的副产物不得进交付产物。
+    """
+    manifest = version_dir / "manifest.json"
+    entries: list[str] | None = None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("files"), list):
+        names = [
+            str(item.get("path"))
+            for item in data["files"]
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and item.get("path")
+        ]
+        entries = [*names, "manifest.json"] if names else None
+    if entries is not None:
+        return [version_dir / name for name in entries]
+    return [
+        path
+        for path in sorted(version_dir.rglob("*"))
+        if path.is_file()
+        and not path.name.startswith(".")
+        and not path.name.endswith(".tmp")
+        and path.suffix != ".pyc"
+        and "__pycache__" not in path.relative_to(version_dir).parts
+    ]
+
+
+def _deletion_confirmer() -> engine_mod.DeletionConfirmer | None:
+    """删除确认闸门（Design §4.2.2）：非交互（管道 / CI）返回 ``None``（一律保留）。"""
+    if not sys.stdin.isatty():
+        return None
+
+    def confirm(requests: Sequence[Mapping[str, Any]]) -> bool:
+        print("修复提出删除以下文件：", file=sys.stderr)
+        for item in requests:
+            reasons = "；".join(str(reason) for reason in item.get("reasons") or ())
+            detail = f"（依据：{reasons}）" if reasons else "（本轮 findings 未提及该文件）"
+            print(f"  - {item.get('path')} {detail}", file=sys.stderr)
+        answer = render.ask_user("确认删除这些文件？（y/N，直接回车 = 保留）：")
+        return answer is not None and answer.lower() in ("y", "yes")
+
+    return confirm
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
@@ -427,14 +531,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if detail.degraded:
         print(f"crw show：记录损坏，已降级展示 — {detail.degraded_reason}", file=sys.stderr)
         return _EXIT_ERROR
+    if records_mod.is_legacy_record(detail.state):
+        print(
+            "crw show：该记录来自单文件格式（M3.5 前），已被多文件版本格式取代，不再支持展示。",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
     return _EXIT_OK
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    """续跑：以父运行的最新代码版本为新运行的起点（Design §4.4）。
+    """续跑：以父运行的最新版本目录为新运行的起点（Design §4.2.2 / §4.4）。
 
-    ``-f`` 不适用（起点由父运行决定）；父运行须存在 ``current_code`` 且文件仍在，否则给出
-    可读原因并退出 2。未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
+    ``-f`` 不适用（起点由父运行决定）；父运行须存在 ``current_version_dir`` 且目录仍在，
+    否则给出可读原因并退出 2。旧单文件格式记录不做兼容（用户裁决 2026-10-13）：给一行
+    可读提示并退出 2。未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
     ``--strict`` 与审查形态一并继承——续跑是"接着修"，换判定标准会让结论不可比。
     ``--no-exec`` 不继承（它不进状态快照，命令面无法可靠区分"显式关闭"与"从未设置"）。
     """
@@ -451,25 +562,29 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return _EXIT_ERROR
-    code_path = Path(str(parent_state.get("current_code") or ""))
-    if not code_path.is_file():
+    if records_mod.is_legacy_record(parent_state):
         print(
-            f"crw resume：父运行 {args.run_id} 没有可续跑的代码版本"
-            f"（current_code：{code_path or '（未记录）'}）——该运行可能在建码前就失败了。",
+            "crw resume：该记录来自单文件格式（M3.5 前），已被多文件版本格式取代，无法续跑。",
             file=sys.stderr,
         )
         return _EXIT_ERROR
-    source_text, error_code = _read_input_file(code_path, command="resume")
-    if source_text is None:
-        return error_code
-    resolved = _resolve_model(args.model, args.provider, "resume")
+    version_text = str(parent_state.get("current_version_dir") or "")
+    version_dir = Path(version_text)
+    if not version_text or not version_dir.is_dir():
+        print(
+            f"crw resume：父运行 {args.run_id} 没有可续跑的代码版本"
+            f"（current_version_dir：{version_text or '（未记录）'}）——"
+            "该运行可能在建码前就失败了。",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    resolved = _resolve_model(args.model, args.provider, "resume", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
     # 轮次取值来源：命令行显式 > 父运行继承（配置默认 ~/.crw/settings.json 随 M4 落地）
     inherited_rounds = _inherited_rounds(parent_state, args.run_id)
     request = engine_mod.RunRequest(
-        source_path=code_path,
-        source_text=source_text,
+        source_dir=version_dir,
         max_iterations=args.max_iter if args.max_iter_source else inherited_rounds,
         max_iterations_source=args.max_iter_source or state_mod.SOURCE_PARENT,
         strict=bool(args.strict) or bool(parent_state.get("strict")),
@@ -478,7 +593,10 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         resolved=resolved,
         parent_run_id=args.run_id,
     )
-    engine = engine_mod.WorkflowEngine(observer=render.RunRenderer(stream=not args.no_stream))
+    engine = engine_mod.WorkflowEngine(
+        observer=render.RunRenderer(stream=not args.no_stream),
+        confirm_deletions=_deletion_confirmer(),
+    )
     result = engine.execute(request)
     render.render_result(result, command="resume")
     if args.out:
@@ -618,7 +736,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
     except _ReviewInputError as exc:
         print(f"crw review：{exc}", file=sys.stderr)
         return _EXIT_ERROR
-    resolved = _resolve_model(args.model, args.provider, "review")
+    resolved = _resolve_model(args.model, args.provider, "review", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
     observer = render.RunRenderer(stream=True)
@@ -646,7 +764,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
             )
         except Exception as exc:  # noqa: BLE001 — 单文件失败继续批量；最终退出码 2
             print(
-                f"[审查失败] {display_name}：{_SECRET_PATTERN.sub('sk-***', str(exc))}",
+                f"[审查失败] {display_name}：{_mask_secrets(str(exc))}",
                 file=sys.stderr,
             )
             failed = True
@@ -762,10 +880,17 @@ def _print_providers(data: dict[str, Any]) -> None:
         return
     _say(f"默认模型：{data.get('default') or '（未设置）'}")
     for entry in providers:
+        thinking_notes = []
+        for item in entry.get("models") or []:
+            if isinstance(item, dict) and item.get("thinking"):
+                selected = item["thinking"].get("selected")
+                thinking_notes.append(f"{item.get('name')}（思考：{selected or '未设'}）")
+        note = f"　挡位：{'、'.join(thinking_notes)}" if thinking_notes else ""
         _say(
             f"  - {entry['name']}　base_url={entry['base_url']}"
             f"　key={_mask_key(entry.get('api_key'), entry['name'])}"
-            f"　模型：{', '.join(entry['models'])}"
+            f"　模型：{', '.join(config_mod.model_names(entry.get('models') or []))}"
+            f"{note}"
         )
 
 
@@ -821,7 +946,7 @@ def _input_base_url_and_models(
     base_url = base_input or default_base
     if preset is not None:
         models = list(preset.models)
-        _say(f"预填模型清单：{', '.join(models)}")
+        _say(f"预填模型清单：{', '.join(config_mod.model_names(models))}")
         use_prefill = _ask("是否使用预填模型清单？（Y/n）")
         if use_prefill is None:
             _say("已取消。")
@@ -1002,7 +1127,11 @@ def _config_add_provider(session: _ConfigSession) -> None:
         _say("已取消：未添加该供应商（key 输入被中断）。")
         return
     if key:
-        _apply_key_storage(session, entry, key)
+        if not _apply_key_storage(session, entry, key):
+            _say(
+                "提示：key 未写入任何存储（存储选择被取消）——该供应商将走环境变量回退，"
+                "可稍后用菜单 5 补设。"
+            )
     else:
         entry["api_key"] = ""
         # 留空即依赖环境变量回退：归一化变量名与已有无 key 供应商撞名且接入点主机不同时，
@@ -1048,7 +1177,7 @@ def _config_manage_models(session: _ConfigSession) -> None:
     if entry is None:
         return
     while True:
-        _say(f"供应商 '{entry['name']}' 模型：{', '.join(entry['models'])}")
+        _say(f"供应商 '{entry['name']}' 模型：{', '.join(config_mod.model_names(entry['models']))}")
         choice = _ask("1) 添加模型  2) 删除模型  0) 返回：")
         if choice is None or choice == "0":
             return
@@ -1066,7 +1195,7 @@ def _config_add_model(session: _ConfigSession, entry: dict[str, Any]) -> None:
     if not name:
         _say("已取消。")
         return
-    if name in entry["models"]:
+    if name in config_mod.model_names(entry["models"]):
         _say(f"模型 '{name}' 已在该供应商的清单中，未重复添加。")
         return
     entry["models"].append(name)
@@ -1079,8 +1208,12 @@ def _config_remove_model(session: _ConfigSession, entry: dict[str, Any]) -> None
     if len(entry["models"]) <= 1:
         _say("供应商至少保留一个模型，无法删除。")
         return
-    name = _choose_entry(entry["models"], "要删除的模型")
+    chosen = _choose_entry(entry["models"], "要删除的模型")
+    if chosen is None:
+        return
+    name = config_mod.model_entry_name(chosen)
     if name is None:
+        _say("该模型条目缺少名称，无法删除。")
         return
     default = session.data.get("default") or ""
     if default == f"{entry['name']}/{name}":
@@ -1089,7 +1222,7 @@ def _config_remove_model(session: _ConfigSession, entry: dict[str, Any]) -> None
             _say("已取消。")
             return
         session.data.pop("default", None)
-    entry["models"].remove(name)
+    entry["models"].remove(chosen)
     _say(f"模型 '{name}' 已从 '{entry['name']}' 删除。")
     session.save()
 
@@ -1102,8 +1235,12 @@ def _config_set_default(session: _ConfigSession) -> None:
     model = _choose_entry(entry["models"], "模型")
     if model is None:
         return
-    session.data["default"] = f"{entry['name']}/{model}"
-    _say(f"默认模型已设为 {entry['name']}/{model}。")
+    model_name = config_mod.model_entry_name(model)
+    if model_name is None:
+        _say("该模型条目缺少名称，无法设为默认。")
+        return
+    session.data["default"] = f"{entry['name']}/{model_name}"
+    _say(f"默认模型已设为 {entry['name']}/{model_name}。")
     session.save()
 
 
@@ -1122,6 +1259,107 @@ def _config_update_key(session: _ConfigSession) -> None:
         if saved
         else f"供应商 '{entry['name']}' 的 key 未改动。"
     )
+    session.save()
+
+
+def _config_manage_thinking(session: _ConfigSession) -> None:
+    """模型思考挡位配置（Design §8.3）：选供应商 → 模型 → 勾选挡位 → 选默认。
+
+    挡位名以内置等级表为主、允许自定义名（发送侧经 extra_body 原样透传）；
+    官网未查证挡位的供应商不在预设里预填（用户裁决：查不到的交给用户自己填）。
+    未配置挡位的模型不发送任何思考参数（行为与 M3 一致）。
+    """
+    entry = _choose_entry(session.providers(), "供应商")
+    if entry is None:
+        return
+    models = entry["models"]
+    chosen = _choose_entry(models, "模型")
+    if chosen is None:
+        return
+    model_name = config_mod.model_entry_name(chosen)
+    if model_name is None:
+        _say("该模型条目缺少名称，无法配置挡位。")
+        return
+    current = config_mod.model_thinking_config(models, model_name) or {}
+    levels = list(current.get("levels") or [])
+    selected = current.get("selected")
+    _say(
+        f"模型 '{model_name}' 当前思考挡位：{selected or '（未配置）'}"
+        f"（可选挡位：{', '.join(levels) or '（无）'}）"
+    )
+    _say(f"内置挡位表：{thinking_mod.available_levels_text()}")
+    _say(
+        "说明：off/none/disabled = 关闭思考；minimal…high = reasoning_effort；"
+        "max = 最高档；enabled = 布尔开关；budget:<n> = 数值预算；其他名称按供应商参数原样透传。"
+    )
+    raw = _ask(
+        "要启用的挡位（逗号分隔挡位名，如 off,low,high；回车保留现状；输入 清空 移除全部）："
+    )
+    if raw is None:
+        _say("已取消。")
+        return
+    text = raw.strip()
+    if text == "":
+        new_levels = levels
+    elif text in ("清空", "clear"):
+        # "清空"= 一次性清除该模型的全部挡位配置（含默认挡位）：只清清单却留着
+        # 默认值会得到自相矛盾的配置（默认不在可选清单内），这里不制造这种半状态
+        _set_model_thinking(session, entry, models, model_name, [], None)
+        return
+    else:
+        new_levels = []
+        for token in (item.strip() for item in text.split(",")):
+            if not token:
+                continue
+            if token.startswith("budget:") and not thinking_mod.is_budget_level(token):
+                _say(f"budget 挡位形如 budget:<正整数>，收到 {token!r}，已取消。")
+                return
+            if token not in new_levels:
+                new_levels.append(token)
+    selected_raw = _ask(f"默认挡位（须在上面清单内或 off；回车保留 {selected or '（无）'}）：")
+    if selected_raw is None:
+        _say("已取消。")
+        return
+    new_selected = selected_raw.strip() or selected
+    if new_selected and new_selected != "off" and new_selected not in new_levels:
+        _say(f"默认挡位 {new_selected!r} 不在挡位清单内，已取消（请先启用它再设默认）。")
+        return
+    _set_model_thinking(session, entry, models, model_name, new_levels, new_selected)
+
+
+def _set_model_thinking(
+    session: _ConfigSession,
+    entry: dict[str, Any],
+    models: list[Any],
+    model_name: str,
+    levels: list[str],
+    selected: str | None,
+) -> None:
+    """把挡位配置写回模型条目：无挡位退回纯字符串形态，有挡位写对象形态。"""
+    item = {"name": model_name}
+    if levels or selected:
+        payload: dict[str, Any] = {}
+        if levels:
+            payload["levels"] = levels
+        if selected:
+            payload["selected"] = selected
+        item["thinking"] = payload
+    index = next(
+        (
+            position
+            for position, value in enumerate(models)
+            if config_mod.model_entry_name(value) == model_name
+        ),
+        None,
+    )
+    if index is None:
+        models.append(item if len(item) > 1 else model_name)
+    else:
+        models[index] = item if len(item) > 1 else model_name
+    if levels or selected:
+        _say(f"模型 '{model_name}' 的思考挡位已保存（默认：{selected or '（未设）'}）。")
+    else:
+        _say(f"模型 '{model_name}' 的思考挡位已清空（不发送任何思考参数）。")
     session.save()
 
 
@@ -1152,7 +1390,8 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     if isinstance(default, str) and "/" in default:
         provider_name, _, model_name = default.partition("/")
         if any(
-            item["name"] == provider_name and model_name in item["models"] for item in candidate
+            item["name"] == provider_name and model_name in config_mod.model_names(item["models"])
+            for item in candidate
         ):
             imported_default = default
     probe = {"providers": [*session.providers(), *candidate]}
@@ -1189,7 +1428,7 @@ def _run_config_interactive() -> int:
     while True:
         _say(
             "\n菜单：1) 添加/更新供应商  2) 删除供应商  3) 管理供应商模型"
-            "  4) 设置默认模型  5) 修改供应商 key  0) 退出"
+            "  4) 设置默认模型  5) 修改供应商 key  6) 模型思考挡位  0) 退出"
         )
         choice = _ask("选择：")
         if choice is None:
@@ -1205,6 +1444,8 @@ def _run_config_interactive() -> int:
             _config_set_default(session)
         elif choice == "5":
             _config_update_key(session)
+        elif choice == "6":
+            _config_manage_thinking(session)
         elif choice == "0":
             _say("退出配置。")
             return _EXIT_OK
@@ -1229,7 +1470,8 @@ def _run_config_test() -> int:
     failures = 0
     for entry in providers:
         name = str(entry.get("name") or "")
-        model_name = str(entry["models"][0])
+        models = entry["models"]
+        model_name = config_mod.model_entry_name(models[0]) or "（未命名模型）"
         status, detail = config_mod.test_provider(entry)
         label = {"ok": "OK", "auth": "401（key 无效）", "timeout": "超时（网络不可达）"}.get(
             status, "失败"

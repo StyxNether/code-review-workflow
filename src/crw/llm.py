@@ -19,8 +19,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.errors import GraphRecursionError
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAIError
+from pydantic import ValidationError
 
 from . import config
+from . import thinking as thinking_mod
 
 #: 请求级超时：不用 SDK 默认的 600s，避免失败请求长时间挂起
 REQUEST_TIMEOUT_SECONDS = 60
@@ -72,8 +74,9 @@ def create_model(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    thinking: str | None = None,
 ) -> ChatOpenAI:
-    """构建 OpenAI 兼容的 ChatOpenAI 客户端。
+    """构建 OpenAI 兼容的 ChatOpenAI 客户端（配置思考挡位时注入对应参数，Design §8.3）。
 
     显式校验 key 非空：SDK 在 ``api_key`` 为 None 时会回退读取 ``OPENAI_API_KEY``，
     可能把 OpenAI 的密钥发往 ``CRW_BASE_URL`` 指定的第三方接入点。
@@ -82,6 +85,7 @@ def create_model(
         model_name: 模型名；省略时取环境变量回退（``CRW_MODEL`` → ``CRA_MODEL``）。
         api_key: 显式 key（``crw config`` 解析结果）；省略时走环境变量回退链。
         base_url: 显式接入点；省略时走环境变量回退。
+        thinking: 思考挡位（``ResolvedModel.thinking``）；``None`` 不发送任何思考参数。
     """
     key = api_key if api_key is not None else config.get_api_key()
     if not key:
@@ -89,14 +93,29 @@ def create_model(
             "未配置 API key：请运行 crw config，或设置环境变量 CRW_DEEPSEEK_API_KEY"
             "（使用环境变量回退方式时默认供应商为 DeepSeek）。"
         )
-    return ChatOpenAI(
-        model=model_name if model_name is not None else config.get_model(),
-        api_key=key,
-        base_url=base_url if base_url is not None else config.get_base_url(),
-        temperature=TEMPERATURE,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        max_retries=MAX_RETRIES,
-    )
+    params: dict[str, Any] = {}
+    if thinking:
+        try:
+            params = thinking_mod.resolve_level_params(thinking)
+        except thinking_mod.ThinkingLevelError as exc:
+            raise LLMError(f"思考挡位不合法：{exc}") from exc
+    try:
+        return ChatOpenAI(
+            model=model_name if model_name is not None else config.get_model(),
+            api_key=key,
+            base_url=base_url if base_url is not None else config.get_base_url(),
+            temperature=TEMPERATURE,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            max_retries=MAX_RETRIES,
+            **params,
+        )
+    except ValidationError as exc:
+        # 构造期校验失败（如某个发送参数超出该 SDK 版本的取值域）：翻译为可读 LLMError，
+        # 不让 pydantic 的英文 traceback 直接抛给用户（本层屏蔽 SDK 类型的同一口径）
+        raise LLMError(
+            f"模型客户端构造失败（参数校验未通过）：{exc}；"
+            "可检查 --model/--provider 或 crw config 中的模型与思考挡位配置。"
+        ) from exc
 
 
 def translate_failure(exc: Exception) -> Exception:
@@ -163,7 +182,7 @@ def probe(base_url: str, api_key: str, model_name: str) -> tuple[str, str]:
     """
     if not api_key:
         # 与 create_model 的显式校验一致：空 key 不应发到服务端换回误导性的 401
-        return "error", f"API key 为空；请用 crw config 补充，或设置环境变量 {_key_hint()}。"
+        return "error", f"API key 为空；请用 crw config 补充。{_key_hint()}。"
     try:
         model = ChatOpenAI(
             model=model_name,

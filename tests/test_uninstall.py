@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from crw import config, uninstall
+from crw import config as config_mod
 
 PACKAGE = uninstall.PACKAGE_NAME
 
@@ -485,3 +486,27 @@ def test_confirmation_order_is_fixed_and_happy_path(home: Path) -> None:
     assert "kill -0" in script and f"uv tool uninstall {PACKAGE}" in script
     assert io.removed == [data]
     assert "卸载流程结束" in io.stdout()
+
+
+def test_env_registry_corrupt_is_distinguished_from_empty() -> None:
+    """登记文件"损坏"与"合法空清单"分开判定：只有前者算未完成的清理项（退出码 2）。"""
+    registry = config_mod.env_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    io = FakeIO()
+
+    registry.write_text('{"env_vars": []}', encoding="utf-8")
+    assert uninstall.collect_inventory(io).registry_corrupt is False
+
+    registry.write_text("{坏 JSON", encoding="utf-8")
+    inventory = uninstall.collect_inventory(io)
+    assert inventory.registry_corrupt is True
+    assert inventory.registered_env_vars == []
+
+
+def test_data_dir_guard_refuses_home_and_its_ancestors() -> None:
+    """数据目录保险：用户主目录及其上级一律拒绝删除（极端 CRW_HOME 配置的兜底）。"""
+    home = Path.home()
+
+    assert uninstall._data_dir_block_reason(home, str(home)) is not None
+    root = Path(home.anchor)
+    assert uninstall._data_dir_block_reason(root, str(root)) is not None

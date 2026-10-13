@@ -30,6 +30,14 @@ NodeFn = Callable[..., Mapping[str, Any]]
 EVIDENCE_KEY = REVIEW_EVIDENCE_KEY
 
 
+def _files_of(state: Mapping[str, Any]) -> list[str]:
+    """状态的版本文件清单（审查任务要覆盖全部文件，Design §4.2.2）。"""
+    files = state.get("version_files")
+    if not isinstance(files, list):
+        return []
+    return [str(item) for item in files if isinstance(item, str) and item.strip()]
+
+
 def build_review_node(
     runtime: AgentRuntime,
     registry: ToolRegistry,
@@ -56,12 +64,12 @@ def build_review_node(
         if retry_feedback is None:
             evidence["value"] = False  # 新一轮审查：重新判定执行证据
         version = state_mod.code_version(state)
-        file_name = state_mod.code_file_name(version)
         result = runtime.run(
             node=name,
             system_prompt=prompts.reviewer_system_prompt(view),
             user_prompt=prompts.review_task_prompt(
-                file_name=file_name,
+                version_label=state_mod.code_version_dir_name(version),
+                files=_files_of(state),
                 review_round=state_mod.round_number_for_review(state),
                 code_version=version,
                 allow_exec=EXEC_TOOL_NAME in registry.names(),

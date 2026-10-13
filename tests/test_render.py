@@ -131,7 +131,7 @@ def test_review_listing_goes_to_stdout_with_suggestions() -> None:
     renderer, out, err = make_renderer()
 
     renderer.on_review(
-        round_number=1, file_name="code_v1.py", findings=[finding()], summary="发现 1 项问题。"
+        round_number=1, version_label="code_v1/", findings=[finding()], summary="发现 1 项问题。"
     )
 
     text = out.getvalue()
@@ -145,7 +145,7 @@ def test_review_listing_without_findings_omits_the_summary_line() -> None:
     renderer, out, _ = make_renderer()
 
     renderer.on_review(
-        round_number=2, file_name="code_v2.py", findings=[], summary="本轮未发现问题。"
+        round_number=2, version_label="code_v2/", findings=[], summary="本轮未发现问题。"
     )
 
     assert out.getvalue().strip() == "（本轮无问题）"
@@ -284,7 +284,7 @@ def summary(**kwargs: object) -> records.RunSummary:
     return records.RunSummary(**defaults)
 
 
-def test_runs_table_lists_the_six_designed_columns() -> None:
+def test_runs_table_lists_the_designed_columns() -> None:
     out = StringIO()
 
     render.render_runs(
@@ -298,7 +298,15 @@ def test_runs_table_lists_the_six_designed_columns() -> None:
     )
 
     lines = out.getvalue().splitlines()
-    assert lines[0].split() == ["运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数"]
+    assert lines[0].split() == [
+        "运行号",
+        "时间",
+        "输入摘要",
+        "状态",
+        "修复轮数",
+        "残留严重数",
+        "模型",
+    ]
     assert lines[1].startswith("---")
     assert "r-20261012-0001" in lines[2]
     assert "达限残留" in lines[3]
@@ -344,11 +352,14 @@ def test_detail_renders_summary_timeline_rounds_and_artifacts(tmp_path: Path) ->
         rounds=(
             records.RoundReport(
                 round_number=1,
-                file_name="code_v1.py",
+                version_label="code_v1/",
+                files=["main.py"],
                 review={"findings": [finding()]},
                 fixes={"fixes": [{"finding_id": "f-1", "status": "fixed", "note": "已修"}]},
             ),
-            records.RoundReport(round_number=2, file_name="code_v2.py", review={"findings": []}),
+            records.RoundReport(
+                round_number=2, version_label="code_v2/", files=["main.py"], review={"findings": []}
+            ),
         ),
         artifacts=(tmp_path / "report.md",),
     )
@@ -357,7 +368,7 @@ def test_detail_renders_summary_timeline_rounds_and_artifacts(tmp_path: Path) ->
     render.render_detail(detail, out=out)
 
     text = out.getvalue()
-    assert "syntax_error.py → code_v1.py" in text
+    assert "syntax_error.py → code_v1/syntax_error.py" in text
     assert "[状态] 干净通过" in text
     assert "上限 3（来源：命令行）" in text
     assert "时间线：" in text and "第 1 轮（code_v1.py）：1 严重" in text
@@ -726,7 +737,7 @@ def test_severity_and_stage_are_colored_when_enabled() -> None:
     renderer.on_event({"node": "review", "event": "start", "iteration": 1})
     renderer.on_review(
         round_number=1,
-        file_name="code_v1.py",
+        version_label="code_v1/",
         findings=[finding(), finding("建议", id="f-2", location="code_v1.py:9")],
         summary="",
     )
@@ -740,7 +751,7 @@ def test_colors_are_off_by_default_for_non_tty_streams() -> None:
     renderer, out, err = make_renderer()
 
     renderer.on_event({"node": "review", "event": "start", "iteration": 1})
-    renderer.on_review(round_number=1, file_name="code_v1.py", findings=[finding()], summary="")
+    renderer.on_review(round_number=1, version_label="code_v1/", findings=[finding()], summary="")
 
     assert "\x1b[" not in err.getvalue()
     assert "\x1b[" not in out.getvalue()
@@ -759,7 +770,7 @@ def test_parallel_view_listing_shows_a_counts_line() -> None:
 
     renderer.on_review(
         round_number=1,
-        file_name="code_v1.py",
+        version_label="code_v1/",
         findings=[finding()],
         summary="",
         view="正确性",
@@ -799,7 +810,10 @@ def test_degraded_detail_renders_log_summary_and_artifacts(tmp_path: Path) -> No
         ),
         rounds=(
             records.RoundReport(
-                round_number=1, file_name="code_v1.py", review={"findings": [finding()]}
+                round_number=1,
+                version_label="code_v1/",
+                files=["main.py"],
+                review={"findings": [finding()]},
             ),
         ),
         artifacts=(tmp_path / "state.json",),
@@ -833,10 +847,16 @@ def test_detail_marks_not_converged_rounds(tmp_path: Path) -> None:
         events=(),
         rounds=(
             records.RoundReport(
-                round_number=1, file_name="code_v1.py", review={"findings": [finding()]}
+                round_number=1,
+                version_label="code_v1/",
+                files=["main.py"],
+                review={"findings": [finding()]},
             ),
             records.RoundReport(
-                round_number=2, file_name="code_v2.py", review={"findings": [finding()]}
+                round_number=2,
+                version_label="code_v2/",
+                files=["main.py"],
+                review={"findings": [finding()]},
             ),
         ),
         artifacts=(),
@@ -948,3 +968,23 @@ def test_fix_status_labels_cover_the_contract_enum() -> None:
 
     assert set(render._STATUS_LABEL) == set(contracts_mod.FIX_STATUSES)
     assert set(render._SEVERITY_STYLE) == set(contracts_mod.SEVERITIES)
+
+
+def test_engine_level_error_events_are_rendered() -> None:
+    """引擎级 error / interrupt 事件照常渲染（只有 start / end 由命令面接管结论）。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": "engine", "event": "error", "detail": "state.json 写入失败"})
+
+    assert "错误：state.json 写入失败" in err.getvalue()
+
+
+def test_crlf_fence_markers_are_suppressed_too() -> None:
+    """CRLF 正文里的围栏（含非 python/json 标签）同样被抑制，不漏出正文。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_delta("review", "说明。\r\n```text\r\n秘而不宣\r\n```\r\n收尾。")
+
+    text = err.getvalue()
+    assert "秘而不宣" not in text
+    assert "已收到 text 围栏" in text

@@ -256,7 +256,8 @@ class TestRunPython:
 
         result = exec_py.run_python([root], code="print(1)")
 
-        assert "CRW_EXEC_TIMEOUT" in result
+        # 配置层给可读的"必须是正整数"结论（不再伪装成执行超时）
+        assert "CRW_EXEC_TIMEOUT" in result and "正整数" in result
 
     def test_output_is_truncated(self, root: Path) -> None:
         result = exec_py.run_python([root], code="print('x' * 5000)")
@@ -316,9 +317,13 @@ class TestEnvSanitisation:
         assert "退出码：0" in result
 
     def test_sanitised_env_keeps_ordinary_variables(self) -> None:
+        """普通变量原样保留：按大小写无关判定（Windows 上键名常见为 Path）。"""
         environment = exec_py._sanitized_env()
 
-        assert "PATH" in environment or sys.platform == "win32"
+        names = {name.upper() for name in environment}
+        assert "PATH" in names
+        if sys.platform == "win32":
+            assert "SYSTEMROOT" in names  # Windows 子进程正常运行所必需
 
 
 class TestRegistry:
@@ -360,7 +365,8 @@ class TestRegistry:
 
         assert "不是合法 JSON" in registry.dispatch("read_file", "{oops")
         assert "必须是 JSON 对象" in registry.dispatch("read_file", "[1, 2]")
-        assert "执行失败" in registry.dispatch("read_file", json.dumps({"path": 12}))
+        # 参数类型错误的正是"可读"的要义：给出期望形态，而不是让工具内部抛 TypeError
+        assert "必须是非空字符串" in registry.dispatch("read_file", json.dumps({"path": 12}))
 
     def test_tool_errors_never_raise(self, root: Path) -> None:
         """工具异常一律结构化回传模型：运行不因工具失败而崩（Design §8.4）。"""
@@ -415,3 +421,74 @@ class TestRunPythonBoundaries:
         )
 
         assert "退出码：0" in result
+
+
+class TestRecheckGuards:
+    """复核轮修复的行为回归。"""
+
+    def test_list_dir_caps_a_single_huge_subdirectory(self, root: Path) -> None:
+        """单个子目录的条目数也受预算约束：不得等到外层检查才发现已塞入几万行。"""
+        huge = root / "huge"
+        huge.mkdir()
+        for index in range(fs.MAX_LIST_LINES + 200):
+            (huge / f"item{index:04d}.txt").write_text("x", encoding="utf-8")
+
+        result = fs.list_dir([root])
+
+        assert len(result.splitlines()) <= fs.MAX_LIST_LINES + 5
+        assert "条目过多已截断" in result
+
+
+class TestSelfReviewGuards:
+    """M3.5 自审修复的行为回归。"""
+
+    def test_read_file_rejects_non_integer_line_range(self, root: Path) -> None:
+        (root / "a.py").write_text("print(1)\n", encoding="utf-8")
+
+        result = fs.read_file([root], "a.py", start="10")  # type: ignore[arg-type]
+
+        assert "start 必须是" in result
+
+    def test_read_file_caps_output_for_few_newline_files(self, root: Path) -> None:
+        """少换行的大文件（单行）也必须有字符上限：400 行闸门挡不住它。"""
+        (root / "big.py").write_text(
+            "x = 1  # " + "y" * (fs.MAX_READ_OUTPUT_CHARS + 10_000), encoding="utf-8"
+        )
+
+        result = fs.read_file([root], "big.py")
+
+        assert "字符上限" in result
+        assert len(result) <= fs.MAX_READ_OUTPUT_CHARS + 300
+
+    def test_list_dir_ignores_bulky_build_dirs_and_caps_lines(self, root: Path) -> None:
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "x.js").write_text("x", encoding="utf-8")
+        for index in range(fs.MAX_LIST_LINES + 100):
+            (root / f"f{index:04d}.py").write_text("x\n", encoding="utf-8")
+
+        result = fs.list_dir([root])
+
+        assert "node_modules" not in result
+        assert f"已按 {fs.MAX_LIST_LINES} 行上限截断" in result
+
+    def test_run_python_passes_large_code_via_stdin(self, root: Path) -> None:
+        """大候选代码改走 stdin：规避 Windows 命令行长度上限与进程命令行的暴露面。"""
+        code = "# pad\n" * 2000 + "print('stdin-path-ok')\n"  # 远超命令行阈值
+
+        result = exec_py.run_python([root], code=code)
+
+        assert "stdin-path-ok" in result
+        assert "退出码：0" in result
+
+    def test_run_python_does_not_leave_bytecode_in_the_workspace(self, root: Path) -> None:
+        """子进程不写 __pycache__（PYTHONDONTWRITEBYTECODE）：核实执行不得污染工作区 /
+        版本目录 —— 真实演示暴露：字节码落进产物目录会传播进 resume 与 --out。"""
+        (root / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+        result = exec_py.run_python(
+            [root],
+            code="import sys; sys.path.insert(0, '.'); import helper; print(helper.VALUE)\n",
+        )
+
+        assert "42" in result
+        assert not (root / "__pycache__").exists()

@@ -49,15 +49,26 @@ def scripted_review(*responses: object) -> Callable[..., dict[str, str]]:
 
 
 def scripted_fix(code: str, fixes: Sequence[Mapping[str, Any]]) -> Callable[..., dict[str, str]]:
-    """返回固定代码与 fixes 清单的修复节点。"""
+    """返回固定代码与 fixes 清单的修复节点（输出版本内全部文件，首文件替换为给定代码）。"""
 
     def node(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        raw = str(state.get("current_version_dir") or "")
+        # 空值直接走兜底：Path("") 等价于当前目录，会把仓库整棵树当版本读
+        directory = Path(raw) if raw.strip() else None
+        files: dict[str, str] = {}
+        if directory is not None and directory.is_dir():
+            for item in sorted(directory.rglob("*")):
+                if item.is_file() and item.name != "manifest.json":
+                    files[item.relative_to(directory).as_posix()] = item.read_text(encoding="utf-8")
+        if not files:
+            files = {"main.py": ""}
+        first = min(files)
+        files[first] = code
         payload = {"fixes": list(fixes)}
-        return {
-            "fix_text": (
-                f"```python\n{code}\n```\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```"
-            )
-        }
+        fences = "\n\n".join(
+            f"```python file={name}\n{content}\n```" for name, content in sorted(files.items())
+        )
+        return {"fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```"}
 
     return node
 
@@ -76,7 +87,7 @@ def _raise_file_exists(run_id: str) -> Path:
     raise FileExistsError(183, "Cannot create a file when that file already exists")
 
 
-def severe_finding(issue: str = "除零风险", location: str = "code_v1.py:5") -> dict[str, Any]:
+def severe_finding(issue: str = "除零风险", location: str = "main.py:5") -> dict[str, Any]:
     return {
         "severity": "严重",
         "location": location,
@@ -151,10 +162,16 @@ def test_requirement_run_persists_the_designed_directory_contract(
         "report.md",
         "state.json",
         "workspace",
-        "workspace/code_v1.py",
+        "workspace/code_v1",
+        "workspace/code_v1/main.py",
+        "workspace/code_v1/manifest.json",
         "workspace/review_1.json",
     ]
-    ast.parse((result.run_dir / "workspace" / "code_v1.py").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (result.run_dir / "workspace" / "code_v1" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert [entry["path"] for entry in manifest["files"]] == ["main.py"]
+    ast.parse((result.run_dir / "workspace" / "code_v1" / "main.py").read_text(encoding="utf-8"))
 
 
 def test_requirement_run_state_snapshot_matches_design(
@@ -178,7 +195,7 @@ def test_requirement_run_state_snapshot_matches_design(
     assert state["session_id"] is None and state["round_index"] is None
     assert state["review_round"] == state["fix_rounds"] + 1  # 审查发生后的不变量
     assert [entry["node"] for entry in state["history"]] == ["encode", "review"]
-    assert state["history"][0]["artifacts"] == ["workspace/code_v1.py"]
+    assert state["history"][0]["artifacts"] == ["workspace/code_v1/main.py"]
     assert all(entry["duration_ms"] >= 0 for entry in state["history"])
 
 
@@ -219,9 +236,9 @@ def test_syntax_fixture_runs_one_fix_round_then_passes(
     first_review = json.loads((workspace / "review_1.json").read_text(encoding="utf-8"))
     second_review = json.loads((workspace / "review_2.json").read_text(encoding="utf-8"))
     assert [item["severity"] for item in first_review["findings"]] == ["严重"]
-    assert first_review["iteration"] == 1 and first_review["file"] == "code_v1.py"
+    assert first_review["iteration"] == 1 and first_review["files"] == ["syntax_error.py"]
     assert second_review["findings"] == []
-    ast.parse((workspace / "code_v2.py").read_text(encoding="utf-8"))
+    ast.parse((workspace / "code_v2" / "syntax_error.py").read_text(encoding="utf-8"))
 
 
 def test_syntax_fixture_persists_fix_dispositions(
@@ -235,7 +252,8 @@ def test_syntax_fixture_persists_fix_dispositions(
     )
 
     assert payload["round"] == 1
-    assert payload["code_file"] == "code_v2.py"
+    assert payload["version_dir"] == "code_v2"
+    assert payload["files"] == ["syntax_error.py"]
     assert payload["fixes"][0]["finding_id"] == "f-1"
     assert payload["fixes"][0]["status"] == "fixed"
 
@@ -253,9 +271,9 @@ def test_file_input_is_copied_into_the_workspace(
         .replace("\\", "/")
         .endswith("tests/fixtures/buggy_samples/syntax_error.py")
     )
-    assert (result.run_dir / "workspace" / "code_v1.py").read_text(encoding="utf-8") == read_sample(
-        "syntax_error.py"
-    )
+    assert (result.run_dir / "workspace" / "code_v1" / "syntax_error.py").read_text(
+        encoding="utf-8"
+    ) == read_sample("syntax_error.py")
 
 
 def test_report_documents_rounds_dispositions_and_input_mapping(
@@ -268,8 +286,8 @@ def test_report_documents_rounds_dispositions_and_input_mapping(
     assert "# 运行报告" in text and "结论：干净通过" in text
     assert "## 运行摘要" in text and "## 时间线" in text
     assert "## 逐轮问题清单" in text and "## 产物清单" in text
-    assert "### 第 1 轮审查（基于 `code_v1.py`）" in text
-    assert "### 第 2 轮审查（基于 `code_v2.py`）" in text
+    assert "### 第 1 轮审查（基于 `code_v1/`）" in text
+    assert "### 第 2 轮审查（基于 `code_v2/`）" in text
     assert "**fixed**" in text  # 问题 ← 处置对照
     assert "原文件 → 工作区" in text
     assert "`report.md`" in text  # 产物清单含报告自身
@@ -295,8 +313,8 @@ def test_divide_by_zero_hits_the_limit_and_reports_residual(
     assert contracts.residual_severe(state["findings"]) == 1
 
     workspace = result.run_dir / "workspace"
-    assert (workspace / "code_v2.py").read_text(encoding="utf-8") == (
-        workspace / "code_v1.py"
+    assert (workspace / "code_v2" / "divide_by_zero.py").read_text(encoding="utf-8") == (
+        workspace / "code_v1" / "divide_by_zero.py"
     ).read_text(encoding="utf-8")
     assert "**skipped**" in report_text(result)
 
@@ -326,7 +344,7 @@ def test_residual_report_lists_the_last_round_without_disposition(
     text = report_text(result)
 
     assert "结论：达修复轮次上限，仍有 1 项【严重】残留" in text
-    assert "### 第 2 轮审查（基于 `code_v2.py`）" in text
+    assert "### 第 2 轮审查（基于 `code_v2/`）" in text
     assert "处置：—" in text  # 末轮无修复轮，未处置
 
 
@@ -341,7 +359,7 @@ def test_max_iter_zero_reviews_once_without_fixing(
 
     assert result.exit_code == 1
     assert (result.review_round, result.fix_rounds) == (1, 0)
-    assert not (result.run_dir / "workspace" / "code_v2.py").exists()
+    assert not (result.run_dir / "workspace" / "code_v2").exists()
     assert not (result.run_dir / "workspace" / "fixes_1.json").exists()
 
 
@@ -864,7 +882,7 @@ def test_extra_fences_are_ignored_but_recorded(
         return {
             "fix_text": (
                 "```text\n旁白\n```\n\n"
-                "```python\nprint(1)\n```\n\n"
+                "```python file=main.py\nprint(1)\n```\n\n"
                 f"```json\n{fixes_body}\n```\n\n"
                 "```json\n{}\n```\n"
             )
@@ -1130,12 +1148,11 @@ def test_resumed_run_records_parent_and_reports_parent_residual(
     parent = engine.execute(file_request("divide_by_zero.py", max_iterations=1))
     assert parent.exit_code == 1  # 父运行：达限残留
 
-    code_path = Path(str(read_state(parent)["current_code"]))
+    version_dir = Path(str(read_state(parent)["current_version_dir"]))
     resumed = engine.execute(
         engine_mod.RunRequest(
             parent_run_id=parent.run_id,
-            source_path=code_path,
-            source_text=code_path.read_text(encoding="utf-8"),
+            source_dir=version_dir,
             max_iterations=1,
             max_iterations_source=state_mod.SOURCE_PARENT,
         )
@@ -1155,13 +1172,12 @@ def test_resumed_run_notes_the_source_in_the_start_event(
 ) -> None:
     engine = make_engine(fixed_clock, run_id_sequence)
     parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
-    code_path = Path(str(read_state(parent)["current_code"]))
+    version_dir = Path(str(read_state(parent)["current_version_dir"]))
 
     resumed = engine.execute(
         engine_mod.RunRequest(
             parent_run_id=parent.run_id,
-            source_path=code_path,
-            source_text=code_path.read_text(encoding="utf-8"),
+            source_dir=version_dir,
         )
     )
 
@@ -1177,7 +1193,7 @@ def test_report_survives_a_corrupt_parent_record(
     parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
     parent_dir = parent.run_dir
     assert parent_dir is not None
-    code_path = Path(str(read_state(parent)["current_code"]))
+    version_dir = Path(str(read_state(parent)["current_version_dir"]))
     (parent_dir / "state.json").write_text(
         json.dumps({"status": "residual", "review_round": "坏值", "findings": []}), encoding="utf-8"
     )
@@ -1185,8 +1201,7 @@ def test_report_survives_a_corrupt_parent_record(
     resumed = engine.execute(
         engine_mod.RunRequest(
             parent_run_id=parent.run_id,
-            source_path=code_path,
-            source_text=code_path.read_text(encoding="utf-8"),
+            source_dir=version_dir,
             max_iterations=0,
         )
     )
@@ -1195,3 +1210,221 @@ def test_report_survives_a_corrupt_parent_record(
     report = report_text(resumed)
     assert f"| 父运行 | {parent.run_id} |" in report
     assert "| 父运行残留 |" not in report  # 读不出父状态 → 少一行标注，不影响报告
+
+
+# ---- M3.5：多文件版本与删除确认闸门（Design §4.2.2） ----
+
+
+def two_file_encode(state: Mapping[str, Any]) -> dict[str, str]:
+    """编码节点：产出两个文件（main.py 与 legacy.py）。"""
+    return {
+        "code_text": (
+            "```python file=main.py\nprint(1)\n```\n\n```python file=legacy.py\nprint(2)\n```\n"
+        )
+    }
+
+
+def deleting_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+    """修复节点：只给出 main.py，并提出删除 legacy.py（Design §4.2.2 的"申请-确认"）。"""
+    files = fakes.read_version_files(state)
+    keep = {name: content for name, content in files.items() if name != "legacy.py"}
+    payload = {
+        "fixes": [{"finding_id": "f-1", "status": "fixed", "note": "删除冗余模块。"}],
+        "deleted": ["legacy.py"],
+    }
+    fences = "\n\n".join(f"```python file={name}\n{content}\n```" for name, content in keep.items())
+    return {"fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"}
+
+
+def _deletion_run(
+    fixed_clock: Callable[[], str],
+    run_id_sequence: Callable[[], str],
+    confirm: engine_mod.DeletionConfirmer | None,
+) -> tuple[engine_mod.RunResult, Path]:
+    nodes = {
+        "encode": two_file_encode,
+        "review": scripted_review([severe_finding(location="legacy.py:1")], []),
+        "fix": deleting_fix,
+    }
+    engine = make_engine(fixed_clock, run_id_sequence, confirm_deletions=confirm, nodes=nodes)
+    result = engine.execute(engine_mod.RunRequest(requirement="写两个文件并清理冗余"))
+    assert result.run_dir is not None
+    return result, result.run_dir / "workspace"
+
+
+def test_confirmed_deletion_drops_the_file_from_the_new_version(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """确认删除：新版本目录不再包含该文件，摘要与报告标注"已确认删除"，退出码不受影响。"""
+    result, workspace = _deletion_run(fixed_clock, run_id_sequence, lambda requests: True)
+
+    assert result.exit_code == 0  # 删除是工程清洁度，不改变判定结论
+    assert sorted(path.name for path in (workspace / "code_v2").iterdir()) == [
+        "main.py",
+        "manifest.json",
+    ]
+    fix_entry = next(entry for entry in read_state(result)["history"] if entry["node"] == "fix")
+    assert "已确认删除：legacy.py" in fix_entry["summary"]
+    payload = json.loads((workspace / "fixes_1.json").read_text(encoding="utf-8"))
+    assert payload["deleted"] == {
+        "proposed": ["legacy.py"],
+        "confirmed": ["legacy.py"],
+        "pending": [],
+    }
+    assert "已确认删除：legacy.py" in report_text(result)
+
+
+@pytest.mark.parametrize("confirm", [lambda requests: False, None])
+def test_unconfirmed_deletion_keeps_the_file_and_annotates(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str], confirm: Any
+) -> None:
+    """拒绝 / 非交互（无确认闸门）：文件保留（从上一版本带回），终端摘要与报告标注"待确认删除（未执行）"。"""
+    result, workspace = _deletion_run(fixed_clock, run_id_sequence, confirm)
+
+    assert result.exit_code == 0
+    assert sorted(path.name for path in (workspace / "code_v2").iterdir()) == [
+        "legacy.py",
+        "main.py",
+        "manifest.json",
+    ]
+    assert (workspace / "code_v2" / "legacy.py").read_text(encoding="utf-8") == "print(2)\n"
+    fix_entry = next(entry for entry in read_state(result)["history"] if entry["node"] == "fix")
+    assert "待确认删除（未执行）：legacy.py" in fix_entry["summary"]
+    payload = json.loads((workspace / "fixes_1.json").read_text(encoding="utf-8"))
+    assert payload["deleted"] == {
+        "proposed": ["legacy.py"],
+        "confirmed": [],
+        "pending": ["legacy.py"],
+    }
+    assert "待确认删除（未执行）" in report_text(result)
+
+
+def test_deletion_confirmer_failure_is_treated_as_unconfirmed(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """确认闸门自身抛错时按"未确认"处理：删除永不静默发生。"""
+
+    def broken(requests: Any) -> bool:
+        raise RuntimeError("终端不可用")
+
+    result, workspace = _deletion_run(fixed_clock, run_id_sequence, broken)
+
+    assert result.exit_code == 0
+    assert (workspace / "code_v2" / "legacy.py").is_file()
+
+
+def test_version_reading_ignores_pycache_artifacts(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """审查 Agent 执行核实时落下的 __pycache__ / *.pyc 不属于版本内容：
+
+    字节码不是 UTF-8 文本，读进来会把版本复制（resume）变成运行失败，
+    整版本指纹比较也会失真（真实缺陷回归）。
+    """
+    engine = make_engine(fixed_clock, run_id_sequence)
+    parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
+    assert parent.run_dir is not None
+    version_dir = Path(str(read_state(parent)["current_version_dir"]))
+    cache = version_dir / "__pycache__"
+    cache.mkdir()
+    (cache / "divide_by_zero.cpython-313.pyc").write_bytes(b"\xf3\r\r\n\x00bytecode")
+
+    resumed = engine.execute(
+        engine_mod.RunRequest(parent_run_id=parent.run_id, source_dir=version_dir, max_iterations=0)
+    )
+
+    # 除零样例复审必然残留（假节点不改动），退出码 1 是预期结论；关键是版本复制成功
+    assert resumed.exit_code == 1
+    assert resumed.run_dir is not None
+    copied = resumed.run_dir / "workspace" / "code_v1"
+    assert sorted(path.name for path in copied.iterdir()) == ["divide_by_zero.py", "manifest.json"]
+
+
+# ---- M3.5 自审修复的回归 ----
+
+
+def test_source_text_only_request_is_recorded_as_file_input(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """只给 source_text 的程序化调用：输入描述与物化结果同口径（kind=file + code_v1/main.py）。"""
+    result = make_engine(fixed_clock, run_id_sequence).execute(
+        engine_mod.RunRequest(source_text="print(1)\n", max_iterations=0)
+    )
+
+    assert result.run_dir is not None
+    state = read_state(result)
+    assert state["input"]["kind"] == state_mod.INPUT_FILE
+    assert (result.run_dir / "workspace" / "code_v1" / "main.py").read_text(
+        encoding="utf-8"
+    ) == "print(1)\n"
+
+
+def test_deleting_an_absent_file_keeps_running(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """待删文件在上一版本目录里已不存在（记录与磁盘脱节）：跳过保留、按待确认标注，不升级为运行失败。"""
+
+    def fix_removing_the_file(
+        state: Mapping[str, Any], retry_feedback: str | None = None
+    ) -> dict[str, str]:
+        directory = Path(str(state["current_version_dir"]))
+        (directory / "legacy.py").unlink()  # 模拟磁盘上的文件已不在
+        files = fakes.read_version_files(state)
+        keep = {name: content for name, content in files.items() if name != "legacy.py"}
+        payload = {
+            "fixes": [{"finding_id": "f-1", "status": "fixed", "note": "清理冗余模块。"}],
+            "deleted": ["legacy.py"],
+        }
+        fences = "\n\n".join(
+            f"```python file={name}\n{content}\n```" for name, content in keep.items()
+        )
+        return {
+            "fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"
+        }
+
+    nodes = {
+        "encode": two_file_encode,
+        "review": scripted_review([severe_finding(location="legacy.py:1")], []),
+        "fix": fix_removing_the_file,
+    }
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写两个文件并清理冗余")
+    )
+
+    assert result.exit_code == 0
+    assert result.run_dir is not None
+    assert sorted(path.name for path in (result.run_dir / "workspace" / "code_v2").iterdir()) == [
+        "main.py",
+        "manifest.json",
+    ]
+
+
+def test_version_read_follows_the_manifest(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """版本读取以 manifest 清单为准：执行核实落进版本目录的副产物不进版本内容。
+
+    真实演示暴露：审查 Agent 跑被测程序时把数据文件写进了版本目录，resume 复制后
+    变成"版本里的文件"，修复覆盖检查随之失败。
+    """
+    engine = make_engine(fixed_clock, run_id_sequence)
+    parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
+    assert parent.run_dir is not None
+    version_dir = Path(str(read_state(parent)["current_version_dir"]))
+    (version_dir / "todos.json").write_text("[]\n", encoding="utf-8")  # 执行副产物
+    cache = version_dir / "__pycache__"
+    cache.mkdir()
+    (cache / "x.cpython-313.pyc").write_bytes(b"\x00\x01")
+
+    resumed = engine.execute(
+        engine_mod.RunRequest(parent_run_id=parent.run_id, source_dir=version_dir, max_iterations=0)
+    )
+
+    assert resumed.run_dir is not None
+    copied = resumed.run_dir / "workspace" / "code_v1"
+    assert sorted(path.name for path in copied.iterdir()) == [
+        "divide_by_zero.py",
+        "manifest.json",
+    ]
+    resumed_state = read_state(resumed)
+    assert resumed_state["version_files"] == ["divide_by_zero.py"]

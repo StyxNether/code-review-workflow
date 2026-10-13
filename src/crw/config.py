@@ -2,11 +2,13 @@
 
 数据目录经 ``CRW_HOME`` 解析（默认 ``~/.crw``）；key 回退链 CRW_ → CRA_ → SE_CodeAgent，
 解析优先级为 ``--model/--provider`` > 配置文件 ``default`` > 环境变量（Design §8.3）。
+模型条目兼容字符串 / 对象两态（对象可带思考挡位配置，Design §8.3 的 M3.5 规格）。
 本模块是 key 的唯一读取点——仓库内任何文件、日志、测试样例都不得出现真实密钥。
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -15,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from . import thinking as thinking_mod
 
 #: 数据目录环境变量：测试与多环境隔离用（Design §9.1）
 HOME_ENV = "CRW_HOME"
@@ -51,38 +55,66 @@ class ProviderPreset:
     """供应商预设：官方接入点 + 预填模型清单 + key 环境变量名（CRW_ 统一格式）。
 
     预填项均可在交互中修改；模型名有时效性，``crw config test`` 可兜底验证。
-    环境变量名与既有工具链的 ``CRA_*`` 一一对应，保证"零重配"。
+    模型条目可为字符串（无思考挡位）或对象（``{"name": …, "thinking": {…}}``），
+    与 models.json 的两态一致（Design §8.3）。环境变量名与既有工具链的 ``CRA_*``
+    一一对应，保证"零重配"。
     """
 
     name: str
     base_url: str
-    models: tuple[str, ...]
+    models: tuple[str | dict[str, Any], ...]
     env_var: str
 
+
+# 思考挡位预填说明（2026-10-14 查证各供应商官网，Design §8.3 的"查证才预填"口径）：
+# - DeepSeek：thinking.type=enabled/disabled 与 reasoning_effort=none/low/high/max（V4 系档位
+#   为 low/high/max，medium 未列入文档 → 不预填），off 走 thinking.type、none 走 effort=none；
+# - Kimi：k2.6 支持 thinking.type=disabled（off 可用）；k3 无 thinking 参数、用
+#   reasoning_effort=low/high/max（low/high 预填，max 的内置映射复合了 thinking.type → 不预填）；
+# - OpenAI：reasoning_effort=none/low/medium/high（GPT-5.1 起 none 取代 minimal）；
+# - 阿里云百炼：enable_thinking 布尔与 thinking_budget 走 extra_body（qwen3.8 混合思考模型），
+#   enabled 与内置映射一致；off 通道不同（Qwen 用 enable_thinking=false）→ 不预填；
+# - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 报错），正确通道
+#   thinking.type=enabled 与内置任何名字的映射都不完全一致 → 不预填，交用户裁决（见收尾总结）。
+_THINKING_DEEPSEEK = {"levels": ["off", "none", "low", "high", "max"]}
+_THINKING_OPENAI = {"levels": ["none", "low", "medium", "high"]}
+_THINKING_QWEN = {"levels": ["enabled"]}
 
 PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset(
         "DeepSeek",
         "https://api.deepseek.com",
-        ("deepseek-flash", "deepseek-v4-pro"),
+        (
+            {"name": "deepseek-flash", "thinking": _THINKING_DEEPSEEK},
+            {"name": "deepseek-v4-pro", "thinking": _THINKING_DEEPSEEK},
+        ),
         "CRW_DEEPSEEK_API_KEY",
     ),
     ProviderPreset(
         "Kimi (Moonshot)",
         "https://api.moonshot.cn/v1",
-        ("kimi-k3", "kimi-k2.6"),
+        (
+            {"name": "kimi-k3", "thinking": {"levels": ["low", "high"]}},
+            {"name": "kimi-k2.6", "thinking": {"levels": ["off"]}},
+        ),
         "CRW_MOONSHOT_API_KEY",
     ),
     ProviderPreset(
         "OpenAI",
         "https://api.openai.com/v1",
-        ("gpt-6-astra", "gpt-6-luna"),
+        (
+            {"name": "gpt-6-astra", "thinking": _THINKING_OPENAI},
+            {"name": "gpt-6-luna", "thinking": _THINKING_OPENAI},
+        ),
         "CRW_OPENAI_API_KEY",
     ),
     ProviderPreset(
         "阿里云百炼",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        ("qwen3.8-max", "qwen3.8-flash"),
+        (
+            {"name": "qwen3.8-max", "thinking": _THINKING_QWEN},
+            {"name": "qwen3.8-flash", "thinking": _THINKING_QWEN},
+        ),
         "CRW_DASHSCOPE_API_KEY",
     ),
     ProviderPreset(
@@ -110,6 +142,32 @@ PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
         "CRW_ZHIPUAI_API_KEY",
     ),
 )
+
+
+# ---- 模型条目两态（字符串 / 对象，Design §8.3 的思考挡位）----
+
+
+def model_entry_name(item: Any) -> str | None:
+    """模型条目 → 名称：字符串形态即名称；对象形态取 ``name``。非法条目返回 ``None``。"""
+    if isinstance(item, str):
+        return item or None
+    if isinstance(item, dict):
+        name = item.get("name")
+        return name if isinstance(name, str) and name else None
+    return None
+
+
+def model_names(models: list[Any]) -> list[str]:
+    """模型清单 → 名称清单（跳过非法条目；校验层保证入库前先拦下非法形态）。"""
+    return [name for name in (model_entry_name(item) for item in models) if name]
+
+
+def model_thinking_config(models: list[Any], name: str) -> dict[str, Any] | None:
+    """按名称取模型的 thinking 配置（未配置 / 无该模型返回 ``None``）。"""
+    for item in models:
+        if isinstance(item, dict) and item.get("name") == name:
+            return thinking_mod.normalize_thinking_config(item.get("thinking"))
+    return None
 
 
 def data_dir() -> Path:
@@ -183,9 +241,10 @@ def importable_providers(data: Mapping[str, Any]) -> list[dict[str, Any]]:
         if (
             not isinstance(models, list)
             or not models
-            or not all(isinstance(item, str) and item for item in models)
+            or not all(model_entry_name(entry_item) for entry_item in models)
         ):
             continue
+        # 条目原样沿用（字符串与对象两态都合法；对象条目里损坏的 thinking 由整表校验拦下）
         item: dict[str, Any] = {"name": name, "base_url": base_url, "models": list(models)}
         api_key = entry.get("api_key")
         if isinstance(api_key, str):
@@ -287,20 +346,26 @@ class ResolvedModel:
 
     ``api_key`` 恒为非空字符串：所有返回路径都保证 key 存在（缺失时抛
     :class:`ConfigError` 或返回 ``None``），调用方无须再做空值回退。
+    ``thinking`` 为本次生效的思考挡位（``供应商/模型名（思考：…）`` 口径的一部分）；
+    ``None`` = 未配置挡位（不发送任何思考参数，行为与 M3 一致）。
     """
 
     model: str
     base_url: str
     api_key: str
     provider: str | None
+    thinking: str | None = None
 
     def label(self) -> str:
-        """模型标识（写入 ``state["model"]``）：``供应商/模型名``（Design §4.3）。
+        """模型标识（写入 ``state["model"]``）：``供应商/模型名``，配置挡位时附 ``（思考：…）``。
 
         环境变量回退路径没有供应商名，用接入点主机名代替，保证标识仍可辨识。
         """
         owner = self.provider or (urlsplit(self.base_url).hostname or "环境变量")
-        return f"{owner}/{self.model}"
+        label = f"{owner}/{self.model}"
+        if self.thinking:
+            label += f"（思考：{self.thinking}）"
+        return label
 
 
 # ---- 环境变量回退路径（models.json 不存在或未覆盖相应项时生效）----
@@ -333,8 +398,17 @@ def _get_int_env(name: str, default: int) -> int:
 
 
 def get_exec_timeout() -> int:
-    """run_python 超时秒数：``CRW_EXEC_TIMEOUT``，默认 10。"""
-    return _get_int_env("CRW_EXEC_TIMEOUT", DEFAULT_EXEC_TIMEOUT)
+    """run_python 超时秒数：``CRW_EXEC_TIMEOUT``，默认 10。
+
+    必须为正：0 / 负数会让每次执行立即超时（语义未定义），属配置错误而非可运行配置
+    （与 ``get_max_context_tokens`` 同一口径）。
+    """
+    value = _get_int_env("CRW_EXEC_TIMEOUT", DEFAULT_EXEC_TIMEOUT)
+    if value <= 0:
+        raise ConfigError(
+            f"环境变量 CRW_EXEC_TIMEOUT 必须是正整数（执行超时秒数），当前值：{value}"
+        )
+    return value
 
 
 def get_max_context_tokens() -> int:
@@ -407,9 +481,35 @@ def validate_config(data: Any) -> None:
         if (
             not isinstance(models, list)
             or not models
-            or not all(isinstance(item, str) and item for item in models)
+            or not all(model_entry_name(item) for item in models)
         ):
-            raise ConfigError(f"配置文件结构无效：供应商 '{name}' 的 models 必须是非空字符串数组。")
+            raise ConfigError(
+                f"配置文件结构无效：供应商 '{name}' 的 models 必须是非空字符串数组"
+                "（条目可为字符串或带 name 的对象）。"
+            )
+        entry_model_names = model_names(models)
+        duplicated = sorted(
+            {item for item in entry_model_names if entry_model_names.count(item) > 1}
+        )
+        if duplicated:
+            raise ConfigError(
+                f"配置文件结构无效：供应商 '{name}' 的模型名重复：{', '.join(duplicated)}。"
+            )
+        for index, item in enumerate(models):
+            if isinstance(item, dict):
+                unknown = sorted(set(item) - {"name", "thinking"})
+                if unknown:
+                    raise ConfigError(
+                        f"配置文件结构无效：供应商 '{name}' 的 models[{index}] 含未知字段"
+                        f"（{'、'.join(unknown)}），仅支持 name / thinking。"
+                    )
+                try:
+                    thinking_mod.normalize_thinking_config(item.get("thinking"))
+                except thinking_mod.ThinkingConfigError as exc:
+                    raise ConfigError(
+                        f"配置文件结构无效：供应商 '{name}' 的模型 "
+                        f"'{model_entry_name(item)}' 的 thinking 配置不合法 — {exc}"
+                    ) from exc
         api_key = entry.get("api_key")
         if api_key is not None and not isinstance(api_key, str):
             raise ConfigError(f"配置文件结构无效：供应商 '{name}' 的 api_key 必须是字符串。")
@@ -425,7 +525,7 @@ def validate_config(data: Any) -> None:
         entry = next((item for item in providers if item.get("name") == provider_name), None)
         if entry is None:
             raise ConfigError(f"配置文件结构无效：default 引用的供应商 '{provider_name}' 不存在。")
-        if model_name not in entry["models"]:
+        if model_name not in model_names(entry["models"]):
             raise ConfigError(
                 f"配置文件结构无效：default 引用的模型 '{model_name}' 不在供应商 "
                 f"'{provider_name}' 的清单内。"
@@ -473,17 +573,20 @@ def conflicting_keyless_env_vars(providers: list[dict[str, Any]]) -> dict[str, l
 def _resolve_provider(
     providers: list[dict[str, Any]], provider: str, model: str | None
 ) -> ResolvedModel:
-    """解析到指定供应商：``--model`` 须在其清单内匹配，缺省取 ``models[0]``。"""
+    """解析到指定供应商：``--model`` 须在其清单内匹配，缺省取清单第一个。"""
     entry = next((item for item in providers if item.get("name") == provider), None)
     if entry is None:
         raise ConfigError(f"供应商 '{provider}' 未在 {config_path()} 中配置，请先运行 crw config。")
     models = entry["models"]
-    if model is not None and model not in models:
+    names = model_names(models)
+    if model is not None and model not in names:
         raise ConfigError(
-            f"模型 '{model}' 不在供应商 '{provider}' 的清单内（{', '.join(models)}）；"
+            f"模型 '{model}' 不在供应商 '{provider}' 的清单内（{', '.join(names)}）；"
             "可用 crw config 添加，或从清单中选择。"
         )
-    model_name = model if model is not None else models[0]
+    model_name = model if model is not None else names[0]
+    thinking_payload = model_thinking_config(models, model_name)
+    thinking = thinking_mod.selected_level(thinking_payload) if thinking_payload else None
     api_key = resolve_provider_api_key(provider, entry.get("api_key"))
     if not api_key:
         raise ConfigError(
@@ -492,7 +595,11 @@ def _resolve_provider(
             "请运行 crw config 补充 key，或设置环境变量。"
         )
     return ResolvedModel(
-        model=model_name, base_url=entry["base_url"], api_key=api_key, provider=provider
+        model=model_name,
+        base_url=entry["base_url"],
+        api_key=api_key,
+        provider=provider,
+        thinking=thinking,
     )
 
 
@@ -513,7 +620,9 @@ def resolve(*, model: str | None = None, provider: str | None = None) -> Resolve
     if provider is not None:
         return _resolve_provider(providers, provider, model)
     if model is not None and providers:
-        owners = sorted({entry["name"] for entry in providers if model in entry["models"]})
+        owners = sorted(
+            {entry["name"] for entry in providers if model in model_names(entry["models"])}
+        )
         if len(owners) > 1:
             raise ConfigError(
                 f"模型 '{model}' 在多个供应商中存在（{', '.join(owners)}），"
@@ -553,7 +662,8 @@ def test_provider(entry: dict[str, Any]) -> tuple[str, str]:
 
     name = str(entry.get("name") or "")
     models = entry.get("models")
-    model_name = str(models[0]) if isinstance(models, list) and models else ""
+    names = model_names(models) if isinstance(models, list) else []
+    model_name = names[0] if names else ""
     api_key = resolve_provider_api_key(name, entry.get("api_key"))
     if not api_key:
         return "error", (
@@ -566,18 +676,27 @@ def test_provider(entry: dict[str, Any]) -> tuple[str, str]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """原子写文本（临时文件 + 替换，POSIX 尽力 0600）。
+    """原子写文本（唯一临时文件 + fsync + 替换，POSIX 尽力 0600）。
 
     本模块自带这一原语而不复用 ``workflow.records``：records 依赖本模块取数据目录
     （``records → config``），反向 import 会成环；两处目录与权限语义也不同（用户配置
-    目录 vs 运行记录目录）。
+    目录 vs 运行记录目录）。临时名带 pid 以避免并发（同时跑两个 crw config）互相踩
+    同一个临时文件；写入失败（含中断）尽力清理临时文件，不留半截产物。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    if os.name == "posix":
-        try:
-            tmp.chmod(0o600)
-        except OSError:
-            pass  # 权限收紧失败不阻塞写入（提示已在交互层给出）
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            try:
+                tmp.chmod(0o600)
+            except OSError:
+                pass  # 权限收紧失败不阻塞写入（提示已在交互层给出）
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise

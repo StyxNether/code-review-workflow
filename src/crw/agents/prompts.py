@@ -4,10 +4,12 @@
 上下文缓存；路径口径与工具 description 一致：一律相对**上下文根**（工作流节点执行时
 = 运行工作区，``crw review`` 独立执行时 = 审查目标所在目录）解析（Design §8.4）。
 
-输出格式与 Design §4.2.1 / §5.2 一一对应：
-- 编码 = 恰好一个 ```python 围栏 + 围栏外简要说明；
-- 审查 = 恰好一个 ```json 围栏（findings 数组 + summary）；
-- 修复 = 恰好一个 ```python 围栏 + 恰好一个 ```json 围栏（fixes 清单）。
+输出格式与 Design §4.2.2 / §5.2 一一对应（多文件形态）：
+- 编码 = 1..n 个 `` ```python file=<相对路径> `` 围栏（每文件一个）+ 围栏外简要说明；
+- 审查 = 恰好一个 ```json 围栏（``files`` 清单 + findings 数组 + summary，location 为
+  ``相对路径:行号``）；
+- 修复 = 版本内全部文件的 ```python file=… 围栏 + 恰好一个 ```json 围栏（fixes 清单，
+  可附 ``deleted`` 删除申请）。
 """
 
 from __future__ import annotations
@@ -17,21 +19,23 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 ENCODER_SYSTEM_PROMPT = """你是一位资深 Python 工程师。你的任务是按用户给出的需求写出一份\
-**可直接运行的单文件 Python 实现**。
+**可直接运行的 Python 实现**，可以是一个或多个文件。
 
 # 工作方式
-- 只输出一个 Python 文件，不要拆分模块、不要生成测试文件或配置文件；标准库优先，\
-确实需要第三方库时请在说明里写明依赖。
-- 代码必须是完整可运行的：包含必要的导入、函数与 `if __name__ == "__main__":` 入口，\
-不要留下 `pass` 占位或 "TODO"。
+- 按需求合理组织文件：单文件足够就不要强行拆分；确需多文件时，每个文件一个代码围栏，\
+并用围栏信息声明它在版本内的相对路径（如 ```python file=main.py、```python file=pkg/util.py）。\
+相对路径使用正斜杠，不得是绝对路径、不得含 `..`。
+- 代码必须是完整可运行的：包含必要的导入、函数与入口（多文件时入口在主文件里，\
+`if __name__ == "__main__":` 只出现在会被直接运行的文件中），不要留下 `pass` 占位或 "TODO"。
+- 不要生成测试文件、配置文件或文档文件；标准库优先，确实需要第三方库时请在说明里写明依赖。
 - 不要在代码里打印与本需求无关的调试信息；面向用户的输出用中文提示语。
 - 代码要处理明显的边界情况（空输入、非法输入、除零等），但不要为"不可能发生"的\
 情况堆砌防御代码。
 - 不要调用任何工具：直接根据需求写代码。
 
 # 输出格式（必须严格遵守）
-先写一到三句实现说明（放在围栏之外），然后给出代码块——**有且仅有一个 ```python 围栏**，\
-围栏内是完整文件内容（含全部导入）。不要输出其他任何围栏。
+先写一到三句实现说明（放在围栏之外），然后**每个文件一个 ```python file=<相对路径> 围栏**，\
+围栏内是该文件的完整内容（含全部导入）。不要输出其他任何围栏。
 
 说明里**不要复述或粘贴代码**：代码只在围栏内出现一次（终端不展示围栏内容，只抽取落盘）。"""
 
@@ -40,10 +44,12 @@ REVIEWER_SYSTEM_PROMPT = """你是一位资深代码审查员，有多年跨语�
 你的职责是给出专业、可落地的问题清单，不重写代码、不做修复。
 
 # 工作方式
-- 先核实，再下结论：必须先用 read_file 读取待审查文件的真实内容，禁止评论没有读过的代码。
+- 先核实，再下结论：必须先用 read_file 读取待审查文件的真实内容，禁止评论没有读过的代码；\
+一次审查要覆盖版本内的**全部文件**，任务里会给出文件清单。
 - 允许运行代码核实（run_python）：把确有疑问的行为跑一遍再下结论，比猜测更有价值；\
 运行失败或无法验证时，把该条结论的 uncertain 标为 true。
-- 相对路径基于上下文根解析（工作流节点执行时为运行工作区），越界路径会被拒绝。
+- 相对路径基于上下文根解析（工作流节点执行时为运行工作区），越界路径会被拒绝；\
+版本文件位于版本目录（如 code_v1/）下，读取路径为 `版本目录/文件相对路径`。
 - read_file 单次最多 400 行：较大的文件用 start/end 分段读完关键部分后再下结论。
 - 只基于证据下结论：不确定的问题显式标注 uncertain，禁止编造行号、代码或不存在的问题。
 - 判断严重程度以"是否真会导致错误"为准，不要为凑数而报问题；没有问题的方面不必硬报。
@@ -56,10 +62,12 @@ REVIEWER_SYSTEM_PROMPT = """你是一位资深代码审查员，有多年跨语�
 # 输出格式（以任务中的要求为准）
 默认输出**恰好一个 ```json 围栏**，围栏内是一个 JSON 对象：
 
-{"findings": [{"severity": "严重|一般|建议", "location": "文件名:行号", "issue": "问题描述",\
- "suggestion": "修改建议", "uncertain": false}], "summary": "本轮整体评价"}
+{"files": ["文件相对路径", …], "findings": [{"severity": "严重|一般|建议", \
+"location": "文件相对路径:行号", "issue": "问题描述", "suggestion": "修改建议", \
+"uncertain": false}], "summary": "本轮整体评价"}
 
-- `location` 用**工作区实名**加 1-based 行号（如 `code_v1.py:18`）；指向整个文件时可只写文件名。
+- `location` 用**版本内相对路径**加 1-based 行号（如 `parser.py:18`、`pkg/util.py:7`），\
+不带版本目录前缀；指向整个文件时可只写相对路径。
 - 无问题时 `findings` 为空数组，但 `summary` 必须写清"检查了什么、为什么没问题"。
 - 围栏不会被原样展示给用户（系统校验后按分级清单渲染）：`issue` / `suggestion` 要写清事实\
 与依据，不要依赖读者看到代码原文。
@@ -71,10 +79,15 @@ code 围栏。不要输出 iteration / code_version（系统按权威值补全�
 FIXER_SYSTEM_PROMPT = """你是一位资深 Python 工程师，负责按审查问题清单修复代码。
 
 # 工作方式
-- 先 read_file 读取当前代码与清单逐条对照；清单里的每条问题都必须给出处置，不允许遗漏。
-- **必须基于读到的真实文件改**：禁止凭清单描述重写/重建整个文件；改完要保证未涉及的部分\
+- 先 read_file 读取版本内的**每个文件**（任务里会给清单），与清单逐条对照；清单里的\
+每条问题都必须给出处置，不允许遗漏。
+- **必须基于读到的真实文件改**：禁止凭清单描述重写/重建文件；改完要保证未涉及的部分\
 与原文一致（文件读不出来就如实说明，不要猜内容）。
 - 修复要**针对问题本身**做最小改动：不要顺手重构、不要改变无关行为、不要丢功能。
+- **必须输出版本内的全部文件**（每文件一个 ```python file=<相对路径> 围栏，路径与读到的\
+一致）：即使某文件没有改动，也要原样给出——产物是完整版本，不是补丁。
+- 确有理由要**删除某个文件**时，在 fixes 的 JSON 里加 `"deleted": ["<相对路径>", …]` \
+提出申请（删除由用户确认后才会执行，不要试图用"给空文件"代替）。
 - 允许用 run_python 验证候选代码（把完整候选代码用 `code=` 内联执行，或写成文件后执行）——\
 提交前自验过再给出结论，比让复审再发现一遍更省时间。
 - 确实不该改、改不了或问题不成立时，用 `skipped` 并写明理由（如"该结论不成立：已在上游校验"\
@@ -82,8 +95,8 @@ FIXER_SYSTEM_PROMPT = """你是一位资深 Python 工程师，负责按审查�
 - 相对路径基于上下文根解析（工作流节点执行时为运行工作区）。
 
 # 输出格式（必须严格遵守）
-**恰好一个 ```python 围栏**（围栏内是修复后的完整文件内容，不是 diff、不是片段），\
-随后**恰好一个 ```json 围栏**：
+**版本内每个文件一个 ```python file=<相对路径> 围栏**（围栏内是修复后的完整文件内容，\
+不是 diff、不是片段），随后**恰好一个 ```json 围栏**：
 
 {"fixes": [{"finding_id": "f-1", "status": "fixed|partial|skipped", "note": "处置说明"}]}
 
@@ -91,7 +104,7 @@ FIXER_SYSTEM_PROMPT = """你是一位资深 Python 工程师，负责按审查�
 - `skipped` 必须写明理由（note 不能为空）。
 - `note` 是人读的处置说明（会进运行报告的"问题 ← 处置"对照），写清改了什么、为什么；
   这个 JSON 是给系统的结构化记录，不是给用户看的正文。
-- 两个围栏之外只用一两句说明处置要点，不要复述代码、不要重复贴 JSON 内容。"""
+- 全部围栏之外只用一两句说明处置要点，不要复述代码、不要重复贴 JSON 内容。"""
 
 
 _CORRECTNESS_VIEW = """
@@ -139,40 +152,51 @@ def reviewer_system_prompt(view: str | None = None) -> str:
 
 
 def encode_task_prompt(
-    *, requirement: str, file_name: str, retry_feedback: str | None = None
+    *, requirement: str, version_label: str, retry_feedback: str | None = None
 ) -> str:
     """编码任务：需求文本 + 输出去向 + （重试时）上一轮的校验失败原因。"""
     lines = [
-        "请按以下需求写出单文件 Python 实现。",
+        "请按以下需求写出 Python 实现（一个或多个文件）。",
         "",
         "需求：",
         _clip(requirement, limit_lines=40),
         "",
-        f"输出会由系统保存为工作区文件 {file_name}；请只输出一个 ```python 围栏（完整文件内容）。",
+        (
+            f"输出会由系统保存为版本目录 {version_label}/（manifest 由系统生成，"
+            "不要自己输出）；每个文件一个 ```python file=<相对路径> 围栏。"
+        ),
     ]
     return _with_retry(lines, retry_feedback)
 
 
 def review_task_prompt(
     *,
-    file_name: str,
+    version_label: str,
+    files: Sequence[str],
     review_round: int,
     code_version: int,
     allow_exec: bool,
     retry_feedback: str | None = None,
     view: str | None = None,
 ) -> str:
-    """审查任务：说明本轮要读哪个工作区文件、可用的核实手段与输出契约。
+    """审查任务：本轮覆盖的版本文件清单、可用的核实手段与输出契约。
 
+    一次审查覆盖版本内**全部文件**（Design §4.2.2）；读取路径带版本目录前缀
+    （``版本目录/文件``），而 findings 的 location 只写版本内相对路径。
     ``view`` 非空表示并行双视角审查的分支：任务里写明本视角负责什么、另一位负责什么，
     避免两个审查者把同一类问题各报一遍（汇合阶段虽会去重，但重复会白花一轮调用）。
     """
+    listing = "\n".join(f"- {version_label}/{name}" for name in files)
     lines = [
-        f"请审查工作区中的当前代码：{file_name}（第 {review_round} 轮审查，代码版本 v{code_version}）。",
+        (
+            f"请审查工作区中的当前代码版本 {version_label}/（第 {review_round} 轮审查，"
+            f"代码版本 v{code_version}），覆盖以下**全部** {len(files)} 个文件："
+        ),
+        listing,
         "",
         (
-            f"步骤：先用 read_file 读取 {file_name} 的**完整内容**"
-            f"（超过 400 行时分段读完），再下结论。"
+            "步骤：先用 read_file 逐个读取上述文件的**完整内容**（超过 400 行时分段读完），"
+            "全部读完后再下结论。"
         ),
     ]
     if view is not None:
@@ -196,12 +220,15 @@ def review_task_prompt(
     lines.extend(
         [
             "",
-            f"所有 location 使用工作区实名 {file_name}:行号（1-based）。",
-            "最后输出恰好一个 ```json 围栏，结构如下：",
             (
-                '{"findings": [{"severity": "严重|一般|建议", "location": "'
-                f'{file_name}:行号", "issue": "…", "suggestion": "…", "uncertain": false}}], '
-                '"summary": "本轮整体评价"}'
+                "所有 location 使用**版本内相对路径**:行号（1-based，如 main.py:18、"
+                f"pkg/util.py:7），不要带 {version_label}/ 前缀。"
+            ),
+            "最后输出恰好一个 ```json 围栏，结构如下（files 填上面清单里的相对路径）：",
+            (
+                '{"files": ["…"], "findings": [{"severity": "严重|一般|建议", '
+                '"location": "相对路径:行号", "issue": "…", "suggestion": "…", '
+                '"uncertain": false}], "summary": "本轮整体评价"}'
             ),
         ]
     )
@@ -210,20 +237,35 @@ def review_task_prompt(
 
 def fix_task_prompt(
     *,
-    file_name: str,
+    version_label: str,
+    files: Sequence[str],
     version: int,
     findings: Sequence[Mapping[str, Any]],
     allow_exec: bool,
     retry_feedback: str | None = None,
 ) -> str:
-    """修复任务：当前代码文件、本轮问题清单与输出契约（逐条处置）。"""
+    """修复任务：版本文件清单、本轮问题清单与输出契约（逐条处置 + 完整版本产出）。
+
+    清单以**版本内相对路径**呈现：它同时是 ``file=`` 的声明口径（避免了"清单带版本目录
+    前缀、围栏要求不带前缀"的自相矛盾——真实演示曾因此让模型产出带前缀的路径、覆盖检查
+    判缺全体文件）；读取路径的版本目录前缀在步骤说明里单独给出。
+    """
+    listing = "\n".join(f"- {name}" for name in files)
     lines = [
-        f"请修复工作区文件 {file_name}（当前代码版本 v{version}）中审查发现的问题。",
+        f"请修复工作区版本 {version_label}/（当前代码版本 v{version}）中审查发现的问题。",
+        "",
+        f"版本内共 {len(files)} 个文件（``file=`` 用这些相对路径声明）：",
+        listing,
         "",
         "问题清单：",
         _finding_lines(findings),
         "",
-        f"步骤：先 read_file 读取 {file_name} 的完整内容，逐条处置后输出修复后的**完整文件**。",
+        (
+            f"步骤：先 read_file 读取上面**每个文件**的完整内容（读取路径带版本目录前缀，"
+            f"如 {version_label}/{files[0] if files else 'main.py'}），逐条处置后，"
+            "输出版本内的**全部文件**（未改动的文件也原样给出，每文件一个 "
+            "```python file=<版本内相对路径> 围栏——不要带版本目录前缀）。"
+        ),
     ]
     if allow_exec:
         lines.append(
@@ -237,9 +279,13 @@ def fix_task_prompt(
     lines.extend(
         [
             "",
-            "输出格式：恰好一个 ```python 围栏（完整文件内容）+ 恰好一个 ```json 围栏：",
+            "随后输出恰好一个 ```json 围栏：",
             '{"fixes": [{"finding_id": "f-1", "status": "fixed|partial|skipped", "note": "…"}]}',
             "fixes 必须覆盖上面清单中的每一个 id。",
+            (
+                '确需删除文件时，在该 JSON 里加 "deleted": ["<相对路径>", …] 提出申请'
+                "（是否执行由用户确认，系统会先列出待删清单征询你）。"
+            ),
         ]
     )
     return _with_retry(lines, retry_feedback)

@@ -14,10 +14,10 @@ import pytest
 from support import (
     fenced,
     fix_payload,
+    read_sample,
     requirement_state,
     review_payload,
-    sample_path,
-    write_code,
+    write_version,
 )
 from support import (
     node_state as state_for,
@@ -31,6 +31,7 @@ def test_fake_encode_produces_compilable_module_with_docstring() -> None:
     ast.parse(code)
     assert ast.get_docstring(ast.parse(code))
     assert "写一个计算器" in code
+    assert "file=main.py" in output["code_text"]  # 多文件契约的归属声明
 
 
 def test_fake_encode_is_deterministic_and_handles_hostile_requirement() -> None:
@@ -53,22 +54,27 @@ def test_fake_encode_falls_back_when_requirement_breaks_inlining() -> None:
 
 def test_fake_review_reports_clean_module_as_no_findings(tmp_path: Path) -> None:
     code = '"""示例模块。"""\n\n\ndef main() -> None:\n    print("hi")\n'
-    state = state_for(current_code=write_code(tmp_path, code))
+    state = state_for(
+        version_dir=write_version(tmp_path, {"main.py": code}), files={"main.py": code}
+    )
 
     payload = review_payload(fakes.fake_review(state)["review_text"])
 
     assert payload["findings"] == []
+    assert payload["files"] == ["main.py"]
     assert payload["summary"].strip()
 
 
 def test_fake_review_detects_syntax_error_with_location(tmp_path: Path) -> None:
     code = '"""示例模块。"""\n\n\ndef greet(name)\n    print(name)\n'
-    state = state_for(current_code=write_code(tmp_path, code))
+    state = state_for(
+        version_dir=write_version(tmp_path, {"main.py": code}), files={"main.py": code}
+    )
 
     payload = review_payload(fakes.fake_review(state)["review_text"])
 
     assert [item["severity"] for item in payload["findings"]] == ["严重"]
-    assert payload["findings"][0]["location"] == "code_v1.py:4"
+    assert payload["findings"][0]["location"] == "main.py:4"
     assert "语法错误" in payload["findings"][0]["issue"]
 
 
@@ -78,16 +84,21 @@ def test_fake_review_detects_syntax_error_with_location(tmp_path: Path) -> None:
 )
 def test_fake_review_detects_division_risks(tmp_path: Path, expression: str) -> None:
     code = f'"""示例模块。"""\n\n\ndef compute(values):\n    return {expression}\n'
-    state = state_for(current_code=write_code(tmp_path, code))
+    state = state_for(
+        version_dir=write_version(tmp_path, {"main.py": code}), files={"main.py": code}
+    )
 
     payload = review_payload(fakes.fake_review(state)["review_text"])
 
     assert [item["severity"] for item in payload["findings"]] == ["严重"]
-    assert payload["findings"][0]["location"] == "code_v1.py:5"
+    assert payload["findings"][0]["location"] == "main.py:5"
 
 
 def test_fake_review_suggests_docstring_when_missing(tmp_path: Path) -> None:
-    state = state_for(current_code=write_code(tmp_path, "print(1)\n"))
+    code = "print(1)\n"
+    state = state_for(
+        version_dir=write_version(tmp_path, {"main.py": code}), files={"main.py": code}
+    )
 
     payload = review_payload(fakes.fake_review(state)["review_text"])
 
@@ -95,10 +106,18 @@ def test_fake_review_suggests_docstring_when_missing(tmp_path: Path) -> None:
     assert "docstring" in payload["findings"][0]["issue"]
 
 
-def test_fake_review_on_repository_fixtures() -> None:
+def test_fake_review_on_repository_fixtures(tmp_path: Path) -> None:
     """仓库内两份缺陷样例的行为即演示口径：语法错误 → 严重；除零 → 严重。"""
-    syntax_state = state_for(current_code=str(sample_path("syntax_error.py")))
-    division_state = state_for(current_code=str(sample_path("divide_by_zero.py")))
+    syntax_state = state_for(
+        version_dir=write_version(tmp_path / "syntax", {"main.py": read_sample("syntax_error.py")}),
+        files={"main.py": ""},
+    )
+    division_state = state_for(
+        version_dir=write_version(
+            tmp_path / "division", {"main.py": read_sample("divide_by_zero.py")}
+        ),
+        files={"main.py": ""},
+    )
 
     syntax_findings = review_payload(fakes.fake_review(syntax_state)["review_text"])["findings"]
     division_findings = review_payload(fakes.fake_review(division_state)["review_text"])["findings"]
@@ -115,15 +134,15 @@ def test_fake_fix_repairs_syntax_and_verifies_by_compiling() -> None:
         {
             "id": "f-1",
             "severity": "严重",
-            "location": "code_v1.py:4",
+            "location": "main.py:4",
             "issue": "语法错误：expected ':'",
         }
     ]
 
-    repaired, fixes = fakes.scripted_repair(code, findings)
+    repaired, fixes = fakes.scripted_repair({"main.py": code}, findings)
 
-    ast.parse(repaired)
-    assert "def greet(name):" in repaired
+    ast.parse(repaired["main.py"])
+    assert "def greet(name):" in repaired["main.py"]
     assert fixes == [
         {
             "finding_id": "f-1",
@@ -136,12 +155,12 @@ def test_fake_fix_repairs_syntax_and_verifies_by_compiling() -> None:
 def test_fake_fix_skips_semantic_defects_without_touching_code() -> None:
     code = '"""示例模块。"""\n\n\ndef average(values):\n    return sum(values) / len(values)\n'
     findings = [
-        {"id": "f-1", "severity": "严重", "location": "code_v1.py:5", "issue": "除数是 len(...)"}
+        {"id": "f-1", "severity": "严重", "location": "main.py:5", "issue": "除数是 len(...)"}
     ]
 
-    repaired, fixes = fakes.scripted_repair(code, findings)
+    repaired, fixes = fakes.scripted_repair({"main.py": code}, findings)
 
-    assert repaired == code
+    assert repaired == {"main.py": code}
     assert fixes[0]["status"] == "skipped"
     assert fixes[0]["note"].strip()
 
@@ -152,26 +171,29 @@ def test_fake_fix_covers_every_finding_id() -> None:
         {
             "id": "f-1",
             "severity": "严重",
-            "location": "code_v1.py:4",
+            "location": "main.py:4",
             "issue": "语法错误：expected ':'",
         },
-        {"id": "f-2", "severity": "建议", "location": "code_v1.py", "issue": "模块缺少说明文档"},
+        {"id": "f-2", "severity": "建议", "location": "main.py", "issue": "模块缺少说明文档"},
     ]
 
-    _, fixes = fakes.scripted_repair(code, findings)
+    _, fixes = fakes.scripted_repair({"main.py": code}, findings)
 
     assert [item["finding_id"] for item in fixes] == ["f-1", "f-2"]
 
 
-def test_fake_fix_output_carries_one_python_and_one_json_fence(tmp_path: Path) -> None:
+def test_fake_fix_output_carries_all_files_and_one_json_fence(tmp_path: Path) -> None:
     code = '"""示例模块。"""\n\n\ndef greet(name)\n    print(name)\n'
+    other = '"""另一个模块。"""\n'
+    version_dir = write_version(tmp_path, {"main.py": code, "util.py": other})
     state = state_for(
-        current_code=write_code(tmp_path, code),
+        version_dir=version_dir,
+        files={"main.py": code, "util.py": other},
         findings=[
             {
                 "id": "f-1",
                 "severity": "严重",
-                "location": "code_v1.py:4",
+                "location": "main.py:4",
                 "issue": "语法错误：expected ':'",
             }
         ],
@@ -179,7 +201,9 @@ def test_fake_fix_output_carries_one_python_and_one_json_fence(tmp_path: Path) -
 
     text = fakes.fake_fix(state)["fix_text"]
 
-    assert text.count("```python") == 1
+    assert 'file="main.py"' not in text
+    assert text.count("```python file=main.py") == 1
+    assert text.count("```python file=util.py") == 1  # 未改动文件也原样给出
     assert text.count("```json") == 1
     assert fix_payload(text)["fixes"][0]["status"] == "fixed"
 
@@ -187,9 +211,9 @@ def test_fake_fix_output_carries_one_python_and_one_json_fence(tmp_path: Path) -
 def test_fake_fix_cannot_repair_unrecognized_syntax() -> None:
     """无法安全修补（整文件仍不可编译）时标记 skipped 且不改动代码。"""
     code = "def broken(:\n    pass\n"
-    findings = [{"id": "f-1", "severity": "严重", "location": "code_v1.py:1", "issue": "语法错误"}]
+    findings = [{"id": "f-1", "severity": "严重", "location": "main.py:1", "issue": "语法错误"}]
 
-    repaired, fixes = fakes.scripted_repair(code, findings)
+    repaired, fixes = fakes.scripted_repair({"main.py": code}, findings)
 
-    assert repaired == code
+    assert repaired == {"main.py": code}
     assert fixes[0]["status"] == "skipped"

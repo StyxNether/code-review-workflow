@@ -98,7 +98,10 @@ class RunState(TypedDict, total=False):
     parallel_review: bool
     session_id: str | None
     round_index: int | None
-    current_code: str
+    current_version_dir: str
+    #: 当前版本内的文件清单（版本内相对路径，posix 风格，与 manifest 一致）：
+    # 审查 / 修复节点的任务提示词需要它（节点不接触文件，Design §3.1）
+    version_files: list[str]
     findings: list[Finding]
     #: 并行双视角审查的分支结论（独立 key：同超级步多写者不得冲突，Design §12.2）。
     #: 汇合节点消费后由 ``findings`` 承载权威结论，故不进入运行记录（见 PERSISTED_FIELDS）。
@@ -129,7 +132,8 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "parallel_review",
     "session_id",
     "round_index",
-    "current_code",
+    "current_version_dir",
+    "version_files",
     "findings",
     "clean",
     "strict",
@@ -158,7 +162,8 @@ _DEFAULTS: dict[str, Any] = {
     "parallel_review": False,
     "session_id": None,
     "round_index": None,
-    "current_code": "",
+    "current_version_dir": "",
+    "version_files": [],
     "findings": [],
     "clean": False,
     "strict": False,
@@ -172,9 +177,9 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
-def code_file_name(version: int) -> str:
-    """代码产物文件名：``code_v<version>.py``（Design §4.5）。"""
-    return f"code_v{version}.py"
+def code_version_dir_name(version: int) -> str:
+    """代码版本目录名：``code_v<version>``（版本 = 目录 + manifest.json，Design §4.2.2）。"""
+    return f"code_v{version}"
 
 
 def review_file_name(round_number: int, *, view: str | None = None) -> str:
@@ -252,7 +257,8 @@ def new_state(
         parallel_review=parallel_review,
         session_id=session_id,
         round_index=round_index,
-        current_code="",
+        current_version_dir="",
+        version_files=[],
         findings=[],
         findings_correctness=[],
         findings_security=[],

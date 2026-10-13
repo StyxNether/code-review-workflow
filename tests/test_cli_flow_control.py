@@ -30,13 +30,15 @@ def write_parent_record(
     parallel_review: bool = False,
     with_code: bool = True,
 ) -> Path:
-    """在测试数据目录里造一条父运行记录（state.json + workspace/code_v2.py）。"""
+    """在测试数据目录里造一条父运行记录（state.json + workspace/code_v2/）。"""
     run_dir = records.create_run_dir(run_id)
     workspace = run_dir / "workspace"
-    current_code = ""
+    current_version_dir = ""
     if with_code:
-        (workspace / "code_v2.py").write_text(code, encoding="utf-8")
-        current_code = str(workspace / "code_v2.py")
+        version_dir = workspace / "code_v2"
+        version_dir.mkdir()
+        (version_dir / "main.py").write_text(code, encoding="utf-8")
+        current_version_dir = str(version_dir)
     state = {
         "run_id": run_id,
         "parent_run_id": None,
@@ -50,8 +52,9 @@ def write_parent_record(
         "parallel_review": parallel_review,
         "session_id": None,
         "round_index": None,
-        "current_code": current_code,
-        "findings": [fakes.finding(location="code_v2.py:1")],
+        "current_version_dir": current_version_dir,
+        "version_files": ["main.py"] if with_code else [],
+        "findings": [fakes.finding(location="main.py:1")],
         "clean": False,
         "strict": strict,
         "history": [],
@@ -71,12 +74,12 @@ def test_resume_inherits_parent_rounds_and_records_parent_run_id(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """续跑：父运行最新代码复制为新运行 code_v1.py、记 parent_run_id、轮次来源标 parent。"""
+    """续跑：父运行最新版本目录复制为新运行 code_v1/、记 parent_run_id、轮次来源标 parent。"""
     write_parent_record(max_iterations=2)
     configured_provider()
     fake_chat_model.load(
         [
-            fakes.ai_tool_call("read_file", path="code_v1.py"),
+            fakes.ai_tool_call("read_file", path="code_v1/main.py"),
             fakes.ai_text(fakes.review_fence([], "已读完文件，未发现阻塞问题。")),
         ]
     )
@@ -91,7 +94,9 @@ def test_resume_inherits_parent_rounds_and_records_parent_run_id(
     assert state["max_iterations"] == 2  # 未显式给出 → 继承父运行
     assert state["max_iterations_source"] == state_mod.SOURCE_PARENT
     assert state["input"]["kind"] == state_mod.INPUT_FILE
-    assert (child.path / "workspace" / "code_v1.py").read_text(encoding="utf-8") == "print(1)\n"
+    assert (child.path / "workspace" / "code_v1" / "main.py").read_text(
+        encoding="utf-8"
+    ) == "print(1)\n"
     report = (child.path / "report.md").read_text(encoding="utf-8")
     assert "| 父运行 | r-20261012-0001 |" in report
     assert "| 父运行残留 |" in report
@@ -107,7 +112,7 @@ def test_resume_inherits_strict_and_explicit_rounds_win(
     configured_provider()
     fake_chat_model.load(
         [
-            fakes.ai_tool_call("read_file", path="code_v1.py"),
+            fakes.ai_tool_call("read_file", path="code_v1/main.py"),
             fakes.ai_text(fakes.review_fence([], "已读完文件。")),
         ]
     )
@@ -201,12 +206,22 @@ def test_run_parallel_review_records_the_shape_and_branch_artifacts(
     fake_chat_model.route(
         {
             "你只负责【正确性】视角": [
-                fakes.ai_tool_call("read_file", path="code_v1.py"),
-                fakes.ai_text(fakes.review_fence([fakes.finding(location="code_v1.py:7")])),
+                fakes.ai_tool_call("read_file", path="code_v1/divide_by_zero.py"),
+                fakes.ai_text(
+                    fakes.review_fence(
+                        [fakes.finding(location="divide_by_zero.py:7")],
+                        files=["divide_by_zero.py"],
+                    )
+                ),
             ],
             "你只负责【安全性】视角": [
-                fakes.ai_tool_call("read_file", path="code_v1.py"),
-                fakes.ai_text(fakes.review_fence([fakes.finding(location="code_v1.py:9")])),
+                fakes.ai_tool_call("read_file", path="code_v1/divide_by_zero.py"),
+                fakes.ai_text(
+                    fakes.review_fence(
+                        [fakes.finding(location="divide_by_zero.py:9")],
+                        files=["divide_by_zero.py"],
+                    )
+                ),
             ],
         }
     )
@@ -367,11 +382,11 @@ def test_resume_inherits_the_parallel_review_shape(
     fake_chat_model.route(
         {
             "你只负责【正确性】视角": [
-                fakes.ai_tool_call("read_file", path="code_v1.py"),
+                fakes.ai_tool_call("read_file", path="code_v1/main.py"),
                 fakes.ai_text(fakes.review_fence([], "正确性视角已读完文件。")),
             ],
             "你只负责【安全性】视角": [
-                fakes.ai_tool_call("read_file", path="code_v1.py"),
+                fakes.ai_tool_call("read_file", path="code_v1/main.py"),
                 fakes.ai_text(fakes.review_fence([], "安全性视角已读完文件。")),
             ],
         }
@@ -401,7 +416,7 @@ def test_resume_falls_back_to_default_when_inherited_rounds_is_out_of_range(
     configured_provider()
     fake_chat_model.load(
         [
-            fakes.ai_tool_call("read_file", path="code_v1.py"),
+            fakes.ai_tool_call("read_file", path="code_v1/main.py"),
             fakes.ai_text(fakes.review_fence([], "已读完文件。")),
         ]
     )

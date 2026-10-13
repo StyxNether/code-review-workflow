@@ -385,3 +385,125 @@ def test_legacy_env_var_rejects_a_malformed_preset(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(config.ConfigError, match="前缀约定"):
         config.legacy_env_var("X")
+
+
+# ---- 模型条目两态与思考挡位（Design §8.3 的 M3.5 规格） ----
+
+
+def _thinking_config(**overrides: object) -> dict:
+    entry: dict = {
+        "default": "DeepSeek/deepseek-flash",
+        "providers": [
+            {
+                "name": "DeepSeek",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "placeholder-key",
+                "models": [
+                    {
+                        "name": "deepseek-flash",
+                        "thinking": {"levels": ["off", "low", "high"], "selected": "high"},
+                    }
+                ],
+            }
+        ],
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestThinkingModelEntries:
+    def test_object_form_is_accepted(self) -> None:
+        config.validate_config(_thinking_config())
+
+    def test_string_form_still_means_no_thinking(self) -> None:
+        data = _thinking_config()
+        data["providers"][0]["models"] = ["deepseek-flash"]
+
+        config.validate_config(data)
+        assert config.model_thinking_config(["deepseek-flash"], "deepseek-flash") is None
+
+    @pytest.mark.parametrize(
+        ("models", "match"),
+        [
+            ([{"thinking": {"levels": ["high"]}}], "models"),  # 缺 name
+            ([{"name": "m", "extra": 1}], "未知字段"),
+            ([{"name": "m", "thinking": {"levels": []}}], "不能为空数组"),
+            ([{"name": "m", "thinking": {"levels": ["high"], "selected": "low"}}], "不在 levels"),
+            ([{"name": "m", "thinking": {"levels": ["high", "high"]}}], "重复挡位"),
+            ([{"name": "m"}, {"name": "m"}], "模型名重复"),
+            ([{"name": "m", "thinking": "high"}], "thinking 配置须为对象"),
+        ],
+    )
+    def test_invalid_object_forms_are_rejected(self, models: list, match: str) -> None:
+        data = _thinking_config()
+        data["providers"][0]["models"] = models
+        data.pop("default")
+
+        with pytest.raises(config.ConfigError, match=match):
+            config.validate_config(data)
+
+    def test_resolve_reports_the_selected_level(self) -> None:
+        """解析结果带上生效挡位，标签按 ``供应商/模型（思考：…）`` 回显。"""
+        config.save_raw(_thinking_config())
+
+        resolved = config.resolve()
+
+        assert resolved is not None
+        assert resolved.thinking == "high"
+        assert resolved.label() == "DeepSeek/deepseek-flash（思考：high）"
+
+    def test_unconfigured_level_keeps_the_plain_label(self) -> None:
+        """未配置 selected（或纯字符串条目）：标签不带括号，行为与 M3 一致。"""
+        data = _thinking_config()
+        data["providers"][0]["models"] = [
+            {"name": "deepseek-flash", "thinking": {"levels": ["high"]}}
+        ]
+        config.save_raw(data)
+
+        resolved = config.resolve()
+
+        assert resolved is not None and resolved.thinking is None
+        assert resolved.label() == "DeepSeek/deepseek-flash"
+
+
+def test_exec_timeout_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CRW_EXEC_TIMEOUT 必须为正整数：0 / 负数按配置错误报出（与上下文预算同口径）。"""
+    monkeypatch.setenv("CRW_EXEC_TIMEOUT", "0")
+    with pytest.raises(config.ConfigError, match="CRW_EXEC_TIMEOUT"):
+        config.get_exec_timeout()
+
+    monkeypatch.setenv("CRW_EXEC_TIMEOUT", "-5")
+    with pytest.raises(config.ConfigError, match="正整数"):
+        config.get_exec_timeout()
+
+
+def test_test_provider_survives_invalid_model_entries() -> None:
+    """非法模型条目（无可用名称）不炸栈：给可读结论（正常加载会先被 validate_config 拦下）。"""
+    status, detail = config.test_provider(
+        {"name": "X", "base_url": "https://x.example.invalid", "models": [123]}
+    )
+
+    assert status == "error" and "未配置 key" in detail
+
+
+def test_importable_providers_keeps_object_entries() -> None:
+    """前作配置导入：对象形态的模型条目原样沿用（结构同源口径），不再整条静默丢弃。"""
+    data = {
+        "providers": [
+            {
+                "name": "DeepSeek",
+                "base_url": "https://api.deepseek.com",
+                "models": [
+                    "deepseek-flash",
+                    {"name": "deepseek-v4-pro", "thinking": {"levels": ["high"]}},
+                ],
+            }
+        ]
+    }
+
+    entries = config.importable_providers(data)
+
+    assert entries[0]["models"] == [
+        "deepseek-flash",
+        {"name": "deepseek-v4-pro", "thinking": {"levels": ["high"]}},
+    ]

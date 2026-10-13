@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +26,18 @@ def read_sample(name: str) -> str:
 
 
 def node_state(
-    *, kind: str = "file", max_iterations: int = 3, **overrides: object
+    *,
+    kind: str = "file",
+    max_iterations: int = 3,
+    version_dir: object = "",
+    files: Mapping[str, object] | None = None,
+    **overrides: object,
 ) -> dict[str, Any]:
-    """构造节点可用的最小状态（只含节点读取的字段）。"""
+    """构造节点可用的最小状态（只含节点读取的字段；版本 = 目录 + 文件清单）。"""
     base: dict[str, Any] = {
         "input": {"kind": kind, "requirement": "写一个计算器"},
-        "current_code": str(sample_path("syntax_error.py")),
+        "current_version_dir": str(version_dir),
+        "version_files": sorted(files or {}),
         "findings": [],
         "clean": False,
         "fix_rounds": 0,
@@ -47,16 +54,26 @@ def requirement_state(requirement: str) -> dict[str, Any]:
     return node_state(kind="requirement", input={"kind": "requirement", "requirement": requirement})
 
 
-def write_code(tmp_path: Path, text: str, name: str = "code_v1.py") -> str:
-    """把代码写进工作区文件并返回路径（节点读 current_code）。"""
-    path = tmp_path / name
-    path.write_text(text, encoding="utf-8")
-    return str(path)
+def write_version(tmp_path: Path, files: Mapping[str, str], *, version: int = 1) -> str:
+    """把一组文件写进版本目录（``tmp_path/code_vN/``），返回目录路径（节点读 current_version_dir）。"""
+    directory = tmp_path / f"code_v{version}"
+    for name, text in files.items():
+        target = directory / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return str(directory)
 
 
 def fenced(text: str, label: str) -> str:
-    """取文本中第一个指定标签围栏的内容（脚本化假节点的输出格式即契约格式）。"""
-    return text.split(f"```{label}", 1)[1].split("```", 1)[0]
+    """取文本中第一个指定标签围栏的内容（围栏 info 允许 ``file=…`` 等后缀）。
+
+    找不到围栏时带上下文报错：裸 IndexError 无法区分"围栏缺失"与"标签写错"。
+    """
+    parts = text.split(f"```{label}", 1)
+    assert len(parts) == 2, f"文本中没有 ```{label} 围栏（开头：{text[:60]!r}）"
+    body = parts[1]
+    body = body.split("\n", 1)[1] if "\n" in body else ""
+    return body.split("```", 1)[0]
 
 
 def review_payload(review_text: str) -> dict[str, Any]:
@@ -78,5 +95,5 @@ __all__ = [
     "requirement_state",
     "review_payload",
     "sample_path",
-    "write_code",
+    "write_version",
 ]

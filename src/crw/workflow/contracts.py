@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -26,7 +27,14 @@ FIX_STATUSES: tuple[str, ...] = ("fixed", "partial", "skipped")
 CODE_LABELS: tuple[str, ...] = ("python", "py")
 JSON_LABELS: tuple[str, ...] = ("json",)
 
-_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\s`~]*)[ \t]*$")
+#: 版本量级上限（Design §4.2.2：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB）
+MAX_VERSION_FILES = 20
+MAX_FILE_BYTES = 256 * 1024
+MAX_VERSION_BYTES = 1024 * 1024
+
+# 围栏 info 允许空格分隔的多个词（`` ```python file=<相对路径> ``，Design §4.2.2），
+# 但不得含反引号 / 波浪号：闭合标记行靠"info 为空"识别，info 里出现围栏字符会破坏该判据
+_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?:[ \t]*(?P<info>[^`~]*?))?[ \t]*$")
 
 
 class ContractViolation(ValueError):
@@ -50,15 +58,34 @@ class ReviewResult:
 
 @dataclass(frozen=True)
 class FixResult:
-    """一轮修复的校验后结果。"""
+    """一轮修复的校验后结果（多文件形态，Design §4.2.2）。"""
 
-    code: str
+    files: dict[str, str]
+    """路径（版本内相对路径，posix 风格）→ 文件内容；重复声明取最后一个。"""
+
     fixes: list[dict[str, Any]]
     unknown_ids: tuple[str, ...]
     """未知 finding_id（Design §5.2：忽略并在报告标注）。"""
 
+    deleted: tuple[str, ...] = ()
+    """修复 Agent **提出**删除的路径（执行前须用户确认，Design §4.2.2）。"""
+
+    duplicate_declarations: int = 0
+    """被忽略的重复 file= 声明数（同路径取最后一个，阶段摘要记"已忽略重复声明"）。"""
+
     extra_fences: int = 0
     """被忽略的多余围栏数（Design §4.2.1：其余围栏忽略并记 log）。"""
+
+
+@dataclass(frozen=True)
+class CodeFence:
+    """一个声明了产出路径的代码围栏（围栏 info 形如 `` ```python file=<相对路径> ``）。"""
+
+    label: str
+    file: str | None
+    """``file=`` 声明的相对路径；未声明为 ``None``（多文件契约下属违规）。"""
+
+    content: str
 
 
 def extract_fence(text: str, labels: Sequence[str]) -> list[str]:
@@ -74,31 +101,94 @@ def extract_fence(text: str, labels: Sequence[str]) -> list[str]:
 def scan_fences(text: str) -> list[tuple[str, str]]:
     """按出现顺序扫描全部围栏，返回 ``(语言标签, 内容)``（标签已小写化）。
 
+    语言标签取 info 的第一个词（`` ```python file=a.py `` 的标签是 ``python``）。
     供"其余围栏忽略并记 log"计数用：抽取只认目标标签，但被忽略的围栏也要能被数出来。
     """
-    blocks: list[tuple[str, str]] = []
+    return [(label, content) for label, _, content in _scan_fence_blocks(text)]
+
+
+def scan_file_fences(text: str, labels: Sequence[str] = CODE_LABELS) -> list[CodeFence]:
+    """抽取带语言标签的代码围栏及其 ``file=`` 声明（Design §4.2.2 的产出契约）。
+
+    语言标签不区分大小写；``file=`` 参数取 info 中最后一个 ``file=`` 词，可带成对引号
+    （路径含空格时的声明写法）；未声明 ``file=`` 时 :attr:`CodeFence.file` 为 ``None``。
+    """
+    wanted = {label.lower() for label in labels}
+    result: list[CodeFence] = []
+    for label, info, content in _scan_fence_blocks(text):
+        if label in wanted:
+            result.append(CodeFence(label=label, file=_file_argument(info), content=content))
+    return result
+
+
+def _scan_fence_blocks(text: str) -> list[tuple[str, str, str]]:
+    """围栏扫描的单一实现：按出现顺序返回 ``(标签, info 原文, 内容)``。
+
+    闭合行需同种字符且长度不短于开启行、info 为空（Design §4.2.1）；未闭合的围栏整块
+    丢弃（内容不完整，抽取失败交给重试处理）。
+    """
+    blocks: list[tuple[str, str, str]] = []
     fence: str | None = None
     info = ""
+    label = ""
     buffer: list[str] = []
     for line in text.splitlines():
         match = _FENCE_RE.match(line)
         if fence is None:
             if match:
                 fence = match.group("fence")
-                info = match.group("info").lower()
+                info = (match.group("info") or "").strip()
+                label = info.split()[0].lower() if info else ""
                 buffer = []
             continue
         if (
             match
             and match.group("fence")[0] == fence[0]
             and len(match.group("fence")) >= len(fence)
-            and not match.group("info")
+            and not (match.group("info") or "").strip()
         ):
-            blocks.append((info, "\n".join(buffer).strip("\n")))
+            blocks.append((label, info, "\n".join(buffer).strip("\n")))
             fence = None
         else:
             buffer.append(line)
     return blocks
+
+
+def _file_argument(info: str) -> str | None:
+    """从围栏 info 解析 ``file=`` 参数；未声明返回 ``None``。
+
+    带成对引号的形态优先（``py file="带 空格.py"``，引号内允许空格）；否则按空白分词取
+    最后一个 ``file=`` 词。反斜杠归一为 posix 风格（Windows 心智的模型输出）。
+    """
+    quoted = re.findall(r'file="([^"]+)"', info) or re.findall(r"file='([^']+)'", info)
+    if quoted:
+        return quoted[-1].replace("\\", "/")
+    found: str | None = None
+    for token in info.split():
+        if token.startswith("file=") and len(token) > len("file="):
+            found = token[len("file=") :]
+    if found is None:
+        return None
+    if len(found) >= 2 and found[0] == found[-1] and found[0] in ("'", '"'):
+        found = found[1:-1]
+    return found.replace("\\", "/")
+
+
+def validate_version_path(raw: str) -> str:
+    """校验"版本内相对路径"并归一为 posix 风格；违规抛 :class:`ContractViolation`。
+
+    拒绝绝对路径、盘符、``~`` 展开、越出版本的 ``..`` 段与空路径——版本目录是产物边界
+    （Design §4.2.2），声明路径必须落在它内部。反斜杠按 Windows 心智归一为 ``/``。
+    """
+    text = raw.replace("\\", "/").strip()
+    if not text:
+        raise ContractViolation(["围栏的 file= 声明为空路径"])
+    if text.startswith(("/", "~")) or (len(text) > 1 and text[1] == ":"):
+        raise ContractViolation([f"围栏的 file= 声明必须是版本内相对路径，收到 {raw!r}"])
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ContractViolation([f"围栏的 file= 声明不得越出版本目录，收到 {raw!r}"])
+    return "/".join(parts)
 
 
 def parse_review_output(
@@ -106,19 +196,19 @@ def parse_review_output(
     *,
     review_round: int,
     code_version: int,
-    file_name: str,
+    files: Sequence[str],
     has_tool_evidence: bool = True,
 ) -> ReviewResult:
-    """抽取并校验审查契约对象（Design §5.2）。
+    """抽取并校验审查契约对象（Design §5.2 的多文件形态）。
 
     Args:
         text: 审查节点交回的原始文本，应含恰好一个 ```json 围栏。
         review_round: 权威审查序号（节点若给出 ``iteration`` 必须与之相等）。
         code_version: 权威代码版本号（节点若给出 ``code_version`` 必须与之相等）。
-        file_name: 权威工作区实名（节点若给出 ``file`` 必须与之相等）。
+        files: 当前版本的权威文件清单（版本内相对路径；节点若给出 ``files`` 必须一致）。
         has_tool_evidence: 本轮是否已有成功工具事件或内联送达记录（执行有效性门禁）。
-            M1 的假节点没有工具调用，调用方传 ``True``——契约文本本身就是"内联送达记录"；
-            工具事件的真实判定随 M2 的 Agent 运行时接入（Design §5.2 的同一门禁）。
+            假节点 / 注入桩没有工具调用，调用方传 ``True``——契约文本本身就是"内联送达
+            记录"；工具事件的真实判定由 Agent 运行时统计（Design §5.2 的同一门禁）。
 
     Returns:
         :class:`ReviewResult`；契约非法时抛 :class:`ContractViolation`（附错误清单）。
@@ -134,14 +224,18 @@ def parse_review_output(
         raise ContractViolation(["审查契约顶层必须是对象"])
 
     errors: list[str] = []
-    for key, expected in (
-        ("iteration", review_round),
-        ("code_version", code_version),
-        ("file", file_name),
-    ):
+    for key, expected in (("iteration", review_round), ("code_version", code_version)):
         provided = raw.get(key)
         if provided is not None and provided != expected:
             errors.append(f"{key} 应为 {expected!r}，实际 {provided!r}")
+    provided_files = raw.get("files")
+    if provided_files is not None:
+        if not isinstance(provided_files, list) or not all(
+            isinstance(item, str) for item in provided_files
+        ):
+            errors.append("files 必须是字符串数组")
+        elif sorted(provided_files) != sorted(files):
+            errors.append(f"files 应为版本内清单 {sorted(files)}，实际 {sorted(provided_files)}")
 
     findings: list[Finding] = []
     raw_findings = raw.get("findings")
@@ -165,11 +259,14 @@ def parse_review_output(
         raise ContractViolation(errors)
 
     contract: dict[str, Any] = dict(raw)
+    # 旧单文件契约的顶层键已被 files 取代（Design §4.2.2）：残留的 "file" 不进落盘对象，
+    # 避免 show / 报告两类消费方读到两种口径
+    contract.pop("file", None)
     contract.update(
         {
             "iteration": review_round,
             "code_version": code_version,
-            "file": file_name,
+            "files": sorted(files),
             "findings": findings,
             "summary": summary,
         }
@@ -177,32 +274,95 @@ def parse_review_output(
     return ReviewResult(contract=contract, findings=findings, summary=summary)
 
 
+def collect_version_files(text: str, *, require_path: bool) -> tuple[dict[str, str], int, int]:
+    """抽取产出契约的版本文件表：路径 → 内容（Design §4.2.2）。
+
+    每个文件一个 python 围栏，围栏 info 必须声明 ``file=<版本内相对路径>``；重复路径取
+    最后一个并计数（阶段摘要记"已忽略重复声明"）。同时执行量级上限：文件数、单文件与
+    版本总字节数超限按契约违规重试（Design §4.2.2）。
+
+    Args:
+        text: 节点交回的原始文本。
+        require_path: ``file=`` 声明是否必需（编码 / 修复产出恒为真；保留参数是为
+            把"围栏必须有归属路径"的判定收敛在一处）。
+
+    Returns:
+        ``(路径 → 内容, 被忽略的重复声明数, 被忽略的多余围栏数)``。
+
+    Raises:
+        ContractViolation: 缺围栏 / 空内容 / 缺声明 / 路径越界 / 超量级上限。
+    """
+    fences = scan_file_fences(text)
+    if not fences:
+        raise ContractViolation(["输出缺少 ```python 围栏（需要给出代码文件内容）"])
+    errors: list[str] = []
+    files: dict[str, str] = {}
+    duplicates = 0
+    for index, fence in enumerate(fences, 1):
+        if fence.file is None:
+            if require_path:
+                errors.append(
+                    f"第 {index} 个代码围栏缺少 file= 声明（形如 ```python file=main.py）"
+                )
+            continue
+        try:
+            path = validate_version_path(fence.file)
+        except ContractViolation as exc:
+            errors.extend(exc.errors)
+            continue
+        if not fence.content.strip():
+            errors.append(f"围栏 {path} 的内容为空")
+            continue
+        if path in files:
+            duplicates += 1
+        files[path] = fence.content
+    if not files and not errors:
+        errors.append("未抽取出任何代码文件（每个文件需要一个 ```python file=… 围栏）")
+    total_bytes = sum(len(content.encode("utf-8")) for content in files.values())
+    oversize = [
+        path for path, content in files.items() if len(content.encode("utf-8")) > MAX_FILE_BYTES
+    ]
+    if oversize:
+        errors.append(
+            f"以下文件超过单文件上限（{MAX_FILE_BYTES // 1024} KB）：{', '.join(oversize)}"
+        )
+    if len(files) > MAX_VERSION_FILES:
+        errors.append(f"版本文件数超过上限（{MAX_VERSION_FILES} 个），实际 {len(files)} 个")
+    if total_bytes > MAX_VERSION_BYTES:
+        errors.append(
+            f"版本总大小超过上限（{MAX_VERSION_BYTES // 1024} KB），实际 {total_bytes // 1024} KB"
+        )
+    if errors:
+        raise ContractViolation(errors)
+    extra_fences = max(0, len(scan_fences(text)) - len(fences))
+    return files, duplicates, extra_fences
+
+
 def parse_fix_output(
     text: str,
     *,
     findings: Sequence[Mapping[str, Any]],
+    current_files: Sequence[str],
 ) -> FixResult:
-    """抽取并校验修复产物：代码围栏 + fixes 清单（Design §5.2）。
+    """抽取并校验修复产物：版本内全部文件的围栏 + fixes 清单（Design §4.2.2 / §5.2）。
 
     fixes 必须覆盖上一轮 findings 的 id 全集（缺项即违规，交重试处理）；重复 id 取最后
-    一条；未知 id 忽略并在报告标注；``skipped`` 必须给出理由。
-
-    Design §4.2.1：修复场景取**第一个** python 围栏与**第一个** json 围栏，其余围栏忽略
-    并记 log（由调用方把 ``extra_fences`` 写进事件摘要）；缺少任一围栏才按重试处理。
+    一条；未知 id 忽略并在报告标注；``skipped`` 必须给出理由。围栏侧：**必须给出版本内的
+    全部文件**（声明了 ``deleted`` 的除外——删除未确认前版本完整性由"覆盖检查"保证）；
+    新增文件即版本内新条目。删除以 fixes 围栏里的 ``{"deleted": […]}`` **提出**，执行前
+    由引擎征得用户确认（Design §4.2.2）。
 
     Args:
-        text: 修复节点交回的原始文本，应含 ```python 与 ```json 围栏各至少一个。
+        text: 修复节点交回的原始文本。
         findings: 上一轮审查的 findings（契约 id 全集的来源）。
+        current_files: 当前版本的文件清单（覆盖检查与 deleted 校验的基准）。
 
     Returns:
         :class:`FixResult`；契约非法时抛 :class:`ContractViolation`。
     """
-    code_blocks = extract_fence(text, CODE_LABELS)
-    if not code_blocks:
-        raise ContractViolation(["修复输出缺少 ```python 围栏（需要给出修复后的代码）"])
-    code = code_blocks[0]
-    if not code.strip():
-        raise ContractViolation(["修复输出的代码围栏为空"])
+    files, duplicates, extra_fences = collect_version_files(text, require_path=True)
+    errors: list[str] = []
+    deleted = _parse_deleted_declaration(text, current_files, errors)
 
     json_blocks = extract_fence(text, JSON_LABELS)
     if not json_blocks:
@@ -213,15 +373,21 @@ def parse_fix_output(
         raise ContractViolation([f"修复输出的 ```json 围栏不是合法 JSON：{exc}"]) from exc
     if not isinstance(raw, dict):
         raise ContractViolation(["fixes 契约顶层必须是对象"])
-    # Design §4.2.1：取第一个 python 围栏与第一个 json 围栏，其余围栏（含其他语言）忽略并记 log
-    extra_fences = max(0, len(scan_fences(text)) - 2)
+    extra_fences = max(0, extra_fences - 1)
 
     raw_fixes = raw.get("fixes")
     if not isinstance(raw_fixes, list):
         raise ContractViolation(["fixes 必须为数组"])
 
-    known = [str(item.get("id")) for item in findings]
-    errors: list[str] = []
+    known: list[str] = []
+    for index, item in enumerate(findings, 1):
+        finding_id = item.get("id")
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            errors.append(f"上一轮 findings[{index}] 缺少可用 id（记录可能被手改），无法做逐条对应")
+            continue
+        known.append(finding_id)
+    if errors:
+        raise ContractViolation(errors)
     latest: dict[str, dict[str, Any]] = {}
     unknown: list[str] = []
     for index, item in enumerate(raw_fixes, 1):
@@ -255,11 +421,64 @@ def parse_fix_output(
     missing = [finding_id for finding_id in known if finding_id not in latest]
     if missing:
         errors.append(f"fixes 未覆盖全部 findings：缺少 {', '.join(missing)}")
+
+    # 版本完整性：当前版本文件（声明删除的除外）必须全部给出——只给改动文件会让版本
+    # 不完整，与按文件审查 / 逐字节比较 / resume 从版本目录出发的语义冲突（Design §4.2.2）
+    absent = sorted(set(current_files) - set(deleted) - set(files))
+    if absent:
+        errors.append(f"修复必须给出版本内的全部文件（声明删除的除外），缺少：{', '.join(absent)}")
     if errors:
         raise ContractViolation(errors)
 
+    ordered = {path: files[path] for path in sorted(files)}
     fixes = [latest[finding_id] for finding_id in known if finding_id in latest]
-    return FixResult(code=code, fixes=fixes, unknown_ids=tuple(unknown), extra_fences=extra_fences)
+    return FixResult(
+        files=ordered,
+        fixes=fixes,
+        unknown_ids=tuple(unknown),
+        deleted=tuple(deleted),
+        duplicate_declarations=duplicates,
+        extra_fences=extra_fences,
+    )
+
+
+def _parse_deleted_declaration(
+    text: str, current_files: Sequence[str], errors: list[str]
+) -> list[str]:
+    """解析 fixes JSON 围栏里的 ``{"deleted": […]}`` 删除声明（Design §4.2.2）。
+
+    deleted 与 fixes 同围栏；独立成函数是为了把声明侧的错误并入同一份错误清单（重试
+    一次就能拿到全部问题，少一轮往返）。声明路径必须都在当前版本内；重复路径去重保序。
+    """
+    json_blocks = extract_fence(text, JSON_LABELS)
+    if not json_blocks:
+        return []
+    try:
+        raw = json.loads(json_blocks[0])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    declared = raw.get("deleted")
+    if declared is None:
+        return []
+    if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+        errors.append("deleted 必须是字符串数组（提出删除的版本内相对路径）")
+        return []
+    known = set(current_files)
+    result: list[str] = []
+    for item in declared:
+        try:
+            path = validate_version_path(item)
+        except ContractViolation as exc:
+            errors.extend(f"deleted 声明{error}" for error in exc.errors)
+            continue
+        if path not in known:
+            errors.append(f"deleted 引用了版本外的路径：{path}")
+            continue
+        if path not in result:
+            result.append(path)
+    return result
 
 
 def judge_clean(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) -> bool:
@@ -452,19 +671,49 @@ def blocking_count(findings: Sequence[Mapping[str, Any]], *, strict: bool = Fals
     残留可能全部由【一般】构成，报告与渲染不得再写死"【严重】"。
     """
     blocking = (SEVERE, MODERATE) if strict else (SEVERE,)
-    return sum(1 for item in findings if item.get("severity") in blocking)
+    return sum(
+        1 for item in findings if isinstance(item, Mapping) and item.get("severity") in blocking
+    )
 
 
 def severity_counts(findings: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    """逐级计数（报告与阶段标题用），恒定键序：严重 / 一般 / 建议。"""
+    """逐级计数（报告与阶段标题用），恒定键序：严重 / 一般 / 建议。
+
+    非 Mapping 条目（手改过的 review_N.json）跳过——计数读的是展示数据，
+    不得因为一条残缺条目把列表页 / 详情页整体打崩（与 finding_keys 同口径）。
+    """
     return {
-        level: sum(1 for item in findings if item.get("severity") == level) for level in SEVERITIES
+        level: sum(
+            1 for item in findings if isinstance(item, Mapping) and item.get("severity") == level
+        )
+        for level in SEVERITIES
     }
 
 
 def residual_severe(findings: Sequence[Mapping[str, Any]]) -> int:
     """【严重】问题数（runs 列表的"残留严重数"列）。"""
     return severity_counts(findings)[SEVERE]
+
+
+def manifest_payload(*, version: int, files: Mapping[str, str]) -> dict[str, Any]:
+    """版本 manifest 的载荷（Design §4.2.2：文件清单 + sha256 + 行数）。
+
+    "本轮未产生改动"的整版本比较即对比两份 manifest 的 ``路径 → sha256`` 映射；
+    行数供报告与展示层直接取用。路径按字典序排列，保证同内容同清单。
+    """
+    entries = [
+        {
+            "path": path,
+            "sha256": hashlib.sha256(files[path].encode("utf-8")).hexdigest(),
+            "lines": len(files[path].splitlines()),
+        }
+        for path in sorted(files)
+    ]
+    return {
+        "version": version,
+        "files": entries,
+        "total_bytes": sum(len(files[path].encode("utf-8")) for path in sorted(files)),
+    }
 
 
 def _normalize_finding(item: Any, index: int, errors: list[str]) -> Finding:

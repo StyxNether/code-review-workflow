@@ -1,7 +1,8 @@
-"""结构化契约：围栏抽取、审查 / 修复输出校验与干净判定（Design §4.2.1、§5.2）。"""
+"""结构化契约：围栏抽取、审查 / 修复输出校验与干净判定（Design §4.2.2、§5.2）。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -16,18 +17,18 @@ def review_text(payload: object, *, fence: str = "json") -> str:
 
 
 def finding(
-    severity: str = "严重", location: str = "code_v1.py:3", **extra: object
+    severity: str = "严重", location: str = "main.py:3", **extra: object
 ) -> dict[str, object]:
     return {"severity": severity, "location": location, "issue": "示例问题", **extra}
 
 
 def parse_review(payload: object, **kwargs: object):
-    defaults = {"review_round": 1, "code_version": 1, "file_name": "code_v1.py"}
+    defaults = {"review_round": 1, "code_version": 1, "files": ["main.py"]}
     defaults.update(kwargs)
     return contracts.parse_review_output(review_text(payload), **defaults)  # type: ignore[arg-type]
 
 
-# ---- 围栏抽取（Design §4.2.1）----
+# ---- 围栏抽取（Design §4.2.1 / §4.2.2）----
 
 
 def test_extract_fence_accepts_python_and_py_case_insensitively() -> None:
@@ -60,6 +61,59 @@ def test_extract_fence_skips_nested_foreign_blocks() -> None:
     assert contracts.extract_fence(text, contracts.JSON_LABELS) == ['{"findings": []}']
 
 
+def test_scan_file_fences_parses_the_file_declaration() -> None:
+    """`` ```python file=<相对路径> `` 的声明被解析为版本内相对路径（Design §4.2.2）。"""
+    text = (
+        "```python file=main.py\nprint(1)\n```\n\n"
+        "```PY file=pkg/util.py\nprint(2)\n```\n\n"
+        '```python file="带 空格.py"\nprint(3)\n```\n'
+    )
+
+    fences = contracts.scan_file_fences(text)
+
+    assert [(fence.file, fence.content) for fence in fences] == [
+        ("main.py", "print(1)"),
+        ("pkg/util.py", "print(2)"),
+        ("带 空格.py", "print(3)"),
+    ]
+    assert {fence.label for fence in fences} == {"python", "py"}
+
+
+def test_scan_file_fences_normalizes_windows_separators() -> None:
+    """反斜杠按 Windows 心智归一为 posix 风格（模型常按本机习惯写路径）。"""
+    text = "```python file=pkg\\util.py\nprint(1)\n```\n"
+
+    assert contracts.scan_file_fences(text)[0].file == "pkg/util.py"
+
+
+def test_scan_file_fences_keeps_undeclared_fences_detectable() -> None:
+    """未声明 file= 的围栏保留 file=None，由校验层按违规处理。"""
+    text = "```python\nprint(1)\n```\n"
+
+    assert contracts.scan_file_fences(text)[0].file is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("main.py", "main.py"),
+        (" pkg/util.py ", "pkg/util.py"),
+        ("pkg/./util.py", "pkg/util.py"),
+    ],
+)
+def test_validate_version_path_accepts_relative_paths(raw: str, expected: str) -> None:
+    assert contracts.validate_version_path(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["/abs.py", "C:\\abs.py", "~/home.py", "../outside.py", "a/../../b.py", "", "   "],
+)
+def test_validate_version_path_rejects_paths_leaving_the_version(raw: str) -> None:
+    with pytest.raises(contracts.ContractViolation):
+        contracts.validate_version_path(raw)
+
+
 # ---- 审查契约（Design §5.2）----
 
 
@@ -71,7 +125,7 @@ def test_review_contract_generates_ids_in_order_and_fills_defaults() -> None:
     assert result.findings[0]["suggestion"] == ""
     assert result.contract["iteration"] == 1
     assert result.contract["code_version"] == 1
-    assert result.contract["file"] == "code_v1.py"
+    assert result.contract["files"] == ["main.py"]
     assert result.contract["summary"] == "还行"
     assert result.summary == "还行"
 
@@ -90,21 +144,30 @@ def test_review_contract_keeps_unknown_fields() -> None:
     assert result.findings[0]["confidence"] == 0.9  # type: ignore[typeddict-item]
 
 
-def test_review_contract_accepts_matching_iteration_and_file() -> None:
+def test_review_contract_accepts_matching_files_and_version() -> None:
     result = parse_review(
         {
             "iteration": 2,
             "code_version": 2,
-            "file": "code_v2.py",
+            "files": ["b.py", "a.py"],
             "findings": [],
             "summary": "干净",
         },
         review_round=2,
         code_version=2,
-        file_name="code_v2.py",
+        files=["a.py", "b.py"],
     )
 
     assert result.contract["iteration"] == 2
+    assert result.contract["files"] == ["a.py", "b.py"]  # 权威清单按字典序回填
+
+
+def test_review_contract_drops_the_legacy_file_key() -> None:
+    """旧单文件契约的顶层 ``file`` 被 files 取代：残留键不进落盘对象（Design §4.2.2）。"""
+    result = parse_review({"file": "code_v1.py", "findings": [], "summary": "干净"})
+
+    assert "file" not in result.contract
+    assert result.contract["files"] == ["main.py"]
 
 
 @pytest.mark.parametrize(
@@ -112,7 +175,16 @@ def test_review_contract_accepts_matching_iteration_and_file() -> None:
     [
         ({"iteration": 9, "findings": [], "summary": "s"}, {}, "iteration 应为 1"),
         ({"code_version": 9, "findings": [], "summary": "s"}, {}, "code_version 应为 1"),
-        ({"file": "other.py", "findings": [], "summary": "s"}, {}, "file 应为 'code_v1.py'"),
+        (
+            {"files": ["other.py"], "findings": [], "summary": "s"},
+            {},
+            "files 应为版本内清单",
+        ),
+        (
+            {"files": "main.py", "findings": [], "summary": "s"},
+            {},
+            "files 必须是字符串数组",
+        ),
         ({"findings": []}, {}, "视为审查未执行"),
         ({"findings": [], "summary": "   "}, {}, "视为审查未执行"),
         ({"findings": {}, "summary": "s"}, {}, "findings 必须为数组"),
@@ -137,14 +209,14 @@ def test_review_contract_violations_report_readable_errors(
 def test_review_contract_requires_exactly_one_json_fence() -> None:
     with pytest.raises(contracts.ContractViolation, match="恰好一个 ```json 围栏"):
         contracts.parse_review_output(
-            "没有围栏的结论", review_round=1, code_version=1, file_name="code_v1.py"
+            "没有围栏的结论", review_round=1, code_version=1, files=["main.py"]
         )
 
 
 def test_review_contract_rejects_invalid_json_body() -> None:
     with pytest.raises(contracts.ContractViolation, match="不是合法 JSON"):
         contracts.parse_review_output(
-            review_text("{不是 JSON}"), review_round=1, code_version=1, file_name="code_v1.py"
+            review_text("{不是 JSON}"), review_round=1, code_version=1, files=["main.py"]
         )
 
 
@@ -160,7 +232,7 @@ def test_review_contract_requires_execution_evidence_for_empty_findings() -> Non
             review_text({"findings": [], "summary": "没有发现问题"}),
             review_round=1,
             code_version=1,
-            file_name="code_v1.py",
+            files=["main.py"],
             has_tool_evidence=False,
         )
 
@@ -200,14 +272,18 @@ def test_severity_counts_and_residual_severe() -> None:
     assert list(contracts.severity_counts(findings)) == list(contracts.SEVERITIES)
 
 
-# ---- 修复契约（Design §5.2）----
+# ---- 修复契约（Design §4.2.2 / §5.2）----
 
 
-def fix_text(code: str, fixes: object) -> str:
-    return (
-        f"修复完成。\n\n```python\n{code}\n```\n\n"
-        f"```json\n{json.dumps({'fixes': fixes}, ensure_ascii=False)}\n```\n"
+def fix_text(files: dict[str, str], fixes: object, *, deleted: list[str] | None = None) -> str:
+    """构造修复节点的原始输出：每文件一个 ``python file=`` 围栏 + fixes 围栏。"""
+    fences = "\n\n".join(
+        f"```python file={path}\n{content}\n```" for path, content in files.items()
     )
+    payload: dict[str, object] = {"fixes": fixes}
+    if deleted is not None:
+        payload["deleted"] = deleted
+    return f"修复完成。\n\n{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"
 
 
 def test_fix_contract_covers_all_findings_in_order() -> None:
@@ -215,40 +291,81 @@ def test_fix_contract_covers_all_findings_in_order() -> None:
     findings[0]["id"] = "f-1"
     findings[1]["id"] = "f-2"
     text = fix_text(
-        "print(1)",
+        {"main.py": "print(1)"},
         [
             {"finding_id": "f-2", "status": "skipped", "note": "不采纳"},
             {"finding_id": "f-1", "status": "fixed", "note": "已修"},
         ],
     )
 
-    result = contracts.parse_fix_output(text, findings=findings)
+    result = contracts.parse_fix_output(text, findings=findings, current_files=["main.py"])
 
-    assert result.code == "print(1)"
+    assert result.files == {"main.py": "print(1)"}
     assert [item["finding_id"] for item in result.fixes] == ["f-1", "f-2"]
     assert result.unknown_ids == ()
 
 
-def test_fix_contract_last_duplicate_wins() -> None:
-    findings = [{"id": "f-1"}]
-    text = fix_text(
-        "print(1)",
-        [
-            {"finding_id": "f-1", "status": "skipped", "note": "先跳过"},
-            {"finding_id": "f-1", "status": "fixed", "note": "最终修复"},
-        ],
+def test_fix_contract_last_duplicate_declaration_wins() -> None:
+    """重复的 file= 声明取最后一个并计数（阶段摘要记"已忽略重复声明"）。"""
+    text = (
+        "```python file=main.py\nprint(1)\n```\n\n"
+        "```python file=main.py\nprint(2)\n```\n\n"
+        '```json\n{"fixes": []}\n```\n'
     )
 
-    result = contracts.parse_fix_output(text, findings=findings)
+    result = contracts.parse_fix_output(text, findings=[], current_files=[])
 
-    assert result.fixes == [{"finding_id": "f-1", "status": "fixed", "note": "最终修复"}]
+    assert result.files == {"main.py": "print(2)"}
+    assert result.duplicate_declarations == 1
+
+
+def test_fix_contract_requires_every_current_file_unless_deleted() -> None:
+    """版本完整性：当前文件必须全部给出，声明删除的除外（Design §4.2.2）。"""
+    text = fix_text({"main.py": "print(1)"}, [])
+
+    with pytest.raises(contracts.ContractViolation, match="缺少：util.py"):
+        contracts.parse_fix_output(text, findings=[], current_files=["main.py", "util.py"])
+
+
+def test_fix_contract_new_files_are_allowed() -> None:
+    """新增文件即版本内新条目（不在 current_files 里也算合法产出）。"""
+    result = contracts.parse_fix_output(
+        fix_text({"main.py": "print(1)", "extra.py": "print(2)"}, []),
+        findings=[],
+        current_files=["main.py"],
+    )
+
+    assert set(result.files) == {"main.py", "extra.py"}
+
+
+def test_fix_contract_parses_the_deleted_declaration() -> None:
+    """``{"deleted": […]}`` 是删除申请：解析出来交给引擎确认（Design §4.2.2）。"""
+    result = contracts.parse_fix_output(
+        fix_text({"main.py": "print(1)"}, [], deleted=["legacy.py", "legacy.py"]),
+        findings=[],
+        current_files=["main.py", "legacy.py"],
+    )
+
+    assert result.deleted == ("legacy.py",)
+
+
+def test_fix_contract_rejects_deleting_paths_outside_the_version() -> None:
+    with pytest.raises(contracts.ContractViolation, match="版本外的路径"):
+        contracts.parse_fix_output(
+            fix_text({"main.py": "print(1)"}, [], deleted=["nope.py"]),
+            findings=[],
+            current_files=["main.py"],
+        )
 
 
 def test_fix_contract_ignores_unknown_ids_but_reports_them() -> None:
     """未知 id 忽略并在报告标注（Design §5.2 边界）。"""
     result = contracts.parse_fix_output(
-        fix_text("print(1)", [{"finding_id": "f-9", "status": "fixed", "note": "无中生有"}]),
+        fix_text(
+            {"main.py": "print(1)"}, [{"finding_id": "f-9", "status": "fixed", "note": "无中生有"}]
+        ),
         findings=[],
+        current_files=[],
     )
 
     assert result.fixes == []
@@ -268,41 +385,63 @@ def test_fix_contract_ignores_unknown_ids_but_reports_them() -> None:
 )
 def test_fix_contract_violations(fixes: object, expected: str) -> None:
     with pytest.raises(contracts.ContractViolation) as excinfo:
-        contracts.parse_fix_output(fix_text("print(1)", fixes), findings=[{"id": "f-1"}])
+        contracts.parse_fix_output(
+            fix_text({"main.py": "print(1)"}, fixes), findings=[{"id": "f-1"}], current_files=[]
+        )
 
     assert any(expected in error for error in excinfo.value.errors)
 
 
 def test_fix_contract_requires_a_code_fence() -> None:
     with pytest.raises(contracts.ContractViolation, match="缺少 ```python 围栏"):
-        contracts.parse_fix_output("没有围栏", findings=[])
+        contracts.parse_fix_output("没有围栏", findings=[], current_files=[])
+
+
+def test_fix_contract_requires_the_file_declaration() -> None:
+    """没有 ``file=`` 声明的代码围栏属于契约违规（多文件产出的归属必须显式）。"""
+    text = '```python\nprint(1)\n```\n\n```json\n{"fixes": []}\n```\n'
+
+    with pytest.raises(contracts.ContractViolation, match="file= 声明"):
+        contracts.parse_fix_output(text, findings=[], current_files=[])
 
 
 def test_fix_contract_rejects_empty_code_fence() -> None:
-    with pytest.raises(contracts.ContractViolation, match="代码围栏为空"):
-        contracts.parse_fix_output(fix_text("\n\n", []), findings=[])
+    with pytest.raises(contracts.ContractViolation, match="内容为空"):
+        contracts.parse_fix_output(fix_text({"main.py": "\n\n"}, []), findings=[], current_files=[])
 
 
 def test_fix_contract_requires_a_json_fence() -> None:
     with pytest.raises(contracts.ContractViolation, match="缺少 ```json 围栏"):
-        contracts.parse_fix_output("```python\nprint(1)\n```\n", findings=[])
+        contracts.parse_fix_output(
+            "```python file=main.py\nprint(1)\n```\n", findings=[], current_files=[]
+        )
+
+
+def test_fix_contract_enforces_size_limits() -> None:
+    """量级上限（Design §4.2.2）：文件数、单文件与版本总字节超限按契约违规重试。"""
+    big = "x" * (contracts.MAX_FILE_BYTES + 1)
+    with pytest.raises(contracts.ContractViolation, match="单文件上限"):
+        contracts.parse_fix_output(fix_text({"main.py": big}, []), findings=[], current_files=[])
+    files = {f"f{i}.py": "print(1)" for i in range(contracts.MAX_VERSION_FILES + 1)}
+    with pytest.raises(contracts.ContractViolation, match="文件数超过上限"):
+        contracts.parse_fix_output(fix_text(files, []), findings=[], current_files=[])
 
 
 def test_fix_contract_takes_the_first_fences_and_counts_extras() -> None:
-    """Design §4.2.1：修复场景取第一个 python / json 围栏，其余围栏忽略并计数供记 log。"""
+    """Design §4.2.1：多余的围栏（非 python 或多余 json）忽略并计数供记 log。"""
     fixes_body = json.dumps({"fixes": []}, ensure_ascii=False)
     text = (
-        "```python\nprint(1)\n```\n\n"
+        "```python file=main.py\nprint(1)\n```\n\n"
+        "```python file=util.py\nprint(2)\n```\n\n"
         "```text\n说明块\n```\n\n"
-        "```python\nprint(2)\n```\n\n"
         f"```json\n{fixes_body}\n```\n\n"
         "```json\n{}\n```\n"
     )
 
-    result = contracts.parse_fix_output(text, findings=[])
+    result = contracts.parse_fix_output(text, findings=[], current_files=[])
 
-    assert result.code == "print(1)"
-    assert result.extra_fences == 3  # 共 5 个围栏：取用 1 python + 1 json，其余 3 个忽略
+    assert set(result.files) == {"main.py", "util.py"}
+    assert result.extra_fences == 2  # 共 5 个围栏：取用 2 python + 1 json，其余 2 个忽略
 
 
 def test_scan_fences_reports_labels_and_content_in_order() -> None:
@@ -313,6 +452,17 @@ def test_scan_fences_reports_labels_and_content_in_order() -> None:
         ("text", "旁白"),
         ("json", "{}"),
     ]
+
+
+def test_manifest_payload_lists_files_with_hashes_in_order() -> None:
+    """manifest 是"路径 → sha256"的权威清单（整版本比较的基准，Design §4.2.2）。"""
+    payload = contracts.manifest_payload(version=2, files={"b.py": "print(2)", "a.py": "print(1)"})
+
+    assert payload["version"] == 2
+    assert [entry["path"] for entry in payload["files"]] == ["a.py", "b.py"]
+    assert payload["files"][0]["lines"] == 1
+    assert payload["total_bytes"] == len("print(1)") + len("print(2)")
+    assert payload["files"][0]["sha256"] == hashlib.sha256(b"print(1)").hexdigest()
 
 
 # ---- crw review 报告契约（前作 files[] 形态，Design §6.4）----
@@ -483,7 +633,7 @@ def test_finding_keys_ignores_non_mapping_entries() -> None:
     """未收敛判定读的是展示数据：残缺条目跳过，不因一条坏数据整体失败。"""
     keys = contracts.finding_keys([finding(), "坏数据", None])  # type: ignore[list-item]
 
-    assert keys == frozenset({("code_v1.py:3", "示例问题")})
+    assert keys == frozenset({("main.py:3", "示例问题")})
 
 
 def test_merge_findings_normalizes_unknown_severity() -> None:
@@ -493,3 +643,28 @@ def test_merge_findings_normalizes_unknown_severity() -> None:
     assert merged[0]["severity"] == contracts.ADVICE
     assert contracts.judge_clean(merged) is True  # 归一后判定看得见它（【建议】不阻塞）
     assert contracts.severity_counts(merged)[contracts.ADVICE] == 1
+
+
+def test_quoted_file_argument_last_occurrence_wins() -> None:
+    """info 里出现多个 file= 时两条分支口径一致：最后一个生效。"""
+    text = '```python file="a.py" file="b.py"\nprint(1)\n```\n'
+
+    assert contracts.scan_file_fences(text)[0].file == "b.py"
+
+
+def test_fix_contract_requires_usable_finding_ids() -> None:
+    """上一轮 findings 缺少可用 id（记录被手改）时给可读违规，而不是报"缺少 None"。"""
+    text = '```python file=main.py\nprint(1)\n```\n\n```json\n{"fixes": []}\n```\n'
+
+    with pytest.raises(contracts.ContractViolation, match="缺少可用 id"):
+        contracts.parse_fix_output(text, findings=[{"severity": "严重"}], current_files=["main.py"])
+
+
+def test_severity_counts_skips_non_mapping_entries() -> None:
+    """计数读展示数据：残缺条目（手改过的记录）跳过，不把列表页 / 详情页打崩。"""
+    findings = [finding("严重"), "坏数据", None]  # type: ignore[list-item]
+
+    counts = contracts.severity_counts(findings)
+
+    assert counts[contracts.SEVERE] == 1
+    assert contracts.blocking_count(findings) == 1

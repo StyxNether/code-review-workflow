@@ -1,8 +1,9 @@
-"""修复 Agent 节点：按 findings 逐条修复或说明未采纳，产出修复后代码与 fixes 清单。
+"""修复 Agent 节点：按 findings 逐条修复，产出完整版本（全部文件）与 fixes 清单。
 
-输出契约（Design §4.2.1 / §5.2）：恰好一个 ```python 围栏（修复后的**完整文件**）+
-恰好一个 ```json 围栏（fixes 清单，必须覆盖上一轮 findings 的 id 全集）。抽取、校验、
-落盘与"逐字节相同"判定都在 workflow 包装层完成，节点只交回原始文本。
+输出契约（Design §4.2.2 / §5.2）：版本内每个文件一个 ```python file=<相对路径> 围栏
+（未改动的文件也原样给出）+ 恰好一个 ```json 围栏（fixes 清单，必须覆盖上一轮 findings
+的 id 全集；可附 ``deleted`` 删除申请）。抽取、校验、落盘、删除确认与"整版本逐字节
+相同"判定都在 workflow 包装层完成，节点只交回原始文本。
 """
 
 from __future__ import annotations
@@ -25,11 +26,13 @@ def build_fix_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
     def fix_node(state: Mapping[str, Any], retry_feedback: str | None = None) -> Mapping[str, Any]:
         version = state_mod.code_version(state)
         findings = [item for item in (state.get("findings") or []) if isinstance(item, Mapping)]
+        files = state.get("version_files")
         result = runtime.run(
             node="fix",
             system_prompt=prompts.FIXER_SYSTEM_PROMPT,
             user_prompt=prompts.fix_task_prompt(
-                file_name=state_mod.code_file_name(version),
+                version_label=state_mod.code_version_dir_name(version),
+                files=[str(item) for item in files] if isinstance(files, list) else [],
                 version=version,
                 findings=findings,
                 allow_exec=EXEC_TOOL_NAME in registry.names(),

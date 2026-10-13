@@ -212,3 +212,76 @@ class TestProbe:
 
         assert captured["max_retries"] == 0  # 自检不承担重试语义
         assert captured["timeout"] == llm.PROBE_TIMEOUT_SECONDS
+
+
+class TestThinkingParams:
+    """思考挡位 → 客户端构造参数（Design §8.3；构造不发请求，可离线断言落点）。"""
+
+    def test_no_thinking_sends_no_params(self) -> None:
+        """未配置挡位：不发送任何思考参数（行为与 M3 一致）。"""
+        model = llm.create_model(
+            "some-model", api_key=PLACEHOLDER_KEY, base_url="https://api.example.com/v1"
+        )
+
+        assert model.reasoning_effort is None
+        assert model.extra_body is None
+
+    def test_effort_level_lands_on_reasoning_effort(self) -> None:
+        model = llm.create_model(
+            "some-model",
+            api_key=PLACEHOLDER_KEY,
+            base_url="https://api.example.com/v1",
+            thinking="high",
+        )
+
+        assert model.reasoning_effort == "high"
+
+    def test_off_level_lands_on_thinking_type_disabled(self) -> None:
+        model = llm.create_model(
+            "some-model",
+            api_key=PLACEHOLDER_KEY,
+            base_url="https://api.example.com/v1",
+            thinking="off",
+        )
+
+        assert model.extra_body == {"thinking": {"type": "disabled"}}
+
+    def test_max_composes_both_channels(self) -> None:
+        model = llm.create_model(
+            "some-model",
+            api_key=PLACEHOLDER_KEY,
+            base_url="https://api.example.com/v1",
+            thinking="max",
+        )
+
+        assert model.reasoning_effort == "high"
+        assert model.extra_body == {"thinking": {"type": "enabled"}}
+
+    def test_illegal_level_is_a_readable_llm_error(self) -> None:
+        with pytest.raises(llm.LLMError, match="思考挡位不合法"):
+            llm.create_model(
+                "some-model",
+                api_key=PLACEHOLDER_KEY,
+                base_url="https://api.example.com/v1",
+                thinking="budget:0",
+            )
+
+
+class TestConstructionGuards:
+    def test_construction_validation_error_becomes_readable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """构造期 pydantic 校验失败（如参数超出 SDK 取值域）翻译为可读 LLMError，不裸抛 traceback。"""
+        from pydantic import BaseModel
+
+        class _Strict(BaseModel):
+            value: int
+
+        def _broken(**kwargs: object) -> object:
+            _Strict(value="not-an-int")  # 触发 ValidationError（pydantic 内部抛）
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(llm, "ChatOpenAI", _broken)
+
+        with pytest.raises(llm.LLMError, match="模型客户端构造失败"):
+            llm.create_model("m", api_key=PLACEHOLDER_KEY, base_url="https://api.example.com/v1")

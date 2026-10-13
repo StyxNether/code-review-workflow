@@ -64,24 +64,30 @@ def fake_review_view(view: str) -> Any:
         raise ValueError(f"未知的审查视角：{view!r}（可选：{list(graph_mod.REVIEW_VIEWS)}）")
 
     def node(state: Mapping[str, Any]) -> Mapping[str, Any]:
-        code_path = Path(str(state.get("current_code") or ""))
-        code = code_path.read_text(encoding="utf-8")
-        findings = inspect_code(code, file_name=code_path.name)
+        files = read_version_files(state)
+        findings = [
+            item for name, code in files.items() for item in inspect_code(code, file_name=name)
+        ]
         if view == "security":
             findings = [
                 {**item, "severity": "建议", "suggestion": "安全性视角：收紧输入校验。"}
                 for item in findings
             ]
+            first = next(iter(files), "main.py")
             findings.append(
                 {
                     "severity": "严重",
-                    "location": f"{code_path.name}:1",
+                    "location": f"{first}:1",
                     "issue": "安全性视角独有：模块级执行外部命令。",
                     "suggestion": "改为受控调用。",
                     "uncertain": False,
                 }
             )
-        payload = {"findings": findings, "summary": f"{view} 视角的脚本化结论。"}
+        payload = {
+            "files": sorted(files),
+            "findings": findings,
+            "summary": f"{view} 视角的脚本化结论。",
+        }
         return {
             "review_text": (f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n")
         }
@@ -90,35 +96,61 @@ def fake_review_view(view: str) -> Any:
 
 
 def fake_encode(state: Mapping[str, Any]) -> Mapping[str, Any]:
-    """假编码节点：按需求文本确定性地生成单文件实现。"""
+    """假编码节点：按需求文本确定性地生成单文件实现（多文件契约的"目录里一个文件"特例）。"""
     requirement = str((state.get("input") or {}).get("requirement") or "")
     code = scripted_module_for(requirement)
-    return {"code_text": f"```python\n{code}```\n"}
+    return {"code_text": f"```python file=main.py\n{code}```\n"}
 
 
 def fake_review(state: Mapping[str, Any]) -> Mapping[str, Any]:
-    """假审查节点：对工作区当前代码做脚本化分级检查，输出审查契约（JSON 围栏）。"""
-    code_path = Path(str(state.get("current_code") or ""))
-    code = code_path.read_text(encoding="utf-8")
-    findings = inspect_code(code, file_name=code_path.name)
-    payload = {"findings": findings, "summary": summarize_findings(findings)}
+    """假审查节点：对工作区当前版本做脚本化分级检查，输出审查契约（JSON 围栏）。"""
+    files = read_version_files(state)
+    findings = [item for name, code in files.items() for item in inspect_code(code, file_name=name)]
+    payload = {
+        "files": sorted(files),
+        "findings": findings,
+        "summary": summarize_findings(findings),
+    }
     return {
         "review_text": f"脚本化审查结论如下。\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
     }
 
 
 def fake_fix(state: Mapping[str, Any]) -> Mapping[str, Any]:
-    """假修复节点：只做可脚本化且可复核的修复（语法缺陷），其余逐条标记 skipped。"""
-    code_path = Path(str(state.get("current_code") or ""))
-    code = code_path.read_text(encoding="utf-8")
+    """假修复节点：只做可脚本化且可复核的修复（语法缺陷），其余逐条标记 skipped。
+
+    输出版本内的**全部文件**（未改动的原样给出，每文件一个 ``python file=`` 围栏）。
+    """
+    files = read_version_files(state)
     findings = list(state.get("findings") or [])
-    repaired, fixes = scripted_repair(code, findings)
-    payload = {"fixes": fixes}
-    text = (
-        f"```python\n{repaired}```\n\n"
-        f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
+    repaired_files, fixes = scripted_repair(files, findings)
+    fences = "\n\n".join(
+        f"```python file={name}\n{repaired_files[name]}```" for name in sorted(repaired_files)
     )
+    payload = {"fixes": fixes}
+    text = f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
     return {"fix_text": text}
+
+
+def read_version_files(state: Mapping[str, Any]) -> dict[str, str]:
+    """读出状态的版本目录内容（``路径 → 内容``，跳过 manifest.json）。
+
+    空目录值按"没有版本"处理（``Path("")`` 会解析成当前目录，必须显式挡住）。
+    """
+    raw = str(state.get("current_version_dir") or "")
+    if not raw.strip():
+        return {}
+    directory = Path(raw)
+    files: dict[str, str] = {}
+    if not directory.is_dir():
+        return files
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.name == "manifest.json":
+            continue
+        if path.suffix == ".pyc" or "__pycache__" in path.relative_to(directory).parts:
+            continue  # 与引擎读取同口径：字节码是执行副产物，不是版本内容
+        files[path.relative_to(directory).as_posix()] = path.read_text(encoding="utf-8")
+    return files
 
 
 def scripted_module_for(requirement: str) -> str:
@@ -176,22 +208,25 @@ def summarize_findings(findings: list[dict[str, Any]]) -> str:
     return f"发现 {len(findings)} 项问题：{detail}"
 
 
-def scripted_repair(code: str, findings: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def scripted_repair(
+    files: dict[str, str], findings: list[dict[str, Any]]
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
     """脚本化修复：逐条给出处置，语法缺陷尝试可复核的修补，其余标记 skipped。
 
-    修补结果必须整文件可编译才被采用（否则视为无法安全处理）；因此假修复节点不会
-    把坏语法写回工作区。返回（修复后的代码，fixes 清单）。
+    按 finding 的 location 定位文件；修补结果必须整文件可编译才被采用（否则视为无法
+    安全处理）。返回（修复后的全部文件，fixes 清单）——未涉及文件原样保留。
     """
-    current = code
-    syntax_open = not _compiles(current)
+    repaired = dict(files)
     fixes: list[dict[str, Any]] = []
     for finding in findings:
         finding_id = str(finding.get("id") or "")
-        if syntax_open:
-            repaired = _repair_syntax(current)
-            syntax_open = False
-            if repaired is not None:
-                current = repaired
+        location = str(finding.get("location") or "")
+        name = location.rsplit(":", 1)[0] if ":" in location else location
+        code = repaired.get(name)
+        if code is not None and not _compiles(code):
+            fixed = _repair_syntax(code)
+            if fixed is not None:
+                repaired[name] = fixed
                 fixes.append(
                     {
                         "finding_id": finding_id,
@@ -224,7 +259,7 @@ def scripted_repair(code: str, findings: list[dict[str, Any]]) -> tuple[str, lis
                     "note": "建议类问题不阻塞判定，脚本化修复不改动。",
                 }
             )
-    return current, fixes
+    return repaired, fixes
 
 
 def _module_template(summary: str) -> str:
@@ -422,7 +457,9 @@ class ScriptedChatModel(BaseChatModel):
         """流式回放：工具调用按 tool_call_chunks 还原，文本按 3 段切片（含 usage 末块）。"""
         response = self._next_response(list(messages))
         if response.tool_calls:
-            for call in response.tool_calls:
+            for index, call in enumerate(response.tool_calls):
+                # index 必须逐调用各异：langchain 聚合 chunk 时按 index 归并，
+                # 全部写 0 会把一条消息里的多个并行调用合并成一个（args 直接相连）
                 yield ChatGenerationChunk(
                     message=AIMessageChunk(
                         content="",
@@ -431,7 +468,7 @@ class ScriptedChatModel(BaseChatModel):
                                 "name": call["name"],
                                 "args": json.dumps(call["args"], ensure_ascii=False),
                                 "id": call["id"],
-                                "index": 0,
+                                "index": index,
                                 "type": "tool_call_chunk",
                             }
                         ],
@@ -474,29 +511,44 @@ def ai_tool_call(name: str, **arguments: Any) -> AIMessage:
     return AIMessage(content="", tool_calls=[{"name": name, "args": arguments, "id": call_id}])
 
 
-def python_fence(code: str) -> str:
-    """编码 / 修复产出的代码围栏文本。"""
-    return f"实现说明。\n\n```python\n{code}\n```\n"
+def file_fence(code: str, path: str = "main.py") -> str:
+    """编码 / 修复产出的代码围栏文本（``python file=<相对路径>``，Design §4.2.2）。"""
+    return f"实现说明。\n\n```python file={path}\n{code}\n```\n"
 
 
-def review_fence(findings: Sequence[Mapping[str, Any]], summary: str = "本轮未发现问题。") -> str:
-    """审查契约的 JSON 围栏文本（findings 与 summary）。"""
-    payload = {"findings": list(findings), "summary": summary}
+def review_fence(
+    findings: Sequence[Mapping[str, Any]],
+    summary: str = "本轮未发现问题。",
+    *,
+    files: Sequence[str] = ("main.py",),
+) -> str:
+    """审查契约的 JSON 围栏文本（files 清单 + findings + summary）。"""
+    payload = {"files": list(files), "findings": list(findings), "summary": summary}
     return f"检查完毕。\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
 
 
-def fix_fence(code: str, fixes: Sequence[Mapping[str, Any]]) -> str:
-    """修复产出：代码围栏 + fixes 围栏。"""
-    payload = {"fixes": list(fixes)}
+def fix_fence(
+    files: Mapping[str, str],
+    fixes: Sequence[Mapping[str, Any]],
+    *,
+    deleted: Sequence[str] = (),
+) -> str:
+    """修复产出：版本内全部文件的围栏 + fixes 围栏（可附删除申请）。"""
+    payload: dict[str, Any] = {"fixes": list(fixes)}
+    if deleted:
+        payload["deleted"] = list(deleted)
+    fences = "\n\n".join(
+        f"```python file={path}\n{content}\n```" for path, content in sorted(files.items())
+    )
     return (
-        f"已修复。\n\n```python\n{code}\n```\n\n"
+        f"已修复。\n\n{fences}\n\n"
         f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
     )
 
 
 def finding(
     severity: str = "严重",
-    location: str = "code_v1.py:1",
+    location: str = "main.py:1",
     issue: str = "示例问题",
     suggestion: str = "示例建议",
     *,
@@ -518,8 +570,8 @@ def finding(
 def clean_requirement_script(*, code: str) -> list[Any]:
     """需求 → 编码 → 审查（读文件后报无问题）：干净早退路径。"""
     return [
-        ai_text(python_fence(code)),
-        ai_tool_call("read_file", path="code_v1.py"),
+        ai_text(file_fence(code)),
+        ai_tool_call("read_file", path="code_v1/main.py"),
         ai_text(review_fence([], "已读取完整文件，未发现阻塞问题。")),
     ]
 
@@ -528,37 +580,43 @@ def fix_cycle_script(
     *,
     code: str,
     fixed_code: str,
-    location: str = "code_v1.py:1",
+    name: str = "main.py",
+    location: str | None = None,
     issue: str = "示例严重问题",
 ) -> list[Any]:
-    """代码文件 → 首审含【严重】→ 修复 → 复审干净：修复循环路径。"""
+    """代码文件 → 首审含【严重】→ 修复 → 复审干净：修复循环路径。
+
+    ``name`` 是版本内文件名（``-f`` 输入保留原文件名，须与运行输入一致）。
+    """
+    where = location or f"{name}:1"
     return [
-        ai_tool_call("read_file", path="code_v1.py"),
-        ai_text(review_fence([finding(location=location, issue=issue)])),
+        ai_tool_call("read_file", path=f"code_v1/{name}"),
+        ai_text(review_fence([finding(location=where, issue=issue)], files=[name])),
         ai_text(
             fix_fence(
-                fixed_code,
+                {name: fixed_code},
                 [{"finding_id": "f-1", "status": "fixed", "note": "已按建议修复并自验通过。"}],
             )
         ),
-        ai_tool_call("read_file", path="code_v2.py"),
-        ai_text(review_fence([], "复审通过。")),
+        ai_tool_call("read_file", path=f"code_v2/{name}"),
+        ai_text(review_fence([], "复审通过。", files=[name])),
     ]
 
 
-def residual_script(*, code: str, location: str = "code_v1.py:1") -> list[Any]:
+def residual_script(*, code: str, name: str = "main.py", location: str | None = None) -> list[Any]:
     """每轮都报同类【严重】：`--max-iter 1` 下以残留收尾（退出码 1）。"""
+    where = location or f"{name}:1"
     return [
-        ai_tool_call("read_file", path="code_v1.py"),
-        ai_text(review_fence([finding(location=location, issue="除零风险未处理")])),
+        ai_tool_call("read_file", path=f"code_v1/{name}"),
+        ai_text(review_fence([finding(location=where, issue="除零风险未处理")], files=[name])),
         ai_text(
             fix_fence(
-                code,
+                {name: code},
                 [{"finding_id": "f-1", "status": "skipped", "note": "脚本化样例：本轮不改动。"}],
             )
         ),
-        ai_tool_call("read_file", path="code_v2.py"),
-        ai_text(review_fence([finding(location=location, issue="除零风险未处理")])),
+        ai_tool_call("read_file", path=f"code_v2/{name}"),
+        ai_text(review_fence([finding(location=where, issue="除零风险未处理")], files=[name])),
     ]
 
 
@@ -569,9 +627,9 @@ def requirement_input_with_clean_reviews(
 
     后者用于验证执行有效性门禁：没有工具事件却报"无问题"的审查必须被拒绝。
     """
-    script: list[Any] = [ai_text(python_fence(code))]
+    script: list[Any] = [ai_text(file_fence(code))]
     for _ in range(reviews):
         if with_tools:
-            script.append(ai_tool_call("read_file", path="code_v1.py"))
+            script.append(ai_tool_call("read_file", path="code_v1/main.py"))
         script.append(ai_text(review_fence([], "未发现问题。")))
     return script

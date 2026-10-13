@@ -37,6 +37,14 @@ _READ_CHUNK_CHARS = 4096
 MAX_TIMEOUT_SECONDS = 60
 #: 强杀后回收子进程的有限等待；再超时则放弃回收（杀树已尽力）
 KILL_REAP_SECONDS = 5
+#: 内联代码经命令行参数（``-c``）传递的字符上限：Windows 命令行总长上限约 32767
+#: 字符，超过即 OSError（WinError 206）且代码会出现在进程列表里——超过该阈值改用
+#: stdin 传递（bootstrap 先读入 stdin 再 exec）
+_INLINE_ARG_MAX_CHARS = 8000
+#: 大代码经 stdin 传递时的引导程序：等效于 ``python -c <code>``（含 __main__ 语义）
+_STDIN_BOOTSTRAP = (
+    "import sys;exec(compile(sys.stdin.read(),'<code>','exec'),{'__name__':'__main__'})"
+)
 
 _TRUNCATION_NOTICE = "…（输出超过 {limit} 字符，已截断）"
 _PYTHON_SUFFIX = ".py"
@@ -98,8 +106,15 @@ def run_python(
     if not roots_resolved:
         return f"{fs.ERROR_PREFIX}未提供上下文根，无法执行（运行工作区不可用）。"
     workdir = roots_resolved[0]
+    stdin_text: str | None = None
     if code is not None:
-        command = [sys.executable, "-c", code]
+        if len(code) <= _INLINE_ARG_MAX_CHARS:
+            command = [sys.executable, "-c", code]
+        else:
+            # 大候选代码：走 stdin，规避命令行长度上限（Windows 约 32767 字符）与
+            # "代码出现在进程命令行"的暴露面
+            command = [sys.executable, "-c", _STDIN_BOOTSTRAP]
+            stdin_text = code
     else:
         assert path is not None  # 二选一校验已保证
         target, error = fs.resolve_in_roots(roots_resolved, path)
@@ -120,7 +135,15 @@ def run_python(
         owner = next((root for root in roots_resolved if target.is_relative_to(root)), None)
         workdir = owner if owner is not None else roots_resolved[0]
 
-    effective_timeout = timeout if timeout is not None else config.get_exec_timeout()
+    if timeout is not None:
+        effective_timeout = timeout
+    else:
+        try:
+            effective_timeout = config.get_exec_timeout()
+        except config.ConfigError as exc:
+            # 配置层的第一步校验（正整数）先于本工具的区间校验：配置错误结构化回传，
+            # 不伪装成"执行超时"（也不让异常逃逸出工具边界）
+            return f"{fs.ERROR_PREFIX}{exc}"
     if not 0 < effective_timeout <= MAX_TIMEOUT_SECONDS:
         # 配置来源（CRW_EXEC_TIMEOUT）与模型传参同标准校验：非法配置不应伪装成"执行超时"，
         # 而应给出指向配置的可读错误
@@ -129,22 +152,39 @@ def run_python(
             f"{fs.ERROR_PREFIX}{source}必须是 1~{MAX_TIMEOUT_SECONDS} 的整数秒，"
             f"当前值：{effective_timeout}"
         )
-    exit_code, stdout, stderr = _run_subprocess(command, effective_timeout, cwd=workdir)
+    exit_code, stdout, stderr = _run_subprocess(
+        command, effective_timeout, cwd=workdir, stdin_text=stdin_text
+    )
     return _format_result(exit_code=exit_code, stdout=stdout, stderr=stderr)
 
 
-def _run_subprocess(command: list[str], timeout_seconds: int, *, cwd: Path) -> tuple[int, str, str]:
+def _run_subprocess(
+    command: list[str],
+    timeout_seconds: int,
+    *,
+    cwd: Path,
+    stdin_text: str | None = None,
+) -> tuple[int, str, str]:
     """运行子进程并收集输出；任何退出路径都杀树并有限回收。
 
     超时强杀整棵进程树后以异常上抛，由 dispatch 兜底；Ctrl+C 等中断同样先杀树、再有限
     等待回收管道，然后上抛原始异常——不留残留进程与管道；杀树失败时回收等待超时后放弃
     （有限等待，不阻塞中断响应）。
     """
-    environment = {**_sanitized_env(), "PYTHONIOENCODING": "utf-8"}
+    # PYTHONDONTWRITEBYTECODE：核实执行常落在运行工作区 / 版本目录内，导入被测模块会产生
+    # __pycache__/ *.pyc 并把它们留在产物目录里（真实演示暴露：污染版本内容与 --out 复制）；
+    # 一次性核实不需要字节码缓存，直接关掉，从源头杜绝这类副作用
+    environment = {
+        **_sanitized_env(),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     popen_kwargs: dict[str, Any] = {}
     if sys.platform != "win32":
         # POSIX：独立进程组启动，支撑 killpg 整树强杀（见 _kill_process_tree）
         popen_kwargs["start_new_session"] = True
+    if stdin_text is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -156,6 +196,10 @@ def _run_subprocess(command: list[str], timeout_seconds: int, *, cwd: Path) -> t
         cwd=str(cwd),
         **popen_kwargs,
     )
+    if stdin_text is not None and process.stdin is not None:
+        # 写 stdin 用独立线程：写入可能因管道缓冲短暂阻塞，主流程只管超时与输出
+        # （bootstrap 会先读完全部 stdin 再执行，子进程侧不会死锁）
+        threading.Thread(target=_write_stdin, args=(process.stdin, stdin_text), daemon=True).start()
     readers = _start_readers(process)
     try:
         process.wait(timeout=timeout_seconds)
@@ -181,6 +225,13 @@ def _run_subprocess(command: list[str], timeout_seconds: int, *, cwd: Path) -> t
         _reader_text(readers[0]),
         _reader_text(readers[1]),
     )
+
+
+def _write_stdin(handle: Any, text: str) -> None:
+    """把代码写进子进程 stdin 并关闭；子进程提前退出（管道断开）时静默放弃。"""
+    with suppress(OSError, ValueError):
+        handle.write(text)
+        handle.close()
 
 
 def _start_readers(process: subprocess.Popen[str]) -> tuple[Any, Any]:
