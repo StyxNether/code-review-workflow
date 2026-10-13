@@ -53,7 +53,11 @@ class InputDescriptor(TypedDict, total=False):
 
 
 class Finding(TypedDict, total=False):
-    """单条审查问题（Design §4.3 / §5.2）。"""
+    """单条审查问题（Design §4.3 / §5.2）。
+
+    ``views`` 是并行双视角审查的附加字段（来源视角，Design §12.2）：契约校验层不认识它
+    （模型输出不含该键），汇合节点写入、报告与 `crw show` 读它。
+    """
 
     id: str
     severity: str
@@ -61,6 +65,7 @@ class Finding(TypedDict, total=False):
     issue: str
     suggestion: str
     uncertain: bool
+    views: list[str]
 
 
 class NodeEvent(TypedDict, total=False):
@@ -90,10 +95,15 @@ class RunState(TypedDict, total=False):
     max_iterations: int
     max_iterations_source: str
     rounds_mode: str
+    parallel_review: bool
     session_id: str | None
     round_index: int | None
     current_code: str
     findings: list[Finding]
+    #: 并行双视角审查的分支结论（独立 key：同超级步多写者不得冲突，Design §12.2）。
+    #: 汇合节点消费后由 ``findings`` 承载权威结论，故不进入运行记录（见 PERSISTED_FIELDS）。
+    findings_correctness: list[Finding]
+    findings_security: list[Finding]
     clean: bool
     strict: bool
     history: Annotated[list[NodeEvent], operator.add]
@@ -116,6 +126,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "max_iterations",
     "max_iterations_source",
     "rounds_mode",
+    "parallel_review",
     "session_id",
     "round_index",
     "current_code",
@@ -131,6 +142,9 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "finished_at",
 )
 
+# 说明：并行双视角的分支 key（``findings_correctness`` / ``findings_security``）刻意**不进**
+# 本表与 ``PERSISTED_FIELDS``——它们是图执行期的中间态，汇合后由 ``findings`` 承载权威结论
+# （Design §12.2），归一化重建的状态不含这两键，读取方按"缺省即空"处理（``state.get(k) or []``）。
 _DEFAULTS: dict[str, Any] = {
     "run_id": "",
     "parent_run_id": None,
@@ -141,6 +155,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_iterations": 0,
     "max_iterations_source": SOURCE_DEFAULT,
     "rounds_mode": ROUNDS_UP_TO,
+    "parallel_review": False,
     "session_id": None,
     "round_index": None,
     "current_code": "",
@@ -162,8 +177,10 @@ def code_file_name(version: int) -> str:
     return f"code_v{version}.py"
 
 
-def review_file_name(round_number: int) -> str:
-    """审查结论文件名：``review_<轮次>.json``（Design §4.5）。"""
+def review_file_name(round_number: int, *, view: str | None = None) -> str:
+    """审查结论文件名：``review_<轮次>.json``（并行双视角的分支加视角后缀，Design §12.2）。"""
+    if view:
+        return f"review_{round_number}_{view}.json"
     return f"review_{round_number}.json"
 
 
@@ -198,6 +215,7 @@ def new_state(
     created_at: str,
     rounds_mode: str = ROUNDS_UP_TO,
     strict: bool = False,
+    parallel_review: bool = False,
     parent_run_id: str | None = None,
     session_id: str | None = None,
     round_index: int | None = None,
@@ -213,6 +231,7 @@ def new_state(
         created_at: 开始时间戳（ISO 8601，由注入时钟给出）。
         rounds_mode: 轮次语义（M1 恒为 up-to，exact 随 M4 落地）。
         strict: 是否启用加严干净判定（Design §4.4）。
+        parallel_review: 是否启用并行双视角审查（Design §12.2 的扩展示例）。
         parent_run_id: 续跑来源运行号（resume 时写入，新运行为空）。
         session_id: 所属会话号（会话轮次写入；一次性运行为空）。
         round_index: 会话内轮次序号（从 1 起；一次性运行为空）。
@@ -230,10 +249,13 @@ def new_state(
         max_iterations=max_iterations,
         max_iterations_source=max_iterations_source,
         rounds_mode=rounds_mode,
+        parallel_review=parallel_review,
         session_id=session_id,
         round_index=round_index,
         current_code="",
         findings=[],
+        findings_correctness=[],
+        findings_security=[],
         clean=False,
         strict=strict,
         history=[],

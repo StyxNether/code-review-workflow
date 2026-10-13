@@ -71,13 +71,19 @@ class RoundReport:
 
 @dataclass(frozen=True)
 class RunDetail:
-    """单条运行记录的完整视图。"""
+    """单条运行记录的完整视图。
+
+    ``degraded`` 为真表示 ``state.json`` 不可读，摘要字段取自日志与产物清单（Design §8.2
+    的降级展示）；此时 ``state`` 为空映射，逐轮审查表仍来自 ``workspace/review_*.json``。
+    """
 
     summary: RunSummary
     state: Mapping[str, Any]
     events: tuple[Mapping[str, Any], ...]
     rounds: tuple[RoundReport, ...]
     artifacts: tuple[Path, ...]
+    degraded: bool = False
+    degraded_reason: str = ""
 
 
 def runs_root() -> Path:
@@ -243,18 +249,31 @@ def list_runs(*, root: Path | None = None) -> list[RunSummary]:
 
 
 def load_detail(run_id: str) -> RunDetail:
-    """按运行号加载完整记录；名称非法 / 记录不存在 / ``state.json`` 损坏抛 :class:`RunRecordError`。"""
+    """按运行号加载完整记录；名称非法 / 记录不存在抛 :class:`RunRecordError`。
+
+    ``state.json`` 损坏时**降级返回**（Design §8.2）：摘要与时间线改由 ``log.jsonl`` 与
+    产物清单派生，``degraded`` 置真并附可读原因——记录坏了不代表这一条运行不可查，
+    命令面据此提示并按"记录损坏"给退出码（Design §8.1 的 ``crw show`` 行）。
+    """
     path = run_dir(run_id)
     if not path.is_dir():
         raise RunRecordError(f"运行记录不存在：{run_id}（可用 crw runs 查看现有记录）")
     state = read_state(path)
+    summary = _summarize(path)
     if state is None:
-        raise RunRecordError(
-            f"运行记录损坏：{path / 'state.json'} 不可读或不是 JSON 对象；"
-            f"可查看日志与产物：{path / 'log.jsonl'}"
+        return RunDetail(
+            summary=summary,
+            state={},
+            events=tuple(read_events(path / "log.jsonl")),
+            rounds=tuple(read_rounds(path)),
+            artifacts=tuple(run_artifacts(path)),
+            degraded=True,
+            degraded_reason=(
+                f"{path / 'state.json'} 不可读或不是 JSON 对象（摘要取自 log.jsonl 与产物清单）"
+            ),
         )
     return RunDetail(
-        summary=_summarize(path),
+        summary=summary,
         state=state,
         events=tuple(read_events(path / "log.jsonl")),
         rounds=tuple(read_rounds(path)),

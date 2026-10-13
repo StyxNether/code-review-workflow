@@ -39,6 +39,56 @@ def SCRIPTED_NODES() -> dict[str, Any]:
     return {"encode": fake_encode, "review": fake_review, "fix": fake_fix}
 
 
+def PARALLEL_SCRIPTED_NODES() -> dict[str, Any]:
+    """并行双视角形态的整表假节点装配（含汇合节点，与生产装配同形）。
+
+    安全性视角故意与正确性视角报**同一批位置但级别更低**：合并时取较严重者（正确性的
+    判定胜出），另外多报一条安全性独有的问题——一条用例即可覆盖去重、取严重、并集三件事。
+    """
+    return {
+        "encode": fake_encode,
+        "review_correctness": fake_review_view("correctness"),
+        "review_security": fake_review_view("security"),
+        "merge_reviews": graph_mod.merge_review_node,
+        "fix": fake_fix,
+    }
+
+
+def fake_review_view(view: str) -> Any:
+    """假审查节点（并行视角）：脚本化检查结果按视角改写。
+
+    未知视角显式报错：拼错时静默按"正确性"回放会让用例"能跑但错位"，
+    与生产侧 ``prompts.reviewer_system_prompt`` 的显式失败口径一致。
+    """
+    if view not in graph_mod.REVIEW_VIEWS:
+        raise ValueError(f"未知的审查视角：{view!r}（可选：{list(graph_mod.REVIEW_VIEWS)}）")
+
+    def node(state: Mapping[str, Any]) -> Mapping[str, Any]:
+        code_path = Path(str(state.get("current_code") or ""))
+        code = code_path.read_text(encoding="utf-8")
+        findings = inspect_code(code, file_name=code_path.name)
+        if view == "security":
+            findings = [
+                {**item, "severity": "建议", "suggestion": "安全性视角：收紧输入校验。"}
+                for item in findings
+            ]
+            findings.append(
+                {
+                    "severity": "严重",
+                    "location": f"{code_path.name}:1",
+                    "issue": "安全性视角独有：模块级执行外部命令。",
+                    "suggestion": "改为受控调用。",
+                    "uncertain": False,
+                }
+            )
+        payload = {"findings": findings, "summary": f"{view} 视角的脚本化结论。"}
+        return {
+            "review_text": (f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n")
+        }
+
+    return node
+
+
 def fake_encode(state: Mapping[str, Any]) -> Mapping[str, Any]:
     """假编码节点：按需求文本确定性地生成单文件实现。"""
     requirement = str((state.get("input") or {}).get("requirement") or "")
@@ -277,7 +327,9 @@ class ScriptedChatModel(BaseChatModel):
     """
 
     responses: list[Any] = Field(default_factory=list)
+    routes: dict[str, list[Any]] = Field(default_factory=dict)
     cursor: int = 0
+    cursors: dict[str, int] = Field(default_factory=dict)
     requests: list[list[BaseMessage]] = Field(default_factory=list)
     bound_tools: list[list[str]] = Field(default_factory=list)
 
@@ -288,7 +340,23 @@ class ScriptedChatModel(BaseChatModel):
     def load(self, responses: Sequence[Any]) -> ScriptedChatModel:
         """装载新一轮脚本（同时重置游标与请求记录）：同一用例内可跑多次流程。"""
         self.responses = list(responses)
+        self.routes = {}
         self.cursor = 0
+        self.cursors = {}
+        self.requests = []
+        self.bound_tools = []
+        return self
+
+    def route(self, routes: Mapping[str, Sequence[Any]]) -> ScriptedChatModel:
+        """装载"按提示词路由"的脚本：键出现在系统提示词里即选中该队列。
+
+        并行分支会**同时**发起模型请求，按调用顺序回放会把响应错配给另一个分支（实测：
+        安全性分支拿到了正确性分支的"无问题"结论）；按内容路由使用例与执行顺序无关。
+        """
+        self.routes = {key: list(items) for key, items in routes.items()}
+        self.responses = []
+        self.cursor = 0
+        self.cursors = {}
         self.requests = []
         self.bound_tools = []
         return self
@@ -304,12 +372,40 @@ class ScriptedChatModel(BaseChatModel):
 
     def _next_response(self, messages: Sequence[BaseMessage]) -> Any:
         self.requests.append(list(messages))
+        if self.routes:
+            return self._next_routed(messages)
         if self.cursor >= len(self.responses):
             raise _ScriptExhausted(
                 f"假模型脚本已用尽（第 {self.cursor + 1} 次请求）：请为本次流程补足响应。"
             )
         response = self.responses[self.cursor]
         self.cursor += 1
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def _next_routed(self, messages: Sequence[BaseMessage]) -> Any:
+        """按提示词里的分支标记选队列（标记出现在该分支每次请求的拼接文本里）。"""
+        joined = "\n".join(str(message.content) for message in messages)
+        # 命中必须唯一：任务提示词里有"另一位审查者并行负责【X】"这类互指文案，多命中
+        # 说明路由键选得不够特异——静默取一个会让另一分支的响应被顶替而不报错
+        matched = sorted(key for key in self.routes if key in joined)
+        if len(matched) > 1:
+            raise _ScriptExhausted(
+                f"分支脚本路由命中多个键 {matched}：请把路由键写得互斥（例如带上「你只负责」前缀）。"
+            )
+        if not matched:
+            raise _ScriptExhausted(
+                f"没有匹配的分支脚本（请求内容开头：{joined[:60]!r}）；"
+                f"可用路由：{sorted(self.routes)}。"
+            )
+        key = matched[0]
+        queue = self.routes[key]
+        index = self.cursors.get(key, 0)
+        if index >= len(queue):
+            raise _ScriptExhausted(f"分支「{key}」的脚本已用尽（第 {index + 1} 次请求）。")
+        self.cursors[key] = index + 1
+        response = queue[index]
         if isinstance(response, BaseException):
             raise response
         return response

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +136,62 @@ def env_registry_path() -> Path:
     绝不触碰后者（使用者可能在此前已自行设置 CRW_DEEPSEEK_API_KEY 等变量）。
     """
     return data_dir() / "env-vars.json"
+
+
+# ---- 前作配置探测（Design §6.2 #2 / D7：仅在零配置时提示导入，不读进常态解析路径）----
+
+#: 前作数据目录名（用户主目录下）
+LEGACY_HOME_NAME = ".cra"
+
+
+def legacy_config_path() -> Path:
+    """前作配置路径 ``~/.cra/models.json``（只用于"探测存在性 + 提示导入"）。"""
+    return Path.home() / LEGACY_HOME_NAME / "models.json"
+
+
+def load_legacy_config() -> dict[str, Any] | None:
+    """读取前作配置；不存在 / 损坏 / 顶层非对象返回 ``None``。
+
+    导入是可选的便利功能：前作文件读不了就当它不存在，不得让 ``crw config`` 因此报错。
+    """
+    try:
+        data = json.loads(legacy_config_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def importable_providers(data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """把前作配置的供应商条目规范为本项目形态（只保留结构完整者，丢弃损坏条目）。
+
+    两者 ``models.json`` 结构同源（``default`` + ``providers[{name, base_url, models, api_key?}]``）：
+    差异只在数据目录与 key 环境变量前缀，条目本身可直接沿用；此处只做结构过滤，
+    避免把半截条目带进新配置（整表校验由调用方执行）。
+    """
+    entries = data.get("providers") if isinstance(data, Mapping) else None
+    result: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        base_url = entry.get("base_url")
+        models = entry.get("models")
+        if not isinstance(name, str) or not name or "/" in name:
+            continue
+        if not isinstance(base_url, str) or not base_url:
+            continue
+        if (
+            not isinstance(models, list)
+            or not models
+            or not all(isinstance(item, str) and item for item in models)
+        ):
+            continue
+        item: dict[str, Any] = {"name": name, "base_url": base_url, "models": list(models)}
+        api_key = entry.get("api_key")
+        if isinstance(api_key, str):
+            item["api_key"] = api_key
+        result.append(item)
+    return result
 
 
 def env_var_for_provider(name: str) -> str:

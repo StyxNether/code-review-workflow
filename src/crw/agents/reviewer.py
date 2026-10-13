@@ -6,6 +6,10 @@
 ``review_evidence`` 交回引擎，由引擎传给 :func:`crw.workflow.contracts.parse_review_output`
 的 ``has_tool_evidence``。
 
+并行双视角审查（Design §12.2）复用本节点：同一 runtime、同一工具集，只有系统提示词
+与任务说明按视角分派（``name`` 取分支节点名，工具事件与增量按分支归轮，便于终端与
+log 区分是哪位审查者在动作）。
+
 ``crw review``（代码内联送达）不走本节点，由 :func:`review_once` 直接审查。
 """
 
@@ -26,8 +30,20 @@ NodeFn = Callable[..., Mapping[str, Any]]
 EVIDENCE_KEY = REVIEW_EVIDENCE_KEY
 
 
-def build_review_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
+def build_review_node(
+    runtime: AgentRuntime,
+    registry: ToolRegistry,
+    *,
+    name: str = "review",
+    view: str | None = None,
+) -> NodeFn:
     """构造审查节点：``node(state[, retry_feedback]) -> {"review_text": …}``。
+
+    Args:
+        runtime: 单任务运行时。
+        registry: 审查工具集（``--no-exec`` 时不含 ``run_python``）。
+        name: 节点名（单视角 ``review``；并行双视角取分支节点名，用于事件与增量归类）。
+        view: 视角标识（``None`` = 单视角审查）。
 
     重试（第二次调用）沿用本轮已积累的工具事件——"本轮"指这一次审查，重试属同一轮。
     """
@@ -42,14 +58,15 @@ def build_review_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
         version = state_mod.code_version(state)
         file_name = state_mod.code_file_name(version)
         result = runtime.run(
-            node="review",
-            system_prompt=prompts.REVIEWER_SYSTEM_PROMPT,
+            node=name,
+            system_prompt=prompts.reviewer_system_prompt(view),
             user_prompt=prompts.review_task_prompt(
                 file_name=file_name,
                 review_round=state_mod.round_number_for_review(state),
                 code_version=version,
                 allow_exec=EXEC_TOOL_NAME in registry.names(),
                 retry_feedback=retry_feedback,
+                view=view,
             ),
             registry=registry,
         )

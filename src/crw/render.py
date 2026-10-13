@@ -1,7 +1,17 @@
-"""终端渲染管线：行级流式、分级着色与节点阶段展示。
+"""终端渲染管线：阶段面板、行级流式、分级着色与围栏抑制。
 
 渲染输入由工作流事件驱动（节点开始 / 工具边界 / 重试 / 清单分区 / 节点结束），不依赖框架
 的流式元数据；仅命令面使用本模块（Design §3.1、§8.4）。
+
+三条呈现约定（Design §6.2 #6 的完整管线）：
+
+- **阶段面板**：每个节点开始时打一条彩色横幅（``── [审查] 第 1 轮 ──``），Agent 切换一眼
+  可辨；阶段结束给一行摘要，清单分区随后渲染，各块之间留空行。
+- **围栏抑制**：模型正文里的 ```代码块 / ```json 结论不进终端（生产代码整份回显会刷屏，
+  且围栏内容是交给系统的结构化载荷，不是给人读的正文），只留一行形状摘要；验收结论以
+  分级清单与处置对照的形式呈现（本模块 ``on_review`` / ``on_fixes``）。
+- **分级着色**：【严重】红 /【一般】黄 /【建议】暗，处置 fixed 绿 / partial 黄 / skipped 暗；
+  不支持颜色时（非 TTY、``NO_COLOR``、``color=False``）自动退化为纯文本。
 
 输出通道（§8.4）：结论 / findings 清单 / 报告走 stdout；模型正文与过程叙述、错误走 stderr。
 ``--no-stream`` 时模型正文按阶段缓存、于阶段结束时整体输出（Design §8.1）。
@@ -10,10 +20,15 @@
 from __future__ import annotations
 
 import datetime
+import re
 import sys
+import threading
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, TextIO
+
+from rich.console import Console
 
 from .workflow import contracts
 from .workflow import engine as engine_mod
@@ -22,8 +37,35 @@ from .workflow import state as state_mod
 
 _RULE_WIDTH = 52
 
+#: 换行常量（正文拼接与裁剪用；写成常量以免源码里的转义在编辑中被误读）
+NEWLINE = "\n"
+
 #: ``crw review`` 内联审查的单文件行数上限（超出部分不进提示词，并在提示词中明示）
 REVIEW_PROMPT_MAX_LINES = 2000
+
+#: 阶段横幅样式（按 Agent 着色，切换 Agent 一眼可辨）
+_NODE_STYLE: dict[str, str] = {
+    "encode": "bold cyan",
+    "review": "bold blue",
+    "review_correctness": "bold blue",
+    "review_security": "bold blue",
+    "merge_reviews": "bold white",
+    "fix": "bold magenta",
+}
+#: 分级着色（Design §6.2 #6）
+_SEVERITY_STYLE: dict[str, str] = {
+    contracts.SEVERE: "bold red",
+    contracts.MODERATE: "yellow",
+    contracts.ADVICE: "dim",
+}
+#: 处置着色与中文标签（fixes 清单）
+_STATUS_STYLE: dict[str, str] = {"fixed": "green", "partial": "yellow", "skipped": "dim"}
+_STATUS_LABEL: dict[str, str] = {"fixed": "已修复", "partial": "部分修复", "skipped": "未采纳"}
+
+_STAGE_HINTS: dict[str, str] = {"encode": "生成初始代码"}
+
+#: 并行双视角的分支节点：正文一律按节点缓存后整块输出（见 :meth:`RunRenderer.on_delta`）
+_PARALLEL_BRANCH_NODES = frozenset({"review_correctness", "review_security"})
 
 
 def display_width(text: str) -> int:
@@ -55,6 +97,208 @@ def ask_user(prompt: str) -> str | None:
         return None
 
 
+def guarded(callback: Callable[[], None]) -> None:
+    """执行展示动作并隔离输出流故障（下游关闭管道 / 终端断开，Design §4.6 的同口径）。
+
+    渲染是呈现层：管道被下游关掉（``crw show | head``）时无处分说，也**不得改变命令的结论
+    与退出码**（运行记录仍是真相来源）。渲染器自身的编码缺陷（非 ``OSError``）照常抛出，
+    不在此处掩盖。
+    """
+    try:
+        callback()
+    except OSError:
+        pass
+
+
+def console_for(stream: TextIO, color: bool | None = None) -> Console:
+    """按输出流构造着色控制台（``color`` = ``None`` 自动判定，``True``/``False`` 强制）。
+
+    ``rich`` 自带 TTY 探测、``NO_COLOR`` 支持与 Windows 控制台的 ANSI 启用，故不自行处理
+    转义序列；``soft_wrap`` 关掉自动换行——模型正文自带换行，终端宽度重排会打乱缩进。
+    """
+    if color is None:
+        return Console(file=stream, markup=False, highlight=False, soft_wrap=True, emoji=False)
+    return Console(
+        file=stream,
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+        emoji=False,
+        force_terminal=color,
+        no_color=not color,
+    )
+
+
+# ---- 围栏抑制（流式正文的代码块 / JSON 结论不进终端）----
+
+#: 围栏标记行（CommonMark 语义，允许 0–3 空格缩进）
+_MARKER_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>[^\s`~]*)[ \t]*$")
+#: 行首即围栏 + 已知语言标签：模型把整块代码挤在一行时也要能识别（宁多抑制、不刷屏）
+_INLINE_MARKER_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>python|py|json)\b")
+
+
+@dataclass(frozen=True)
+class _Emission:
+    """过滤器产出：``text`` = 可直接输出的正文片段，``notice`` = 围栏摘要行。"""
+
+    kind: str
+    text: str
+
+
+class _ProseFilter:
+    """流式正文过滤器：抑制围栏内容，围栏闭合时给出形状摘要。
+
+    增量回调可能把围栏标记切在任意位置，因此按行装配：行首仍可能长成围栏标记的片段先
+    暂扣（只有 0–3 空格 + 反引号/波浪号前缀会被扣住），一旦确定为普通正文立即放行——
+    正文的流式感不受影响。
+    """
+
+    def __init__(self) -> None:
+        self._hold = ""
+        self._fence: tuple[str, int, str] | None = None
+        self._fence_body: list[str] = []
+        self._fence_partial = ""
+
+    def feed(self, text: str) -> list[_Emission]:
+        """喂入一段正文增量，返回本次可输出的内容（顺序与原文一致）。"""
+        if self._fence is not None:
+            return self._feed_fenced(text)
+        return self._feed_prose(text)
+
+    def flush(self) -> list[_Emission]:
+        """阶段收尾：围栏内容给形状摘要，暂扣片段放行（内容是否完整由契约层判定）。
+
+        末行没有换行是常态（模型正文的最后一片常不带换行）：暂存片段若本身是闭合标记
+        （纯反引号、长度不短于开启行），就并入计数而不是算作围栏内容。
+        """
+        out: list[_Emission] = []
+        if self._fence is not None:
+            if self._is_closer(self._fence_partial):
+                self._fence_partial = ""
+            out.append(self._notice())
+            self._fence = None
+            self._fence_body = []
+        # 收尾即整体归零：同一个过滤器被复用（阶段重入 / 重试）时不得残留上一轮的行内片段
+        self._fence_partial = ""
+        out.extend(self.drain_hold())
+        return out
+
+    def drain_hold(self) -> list[_Emission]:
+        """放行暂扣的片段（工具行出现 / 阶段收尾时不必再等换行）。"""
+        if not self._hold:
+            return []
+        text, self._hold = self._hold, ""
+        return [_Emission("text", text)]
+
+    def _is_closer(self, line: str) -> bool:
+        """该行（可无换行）是否为当前围栏的闭合标记。"""
+        if self._fence is None:
+            return False
+        char, length, _ = self._fence
+        stripped = line.strip()
+        return stripped.startswith(char * length) and set(stripped) <= {char}
+
+    # ---- 内部 ----
+
+    def _feed_prose(self, text: str) -> list[_Emission]:
+        out: list[_Emission] = []
+        pending = self._hold + text
+        self._hold = ""
+        while pending:
+            newline = pending.find("\n")
+            if newline == -1:
+                if _marker_candidate(pending):
+                    self._hold = pending
+                else:
+                    out.append(_Emission("text", pending))
+                break
+            line = pending[: newline + 1]
+            pending = pending[newline + 1 :]
+            marker = _marker_of(line)
+            if marker is None:
+                out.append(_Emission("text", line))
+                continue
+            fence, info = marker
+            self._fence = (fence[0], len(fence), info)
+            self._fence_body = []
+            self._fence_partial = ""
+            # 围栏开启后，**同一增量里的剩余内容**已经在围栏内（模型把整块挤在一片里时
+            # 最容易出现），必须交给围栏分支处理，否则正文会原样漏出去
+            out.extend(self._feed_fenced(pending))
+            return out
+        return out
+
+    def _feed_fenced(self, text: str) -> list[_Emission]:
+        assert self._fence is not None
+        out: list[_Emission] = []
+        # 未完的行单独暂存：它可能是被切开的闭合标记（`` ` `` / ` `` ` / ` ``` `` 分片），
+        # 直接并入围栏体会让"```\n" 永远凑不齐、围栏再也不会闭合
+        pending = self._fence_partial + text
+        self._fence_partial = ""
+        while pending:
+            newline = pending.find("\n")
+            if newline == -1:
+                self._fence_partial = pending
+                return out
+            line = pending[: newline + 1]
+            pending = pending[newline + 1 :]
+            if self._is_closer(line):
+                out.append(self._notice())
+                self._fence = None
+                self._fence_body = []
+                self._fence_partial = ""
+                out.extend(self._feed_prose(pending))
+                return out
+            self._fence_body.append(line)
+        return out
+
+    def _notice(self) -> _Emission:
+        """围栏形状摘要。
+
+        不标注"未闭合"：流式增量里无法权威区分"模型真的漏了闭合标记"与"正文里提了一句
+        反引号"；这次输出是否完整由契约层判定（缺围栏即重试或可读失败）——终端这条摘要
+        只负责"内容不进屏幕"，不冒充结论（真模型演示中该后缀确实出现过误报）。
+        """
+        _, _, info = self._fence or ("`", 3, "")
+        # 围栏体逐段累积、每段自带换行：用 "" 连接，用 "\n" 连接会把行数按双倍空行算
+        body = "".join(self._fence_body) + self._fence_partial
+        lines = len(body.strip("\n").splitlines())
+        if info in contracts.CODE_LABELS:
+            head = "已收到代码块"
+        elif info in contracts.JSON_LABELS:
+            head = "已收到 JSON 结论"
+        elif info:
+            head = f"已收到 {info} 围栏"
+        else:
+            head = "已收到围栏块"
+        return _Emission("notice", f"{head}（{lines} 行，内容不在此显示）")
+
+
+def _could_be_marker(partial: str) -> bool:
+    """暂扣判定：片段是否仍可能长成围栏标记行（0–3 空格 + 纯反引号/波浪号前缀）。"""
+    stripped = partial.lstrip(" ")
+    if len(partial) - len(stripped) > 3:
+        return False
+    return stripped == "" or set(stripped) <= {"`", "~"}
+
+
+def _marker_candidate(partial: str) -> bool:
+    """行首片段是否需要继续等待：可能是标记开头，或本身已经是标记（只差换行）。"""
+    return _could_be_marker(partial) or _marker_of(partial) is not None
+
+
+def _marker_of(line: str) -> tuple[str, str] | None:
+    """整行是否为围栏标记；返回 ``(围栏串, 语言标签)``（普通正文返回 ``None``）。"""
+    body = line.rstrip("\n")
+    match = _MARKER_RE.match(body)
+    if match is not None:
+        return match.group("fence"), match.group("info").lower()
+    inline = _INLINE_MARKER_RE.match(body)
+    if inline is not None:
+        return inline.group("fence"), inline.group("info").lower()
+    return None
+
+
 class RunRenderer:
     """运行过程渲染器：实现引擎的观察者接口（Design §6.2 #6 的阶段序列）。
 
@@ -62,93 +306,104 @@ class RunRenderer:
         stream: 是否流式输出模型正文。``False``（``crw run --no-stream``）时按节点缓存
             正文，于该阶段结束时整体输出。
         out / err: 输出流；缺省 stdout / stderr。
+        color: 着色开关；``None``（缺省）按输出流是否终端自动判定，``True`` / ``False``
+            强制开 / 关（测试与重定向场景）。
     """
 
     def __init__(
-        self, *, stream: bool = True, out: TextIO | None = None, err: TextIO | None = None
+        self,
+        *,
+        stream: bool = True,
+        out: TextIO | None = None,
+        err: TextIO | None = None,
+        color: bool | None = None,
     ) -> None:
-        self._out = out if out is not None else sys.stdout
-        self._err = err if err is not None else sys.stderr
+        self._out = console_for(out if out is not None else sys.stdout, color)
+        self._err = console_for(err if err is not None else sys.stderr, color)
         self.stream = stream
-        self._buffer: list[str] = []
-        self._buffer_node = ""
-        self._suppress_text = False
+        self._filters: dict[str, _ProseFilter] = {}
+        self._buffers: dict[str, list[str]] = {}
+        self._open_stages: list[str] = []
+        self._lock = threading.Lock()
+        self._suppress: set[str] = set()
         self._line_open = False
 
+    # ---- 引擎观察者接口 ----
+
     def on_event(self, event: Mapping[str, Any]) -> None:
-        """按事件类型输出：开始头行与阶段行 / 重试 / 工具 / 错误 / 中断。"""
+        """按事件类型输出：阶段面板 / 工具 / 重试 / 错误 / 中断。"""
         node = str(event.get("node") or "")
         kind = str(event.get("event") or "")
         detail = event.get("detail")
         text = "" if detail is None else str(detail)
-        if node == "engine" and kind == "start":
-            run_id = str(event.get("run_id") or "?")
-            self._line(f"── 运行 {run_id} " + "─" * _RULE_WIDTH)
-            self._line(f"[输入] {text}")
-        elif node == "engine":
+        if node == "engine":
+            if kind == "start":
+                run_id = str(event.get("run_id") or "?")
+                self._line(f"── 运行 {run_id} " + "─" * _RULE_WIDTH, style="bold")
+                self._line(f"[输入] {text}", style="dim")
             return  # 收尾结论由命令面经 render_result 渲染
-        elif kind == "start":
-            return  # 阶段标题由对应的结束事件给出
+        if kind == "start":
+            with self._lock:
+                self._open_stages.append(node)
+            self._line("", style="")
+            self._line(_stage_banner(node, event.get("iteration")), style=_style_of(node))
         elif kind == "end":
-            self.flush_text()
-            self._suppress_text = False
-            self._line(f"[{engine_mod.node_label(node)}] {text}")
+            self._end_stage(node)
+            self._line(f"[{engine_mod.node_label(node)}] {text}", style=_style_of(node))
         elif kind == "retry":
             # Design §4.6：重试的第二次模型输出不重复渲染正文，只给一行提示
-            self.discard_text()
-            self._suppress_text = True
-            self._line(f"[{engine_mod.node_label(node)}] 重试：{text}")
+            self.discard_text(node)
+            with self._lock:
+                self._suppress.add(node)
+            self._line(f"  ⚠ 重试：{text}", style="yellow")
         elif kind == "tool":
-            self._line(f"[{engine_mod.node_label(node)}] 工具：{text}")
+            self._flush_pending_line(node)
+            self._line(f"  · 工具：{text}", style="dim")
         elif kind == "error":
-            self.flush_text()
-            self._suppress_text = False
-            self._line(f"[{engine_mod.node_label(node)}] 错误：{text}")
+            self._end_stage(node)
+            self._line(f"[{engine_mod.node_label(node)}] 错误：{text}", style="bold red")
         elif kind == "interrupt":
-            self.flush_text()
-            self._suppress_text = False
-            self._line(f"[{engine_mod.node_label(node)}] {text}")
+            self._end_stage(node)
+            self._line(f"[{engine_mod.node_label(node)}] {text}", style="bold yellow")
 
     def on_delta(self, node: str, text: str) -> None:
-        """模型正文增量：流式直接输出；``--no-stream`` 时按节点缓存到阶段结束。
+        """模型正文增量：单阶段时流式输出，多阶段（并行分支）时按节点缓存到该阶段结束。
 
-        契约重试后再来的正文不再渲染：前一次输出已经流出去过，把重试的正文再渲染一遍只会
-        让用户看到两段重复叙述（Design §4.6 的重试语义）；非流式下重试阶段的缓存同样丢弃。
+        围栏内容（代码 / JSON 结论）不进终端（见 :class:`_ProseFilter`）。并行分支会**同时**
+        产生增量，若各自即时写出，两位审查者的叙述会在终端交错成一段读不成句的文本
+        （实测并发执行确实同时到达）；此时按分支缓存，各分支在自己的阶段结束时整块输出，
+        顺序与阶段结束顺序一致。
         """
-        if self._suppress_text:
+        with self._lock:
+            if node in self._suppress:
+                return
+            # 并行分支无条件按节点缓存：两个分支的 start 事件与正文增量来自不同线程，
+            # "已开启阶段数 ≤ 1 就流式"会随到达顺序偶发地把一个分支的叙述直接写出去
+            streaming = (
+                self.stream and len(self._open_stages) <= 1 and node not in _PARALLEL_BRANCH_NODES
+            )
+            if streaming:
+                filtr = self._filters.setdefault(node, _ProseFilter())
+        if streaming:
+            self._emit_prose(filtr.feed(text))
             return
-        if self.stream:
-            _write_raw(self._err, text)
-            self._line_open = not text.endswith("\n")
-            return
-        if node != self._buffer_node:
-            # 换节点前先把上一段缓存吐出去：少了 end 事件时也不至于把正文丢掉
-            self.flush_text()
-            self._buffer_node = node
-        self._buffer.append(text)
+        with self._lock:
+            self._buffers.setdefault(node, []).append(text)
 
     def flush_text(self) -> None:
-        """把缓存的模型正文整体输出（阶段结束 / 出错前的收尾）。"""
-        if not self._buffer:
-            return
-        text = "".join(self._buffer).strip("\n")
-        self._buffer = []
-        if text:
-            self._line(text)
+        """把所有缓存的正文整体输出（阶段结束 / 出错前的收尾）。"""
+        with self._lock:
+            nodes = list(self._buffers)
+        for node in nodes:
+            self._end_stage(node, keep_open=True)
 
-    def _line(self, text: str) -> None:
-        """输出一整行：上一次若是未以换行收尾的流式正文，先补一个换行。
-
-        模型正文不一定以换行结束（实测存在），不补的话阶段行会粘在正文尾部。
-        """
-        if self._line_open:
-            self._err.write("\n")
-            self._line_open = False
-        _write(self._err, text)
-
-    def discard_text(self) -> None:
-        """丢弃缓存的正文（契约重试时前次输出不再渲染）。"""
-        self._buffer = []
+    def discard_text(self, node: str | None = None) -> None:
+        """丢弃缓存的正文与过滤器状态（契约重试时前次输出不再渲染）。"""
+        with self._lock:
+            targets = [node] if node is not None else list(self._buffers)
+            for name in targets:
+                self._buffers.pop(name, None)
+                self._filters.pop(name, None)
 
     def on_review(
         self,
@@ -157,20 +412,38 @@ class RunRenderer:
         file_name: str,
         findings: Sequence[Mapping[str, Any]],
         summary: str,
+        view: str | None = None,
     ) -> None:
-        """审查清单：逐条分级问题（【严重】/【一般】/【建议】）走 stdout。"""
-        if not findings:
-            _write(self._out, "  （本轮无问题）")
+        """审查清单：逐条分级问题（【严重】/【一般】/【建议】）走 stdout。
+
+        并行双视角时每个视角先给一行计数（``view`` 非空），合并结果仍按完整清单渲染——
+        用户先看到两个视角各自的规模，再看到去重合并后的判定依据。
+        """
+        counts = contracts.severity_counts(findings)
+        if view:
+            # 分支结论属"结论"通道（stdout，§8.4）：合并结果随后按完整清单展开
+            self._out.print(
+                f"  · {view}视角：{counts[contracts.SEVERE]} 严重 / "
+                f"{counts[contracts.MODERATE]} 一般 / {counts[contracts.ADVICE]} 建议",
+                style="dim",
+            )
             return
-        for finding in findings:
+        if not findings:
+            self._out.print("  （本轮无问题）", style="green")
+            return
+        for index, finding in enumerate(findings, start=1):
             location = str(finding.get("location") or "")
             issue = str(finding.get("issue") or "")
-            _write(self._out, f"  【{finding.get('severity')}】{location} — {issue}")
+            severity = str(finding.get("severity") or "未分级")
+            self._out.print(
+                f"  {index}. 【{severity}】{location} — {issue}",
+                style=_SEVERITY_STYLE.get(severity, "dim"),
+            )
             suggestion = str(finding.get("suggestion") or "").strip()
             if suggestion:
-                _write(self._out, f"    建议：{suggestion}")
+                self._out.print(f"     建议：{suggestion}", style="dim")
         if summary.strip():
-            _write(self._out, f"  评述：{_brief(summary)}")
+            self._out.print(f"  评述：{_brief(summary)}", style="dim")
 
     def on_fixes(
         self,
@@ -179,14 +452,91 @@ class RunRenderer:
         fixes: Sequence[Mapping[str, Any]],
         findings: Sequence[Mapping[str, Any]],
     ) -> None:
-        """修复处置：逐条"问题 ← 处置"对照走 stdout。"""
+        """修复处置：逐条"问题 ← 处置"对照走 stdout（着色按 status）。"""
         for fix in fixes:
             finding_id = str(fix.get("finding_id") or "")
+            status = str(fix.get("status") or "")
             note = str(fix.get("note") or "").strip()
-            line = f"  【修复】{finding_id} → {fix.get('status')}"
+            label = _STATUS_LABEL.get(status, status)
+            line = f"  {finding_id} → {label}"
             if note:
                 line = f"{line}：{note}"
-            _write(self._out, line)
+            self._out.print(line, style=_STATUS_STYLE.get(status, "dim"))
+
+    # ---- 内部输出 ----
+
+    def _emit_prose(self, emissions: Sequence[_Emission]) -> None:
+        for item in emissions:
+            if item.kind == "notice":
+                # 系统摘要行加前缀：与模型正文一眼分开（正文是原样流式写出的）
+                self._write_line(f"  ⋯ {item.text}", style="dim")
+            else:
+                self._write_raw(item.text)
+
+    def _end_stage(self, node: str, *, keep_open: bool = False) -> None:
+        """阶段收尾：把该节点缓存的正文整块输出（围栏内容转成形状摘要）。
+
+        ``keep_open`` 供 :meth:`flush_text` 复用——那是"把缓存吐出去"而不是"阶段结束"，
+        阶段是否仍在进行由调用方（end / error / interrupt 事件）决定。
+        """
+        with self._lock:
+            if not keep_open and node in self._open_stages:
+                self._open_stages.remove(node)
+            buffered = self._buffers.pop(node, None)
+            filtr = self._filters.pop(node, None)
+            self._suppress.discard(node)
+        if buffered is None and filtr is None:
+            return
+        text = "".join(buffered or []).strip(NEWLINE)
+        filtr = filtr or _ProseFilter()
+        emissions: list[_Emission] = []
+        if text:
+            emissions.extend(filtr.feed(text + NEWLINE))
+        emissions.extend(filtr.flush())
+        self._emit_prose(emissions)
+
+    def _flush_pending_line(self, node: str) -> None:
+        """把暂扣的行首片段放行（工具行出现时不必再等换行）。"""
+        with self._lock:
+            filtr = self._filters.get(node)
+        if filtr is not None:
+            self._emit_prose(filtr.drain_hold())
+
+    def _line(self, text: str, *, style: str) -> None:
+        """输出一整行：上一次若是未以换行收尾的流式正文，先补一个换行。"""
+        self._write_line(text, style=style)
+
+    def _write_line(self, text: str, *, style: str) -> None:
+        if self._line_open:
+            self._err.file.write("\n")
+            self._line_open = False
+        self._err.print(text, style=style or None)
+
+    def _write_raw(self, text: str) -> None:
+        """原样写出模型正文片段（保留缩进与换行，不重排）。"""
+        self._err.print(text, end="")
+        self._err.file.flush()
+        self._line_open = not text.endswith("\n")
+
+
+def _style_of(node: str) -> str:
+    return _NODE_STYLE.get(node, "bold")
+
+
+def _stage_banner(node: str, iteration: Any) -> str:
+    """阶段横幅文本：``── [审查] 第 1 轮 ──`` / ``── [编码] 生成初始代码 ──``。"""
+    label = engine_mod.node_label(node)
+    round_number = iteration if isinstance(iteration, int) and iteration > 0 else None
+    if node == "encode":
+        title = f"[{label}] {_STAGE_HINTS['encode']}"
+    elif node == "merge_reviews":
+        title = f"[{label}] 第 {round_number} 轮：合并双视角结论" if round_number else f"[{label}]"
+    elif round_number:
+        title = f"[{label}] 第 {round_number} 轮"
+    else:
+        title = f"[{label}]"
+    head = f"── {title} "
+    return head + "─" * max(2, _RULE_WIDTH - display_width(head))
 
 
 def render_result(
@@ -195,12 +545,27 @@ def render_result(
     out: TextIO | None = None,
     err: TextIO | None = None,
     command: str = "run",
+    color: bool | None = None,
 ) -> None:
     """收尾结论：干净 / 残留 → stdout；失败与中断 → stderr 可读报错 + 已保留产物路径。"""
-    stream_out = out if out is not None else sys.stdout
-    stream_err = err if err is not None else sys.stderr
+    guarded(lambda: _render_result(result, out=out, err=err, command=command, color=color))
+
+
+def _render_result(
+    result: engine_mod.RunResult,
+    *,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+    command: str = "run",
+    color: bool | None = None,
+) -> None:
+    stdout = out if out is not None else sys.stdout
+    stderr = err if err is not None else sys.stderr
+    out_console = console_for(stdout, color)
+    err_console = console_for(stderr, color)
     reached_limit = result.status == state_mod.STATUS_RESIDUAL
     if result.succeeded or reached_limit:
+        out_console.print("")  # 结论前留空行：与阶段输出分区（Design §6.2 #6 的排版约定）
         # 结论句与报告同源（engine.conclusion_text）：判定口径变化时两处一起变
         conclusion = engine_mod.conclusion_text(
             status=result.status,
@@ -209,33 +574,49 @@ def render_result(
             findings=result.findings,
             strict=bool(result.state.get("strict")),
         )
-        _write(stream_out, f"── 完成：{conclusion}──")
+        head = f"── 完成：{conclusion} "
+        style = "bold green" if result.succeeded else "bold yellow"
+        out_console.print(head + "─" * max(2, _RULE_WIDTH - display_width(head)), style=style)
     else:
         # 中断结论有两个来源：本次进程的中断标记，或记录里的 status=interrupted（会话轮次口径）
         interrupted = result.interrupted or result.status == state_mod.STATUS_INTERRUPTED
         label = "已中断" if interrupted else "运行失败"
         node = result.error_node or "engine"
-        node_text = (
-            f"[{engine_mod.node_label(node)}] " if node in ("encode", "review", "fix") else ""
-        )
-        _write(
-            stream_err,
+        node_text = f"[{engine_mod.node_label(node)}] " if node in engine_mod.NODE_LABELS else ""
+        err_console.print(
             f"crw {command}：{label} — {node_text}{result.error_message or '（无详细信息）'}",
+            style="bold red",
         )
     if result.run_dir is not None:
         # 有结论可给人看（干净 / 残留）时运行记录路径随结论走 stdout，否则随报错走 stderr
-        target = stream_out if (result.succeeded or reached_limit) else stream_err
+        target = out_console if (result.succeeded or reached_limit) else err_console
         tail = "（报告 report.md）" if result.report_written else "（已中断，未生成报告）"
-        _write(target, f"运行记录：{result.run_dir}{tail}")
+        target.print(f"运行记录：{result.run_dir}{tail}", style="dim")
         if not result.report_written and result.interrupted:
-            _write(target, "说明：报告未生成；状态与事件已落盘（state.json / log.jsonl）。")
+            target.print(
+                "说明：报告未生成；状态与事件已落盘（state.json / log.jsonl）。", style="dim"
+            )
 
 
-def render_runs(summaries: Sequence[records_mod.RunSummary], *, out: TextIO | None = None) -> None:
+def render_runs(
+    summaries: Sequence[records_mod.RunSummary],
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
     """运行列表：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数（Design §8.1）。"""
-    stream = out if out is not None else sys.stdout
+    guarded(lambda: _render_runs(summaries, out=out, color=color))
+
+
+def _render_runs(
+    summaries: Sequence[records_mod.RunSummary],
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
+    console = console_for(out if out is not None else sys.stdout, color)
     if not summaries:
-        _write(stream, "（暂无运行记录；先执行 crw run）")
+        console.print("（暂无运行记录；先执行 crw run）")
         return
     header = ("运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数")
     rows = [
@@ -252,98 +633,281 @@ def render_runs(summaries: Sequence[records_mod.RunSummary], *, out: TextIO | No
     widths = [
         max(display_width(row[column]) for row in (header, *rows)) for column in range(len(header))
     ]
-    _write(
-        stream, "  ".join(pad(text, widths[index]) for index, text in enumerate(header)).rstrip()
+    console.print(
+        "  ".join(pad(text, widths[index]) for index, text in enumerate(header)).rstrip(),
+        style="bold",
     )
-    _write(stream, "  ".join("-" * width for width in widths).rstrip())
-    for row in rows:
-        _write(
-            stream, "  ".join(pad(text, widths[index]) for index, text in enumerate(row)).rstrip()
+    console.print(
+        "  ".join("-" * width for width in widths).rstrip(),
+    )
+    for item, row in zip(summaries, rows, strict=True):
+        console.print(
+            "  ".join(pad(text, widths[index]) for index, text in enumerate(row)).rstrip(),
+            style=_status_style(item.status),
         )
 
 
-def render_detail(detail: records_mod.RunDetail, *, out: TextIO | None = None) -> None:
-    """运行详情：摘要 → 时间线 → 逐轮 findings 表 → 产物路径（Design §8.1 的 crw show）。"""
-    stream = out if out is not None else sys.stdout
+def render_detail(
+    detail: records_mod.RunDetail,
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
+    """运行详情：摘要 → 时间线（含工具调用）→ 逐轮 findings 表 → 产物路径（Design §8.1）。
+
+    ``state.json`` 损坏时降级展示（Design §8.2）：摘要行取自日志与产物清单，逐轮审查表仍
+    来自 ``review_*.json``（文件独立于状态快照），并显式说明当前展示的数据来源。
+    """
+    guarded(lambda: _render_detail(detail, out=out, color=color))
+
+
+def _render_detail(
+    detail: records_mod.RunDetail,
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
+    console = console_for(out if out is not None else sys.stdout, color)
     state = detail.state
-    _write(stream, f"── 运行 {state.get('run_id') or detail.summary.run_id} " + "─" * _RULE_WIDTH)
-    _write(stream, f"[输入] {_input_line(state)}")
-    _write(stream, f"[模型] {state.get('model') or '（未记录）'}")
+    run_id = state.get("run_id") or detail.summary.run_id
+    if detail.degraded:
+        head = f"── 运行 {run_id}（记录降级展示）"
+        console.print(
+            head + " " + "─" * max(2, _RULE_WIDTH - display_width(head)), style="bold yellow"
+        )
+        console.print(f"[警告] {detail.degraded_reason}", style="yellow")
+        console.print("[来源] 以下摘要取自 log.jsonl 与产物清单（state.json 不可读）", style="dim")
+    else:
+        head = f"── 运行 {run_id}"
+        console.print(head + " " + "─" * max(2, _RULE_WIDTH - display_width(head)), style="bold")
+    console.print(f"[输入] {_input_line(state, detail.summary)}")
+    console.print(f"[模型] {state.get('model') or '（未记录）'}")
     stale = "（可能已中断）" if detail.summary.stale else ""
-    _write(stream, f"[状态] {engine_mod.status_label(str(state.get('status') or ''))}{stale}")
-    _write(
-        stream,
-        f"[轮次] 审查 {state.get('review_round', 0)} 轮 / 修复 {state.get('fix_rounds', 0)} 轮；"
-        f"上限 {state.get('max_iterations', 0)}（来源：{engine_mod.source_label(state.get('max_iterations_source'))}）",
+    status = state.get("status") or detail.summary.status
+    console.print(
+        f"[状态] {engine_mod.status_label(str(status))}{stale}",
+        style=_status_style(str(status)),
     )
-    _write(stream, f"[时间] {state.get('created_at')} → {state.get('finished_at')}")
+    # 降级态（state.json 不可读）：修复轮次可由产物数派生，审查轮次没有可靠来源——
+    # 用"修复轮次 + 1"会与同页口径打架，故如实写"（未记录）"
+    review_round = state.get("review_round")
+    console.print(
+        f"[轮次] 审查 {review_round if review_round is not None else '（未记录）'} 轮 / "
+        f"修复 {state.get('fix_rounds', detail.summary.fix_rounds or 0)} 轮；"
+        f"上限 {state.get('max_iterations', '（未记录）')}"
+        f"（来源：{engine_mod.source_label(state.get('max_iterations_source'))}）"
+    )
+    console.print(f"[时间] {_time_line(state, detail)}")
     if state.get("parent_run_id"):
-        _write(stream, f"[父运行] {state.get('parent_run_id')}")
+        console.print(f"[父运行] {state.get('parent_run_id')}（续跑来源）")
     error = _mapping(state.get("error"))
     if error:
         label = "已中断" if error.get("node") == "interrupt" else "运行失败"
-        _write(
-            stream, f"[{label}] {engine_mod.node_label(error.get('node'))}：{error.get('message')}"
+        console.print(
+            f"[{label}] {engine_mod.node_label(error.get('node'))}：{error.get('message')}",
+            style="red",
         )
 
-    history = state.get("history") if isinstance(state.get("history"), list) else []
-    _write(stream, "")
-    _write(stream, "时间线：")
-    if history:
-        header = ("#", "节点", "轮次", "开始时间", "耗时(ms)", "摘要")
-        rows = [
-            (
-                str(index),
-                engine_mod.node_label(entry.get("node")),
-                str(entry.get("round") or ""),
-                str(entry.get("started_at") or ""),
-                str(entry.get("duration_ms") or ""),
-                _brief(str(entry.get("summary") or ""), limit=60),
-            )
-            for index, entry in enumerate(history, start=1)
-            if isinstance(entry, Mapping)
-        ]
+    console.print("")
+    console.print("时间线：", style="bold")
+    rows = _timeline_rows(detail)
+    if rows:
+        header = ("#", "节点", "轮次", "开始时间", "耗时(ms)", "工具", "摘要")
         widths = [
             max(display_width(row[column]) for row in (header, *rows))
             for column in range(len(header))
         ]
-        for row in (header, *rows):
-            _write(
-                stream,
-                "  ".join(pad(text, widths[index]) for index, text in enumerate(row)).rstrip(),
-            )
+        console.print(
+            "  ".join(pad(text, widths[index]) for index, text in enumerate(header)).rstrip(),
+            style="bold",
+        )
+        for row in rows:
+            console.print("  ".join(pad(text, widths[i]) for i, text in enumerate(row)).rstrip())
     else:
-        _write(stream, "（无节点事件）")
+        console.print("（无节点事件）")
 
-    _write(stream, "")
-    _write(stream, "逐轮审查：")
+    tools = _tool_lines(detail)
+    if tools:
+        console.print("")
+        console.print("工具调用：", style="bold")
+        for line in tools:
+            console.print(f"  {line}", style="dim")
+
+    console.print("")
+    console.print("逐轮审查：", style="bold")
     if detail.rounds:
         for item in detail.rounds:
             findings = item.review.get("findings")
             findings = findings if isinstance(findings, list) else []
-            counts = _counts(findings)
-            _write(
-                stream,
+            counts = contracts.severity_counts(findings)
+            console.print(
                 f"  第 {item.round_number} 轮（{item.file_name}）："
-                f"{counts['严重']} 严重 / {counts['一般']} 一般 / {counts['建议']} 建议",
+                f"{counts[contracts.SEVERE]} 严重 / {counts[contracts.MODERATE]} 一般 / "
+                f"{counts[contracts.ADVICE]} 建议",
+                style="bold",
             )
-            for finding in findings:
+            if _not_converged(detail, item.round_number):
+                console.print(
+                    "    ⚠ 未收敛：本轮问题集合与上一轮完全相同（已如实标注，未提前中止）",
+                    style="yellow",
+                )
+            for index, finding in enumerate(findings, start=1):
                 if not isinstance(finding, Mapping):
                     continue
-                fix_line = _fix_line(item, str(finding.get("id")))
-                _write(
-                    stream,
-                    f"    【{finding.get('severity')}】{finding.get('location')} — "
-                    f"{_brief(str(finding.get('issue') or ''), limit=60)}{fix_line}",
+                severity = str(finding.get("severity") or "未分级")
+                console.print(
+                    f"    {index}. 【{severity}】{finding.get('location')} — "
+                    f"{_brief(str(finding.get('issue') or ''), limit=60)}"
+                    f"{_fix_line(item, str(finding.get('id')))}",
+                    style=_SEVERITY_STYLE.get(severity, "dim"),
                 )
     else:
-        _write(stream, "（无审查结论）")
+        console.print("（无审查结论）")
 
-    _write(stream, "")
-    _write(stream, "产物路径：")
+    console.print("")
+    console.print("产物路径：", style="bold")
     for path in detail.artifacts:
-        _write(stream, f"  {path}")
-    _write(stream, f"  （运行目录：{detail.summary.path}）")
+        console.print(f"  {path}")
+    console.print(f"  （运行目录：{detail.summary.path}）", style="dim")
+
+
+def _timeline_rows(detail: records_mod.RunDetail) -> list[tuple[str, ...]]:
+    """时间线表：优先取 state.history；损坏记录改由 log.jsonl 的事件配对派生。"""
+    history = detail.state.get("history") if isinstance(detail.state.get("history"), list) else []
+    if history:
+        rows: list[tuple[str, ...]] = []
+        for index, entry in enumerate(history, start=1):
+            if not isinstance(entry, Mapping):
+                continue
+            node = str(entry.get("node") or "")
+            rows.append(
+                (
+                    str(index),
+                    engine_mod.node_label(node),
+                    str(entry.get("round") or ""),
+                    str(entry.get("started_at") or ""),
+                    str(entry.get("duration_ms") or ""),
+                    str(_tool_count(detail, node, entry.get("round"))),
+                    _brief(str(entry.get("summary") or ""), limit=60),
+                )
+            )
+        return rows
+    return _timeline_rows_from_log(detail)
+
+
+def _timeline_rows_from_log(detail: records_mod.RunDetail) -> list[tuple[str, ...]]:
+    """降级时间线（state.json 不可读）：用 start / end 事件的时间戳配对算耗时。"""
+    rows: list[tuple[str, ...]] = []
+    starts: dict[tuple[str, Any], str] = {}
+    order: list[tuple[str, Any, str]] = []
+    for event in detail.events:
+        node = str(event.get("node") or "")
+        kind = str(event.get("event") or "")
+        if node == "engine":
+            continue
+        round_number = event.get("iteration")
+        key = (node, round_number)
+        if kind == "start":
+            starts[key] = str(event.get("ts") or "")
+            order.append((node, round_number, ""))
+        elif kind == "end":
+            detail_text = str(event.get("detail") or "")
+            for index, (entry_node, entry_round, _) in enumerate(order):
+                if (entry_node, entry_round) == key:
+                    order[index] = (entry_node, entry_round, detail_text)
+                    break
+    if not order:
+        return rows
+    for index, (node, round_number, summary) in enumerate(order, start=1):
+        started = starts.get((node, round_number), "")
+        ended = next(
+            (
+                str(event.get("ts") or "")
+                for event in detail.events
+                if str(event.get("node") or "") == node
+                and event.get("iteration") == round_number
+                and str(event.get("event") or "") == "end"
+            ),
+            "",
+        )
+        rows.append(
+            (
+                str(index),
+                engine_mod.node_label(node),
+                "" if round_number is None else str(round_number),
+                started,
+                _duration_ms(started, ended),
+                str(_tool_count(detail, node, round_number)),
+                _brief(summary, limit=60),
+            )
+        )
+    return rows
+
+
+def _tool_lines(detail: records_mod.RunDetail) -> list[str]:
+    """工具调用明细（来自 log.jsonl）：``[审查] 第 1 轮 · read_file(…)``。"""
+    lines: list[str] = []
+    for event in detail.events:
+        if str(event.get("event") or "") != "tool":
+            continue
+        node = str(event.get("node") or "")
+        round_number = event.get("iteration")
+        where = f"[{engine_mod.node_label(node)}]"
+        if round_number is not None:
+            where = f"{where} 第 {round_number} 轮"
+        lines.append(f"{where} · {_brief(str(event.get('detail') or ''), limit=100)}")
+    return lines
+
+
+def _tool_count(detail: records_mod.RunDetail, node: str, round_number: Any) -> int:
+    return sum(
+        1
+        for event in detail.events
+        if str(event.get("event") or "") == "tool"
+        and str(event.get("node") or "") == node
+        and event.get("iteration") == round_number
+    )
+
+
+def _not_converged(detail: records_mod.RunDetail, round_number: int) -> bool:
+    """未收敛判定（Design §4.4）：与上一轮的 ``(location, issue)`` 集合完全相同。"""
+    if round_number <= 1:
+        return False
+    previous = next((item for item in detail.rounds if item.round_number == round_number - 1), None)
+    current = next((item for item in detail.rounds if item.round_number == round_number), None)
+    if previous is None or current is None:
+        return False
+    return engine_mod.not_converged(previous.review, current.review)
+
+
+def _duration_ms(started: str, ended: str) -> str:
+    """两个 ISO 时间戳的耗时（毫秒，降级时间线用）；解析失败留空。"""
+    try:
+        start = datetime.datetime.fromisoformat(started)
+        end = datetime.datetime.fromisoformat(ended)
+    except (TypeError, ValueError):
+        return ""
+    return str(max(0, int((end - start).total_seconds() * 1000)))
+
+
+def _time_line(state: Mapping[str, Any], detail: records_mod.RunDetail) -> str:
+    """开始 → 结束时间；state.json 不可读时取日志首末事件时间。"""
+    if state.get("created_at") or state.get("finished_at"):
+        return f"{state.get('created_at') or '（未记录）'} → {state.get('finished_at') or '（未记录）'}"
+    stamps = [str(event.get("ts") or "") for event in detail.events if event.get("ts")]
+    if not stamps:
+        return "（未记录）"
+    return f"{stamps[0]} → {stamps[-1]}（取自日志）"
+
+
+def _status_style(status: str) -> str:
+    return {
+        state_mod.STATUS_SUCCESS: "green",
+        state_mod.STATUS_RESIDUAL: "yellow",
+        state_mod.STATUS_FAILED: "red",
+        state_mod.STATUS_INTERRUPTED: "red",
+        state_mod.STATUS_RUNNING: "dim",
+    }.get(status, "")
 
 
 def _fix_line(item: records_mod.RoundReport, finding_id: str) -> str:
@@ -355,13 +919,9 @@ def _fix_line(item: records_mod.RoundReport, finding_id: str) -> str:
         return ""
     for fix in fixes:
         if isinstance(fix, Mapping) and str(fix.get("finding_id")) == finding_id:
-            return f"　← 处置：{fix.get('status')}"
+            status = str(fix.get("status") or "")
+            return f"　← 处置：{_STATUS_LABEL.get(status, status)}"
     return ""
-
-
-def _counts(findings: Sequence[Any]) -> dict[str, int]:
-    """逐级计数（详情页的逐轮摘要行）：复用契约层的计数口径。"""
-    return contracts.severity_counts([item for item in findings if isinstance(item, Mapping)])
 
 
 def _number(value: int | None) -> str:
@@ -378,26 +938,17 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _input_line(state: Mapping[str, Any]) -> str:
-    """详情页的输入行：``-f`` 输入标注完整来源路径与工作区映射（Design §4.5）。"""
+def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> str:
+    """详情页的输入行：``-f`` / resume 输入标注来源与工作区映射（Design §4.5）。"""
     descriptor = _mapping(state.get("input"))
     if descriptor.get("kind") == state_mod.INPUT_FILE:
         return (
             f"文件：{descriptor.get('source_path') or '（未记录路径）'}"
             f" → {state_mod.code_file_name(1)}"
         )
+    if not descriptor:
+        return summary.input_summary
     return state_mod.summarize_input(descriptor, limit=200)
-
-
-def _write(stream: TextIO, text: str) -> None:
-    print(text, file=stream)
-    stream.flush()
-
-
-def _write_raw(stream: TextIO, text: str) -> None:
-    """原样写出（不经 print 的换行与转义），用于流式模型正文。"""
-    stream.write(text)
-    stream.flush()
 
 
 def review_json_report(merged: Mapping[str, Any]) -> str:

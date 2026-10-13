@@ -31,6 +31,7 @@ MODULES = (
     "crw.tools",
     "crw.tools.fs",
     "crw.tools.exec_py",
+    "crw.uninstall",
 )
 
 

@@ -267,6 +267,87 @@ def judge_clean(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) 
     return blocking_count(findings, strict=strict) == 0
 
 
+#: severity 的严重度次序（越小越严重）
+_SEVERITY_RANK: dict[str, int] = {SEVERE: 0, MODERATE: 1, ADVICE: 2}
+
+
+def _severity_name(value: Any) -> str:
+    """归一 severity 取值：枚举外的取值（含缺失 / 拼写错）一律按【建议】处理。
+
+    ``review_N.json`` 可能被手改，合并结果又直接进干净判定——把未知取值留在结果里会让
+    :func:`blocking_count` 视而不见（既不阻塞也不提示），等于给出一条"看不见的结论"。
+    """
+    text = str(value)
+    return text if text in SEVERITIES else ADVICE
+
+
+def _severity_rank(value: Any) -> int:
+    """严重度次序（归一后查表，保证入表与比较两处用同一把尺子）。"""
+    return _SEVERITY_RANK[_severity_name(value)]
+
+
+def merge_findings(
+    groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
+) -> list[Finding]:
+    """并行双视角审查的 findings 合并（Design §12.2 的汇合规则）。
+
+    - 去重键 = ``(location, issue)``：同一问题被两个视角都报出时只留一条；
+    - 取**较严重**者：``severity`` 按 严重 < 一般 < 建议 的次序取更严重的一个，随它一起
+      采纳该项的 ``suggestion`` 与 ``uncertain``（更严重的结论通常基于更强的证据）；
+    - ``id`` 统一重编号为 ``f-1``…（保持首次出现顺序），使下游"逐条处置"仍可追溯；
+    - 来源视角并入该条的 ``views``（附加字段，供报告与本产品自身审计"这条是谁提的"）。
+
+    Args:
+        groups: ``(视角显示名, findings)`` 序列，按给定顺序参与去重与统计。
+
+    Returns:
+        合并后的 findings（新对象，不改动入参）。
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for view, findings in groups:
+        for item in findings:
+            key = (str(item.get("location") or ""), str(item.get("issue") or ""))
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = {
+                    # 首次入表也走同一套归一：枚举外的 severity 一律按【建议】处理，
+                    # 否则它会原样落进结果、在 blocking_count 里"既不计严重也不计一般"
+                    # 而静默绕过干净判定（Design §4.4 的判据必须只看枚举内取值）
+                    "severity": _severity_name(item.get("severity")),
+                    "location": key[0],
+                    "issue": key[1],
+                    "suggestion": str(item.get("suggestion") or ""),
+                    "uncertain": bool(item.get("uncertain")),
+                    "views": [view],
+                }
+                continue
+            if _severity_rank(item.get("severity")) < _severity_rank(entry.get("severity")):
+                entry["severity"] = _severity_name(item.get("severity"))
+                entry["suggestion"] = str(item.get("suggestion") or "") or entry["suggestion"]
+                entry["uncertain"] = bool(item.get("uncertain"))
+            if view not in entry["views"]:
+                entry["views"].append(view)
+    result: list[Finding] = []
+    for index, entry in enumerate(merged.values(), start=1):
+        finding = Finding(**{str(key): value for key, value in entry.items()})
+        finding["id"] = f"f-{index}"
+        result.append(finding)
+    return result
+
+
+def finding_keys(findings: Sequence[Mapping[str, Any]]) -> frozenset[tuple[str, str]]:
+    """findings 的 ``(location, issue)`` 集合（未收敛判定用，Design §4.4）。
+
+    非 Mapping 的条目（损坏记录 / 手改过的 review_N.json）跳过——判定读的是展示数据，
+    不该因一条残缺条目整体失败。
+    """
+    return frozenset(
+        (str(item.get("location") or ""), str(item.get("issue") or ""))
+        for item in findings
+        if isinstance(item, Mapping)
+    )
+
+
 # ---- crw review 的报告契约（前作 files[] 形态，Design §6.4）----
 
 

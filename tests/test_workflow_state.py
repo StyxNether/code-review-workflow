@@ -30,10 +30,18 @@ def make_state(**overrides: object) -> dict[str, object]:
 
 
 def test_new_state_fills_every_persisted_field() -> None:
-    """初始状态字段与 Design §4.3 的持久化列表一一对应（不多不少）。"""
+    """初始状态字段与 Design §4.3 的持久化列表一一对应（不多不少）。
+
+    例外：并行双视角审查的分支 key（``findings_<视角>``）是图执行期的中间态，由汇合节点
+    消费后以 ``findings`` 承载权威结论，故声明在 schema 内但**不进**运行记录。
+    """
     state = make_state()
 
-    assert set(state) == set(state_mod.PERSISTED_FIELDS)
+    assert set(state) - set(state_mod.PERSISTED_FIELDS) == {
+        "findings_correctness",
+        "findings_security",
+    }
+    assert set(state_mod.PERSISTED_FIELDS) <= set(state)
     assert state["status"] == state_mod.STATUS_RUNNING
     assert state["review_round"] == 0
     assert state["fix_rounds"] == 0

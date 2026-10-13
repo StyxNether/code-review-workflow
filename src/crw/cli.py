@@ -16,7 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +24,10 @@ from . import agents as agents_mod
 from . import config as config_mod
 from . import render
 from . import tools as tools_mod
+from . import uninstall as uninstall_mod
 from .workflow import contracts as contracts_mod
 from .workflow import engine as engine_mod
+from .workflow import graph as graph_mod
 from .workflow import records as records_mod
 from .workflow import state as state_mod
 
@@ -103,6 +105,12 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--strict", action="store_true", help="干净判定加严：无【严重】且无【一般】"
     )
+    parser.add_argument(
+        "--parallel-review",
+        dest="parallel_review",
+        action="store_true",
+        help="并行双视角审查（正确性 + 安全性同轮并行，汇合去重；审查调用量约翻倍）",
+    )
     _add_model_options(parser)
     parser.add_argument("--out", metavar="目录", help="将最终代码与报告复制到指定目录")
     parser.add_argument("--no-stream", action="store_true", help="关闭流式渲染，整体输出")
@@ -170,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="文件",
         help="写入文件（默认输出到 stdout）",
     )
+    graph_parser.add_argument(
+        "--parallel-review",
+        dest="parallel_review",
+        action="store_true",
+        help="导出并行双视角审查形态的图（与 crw run --parallel-review 同源）",
+    )
 
     subparsers.add_parser("uninstall", help="卸载：分级清理程序、PATH 条目与用户数据")
 
@@ -218,12 +232,6 @@ def _report_failure(command: str | None, exc: Exception) -> int:
     return _EXIT_ERROR
 
 
-def _not_implemented(command: str) -> int:
-    """占位处理：报告命令尚未实现，返回运行错误退出码。"""
-    print(f"crw {command}：该命令尚未实现。", file=sys.stderr)
-    return _EXIT_ERROR
-
-
 # ---- 模型解析与运行装配 ----
 
 
@@ -240,25 +248,45 @@ def _resolve_model(model: str | None, provider: str | None, command: str) -> Any
             "或设置环境变量 CRW_DEEPSEEK_API_KEY（Windows 用 setx，须新开终端生效）。",
             file=sys.stderr,
         )
+        legacy_hint = _legacy_config_hint()
+        if legacy_hint:
+            print(legacy_hint, file=sys.stderr)
         return None
     return resolved
 
 
-def _read_input_file(path: Path) -> tuple[str | None, int]:
-    """读取 ``-f`` 输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。"""
+def _legacy_config_hint() -> str:
+    """零配置且有前作配置时的导入提示（Design §6.2 #2 / D7：只探测存在性并提示）。"""
+    if config_mod.config_path().exists():
+        return ""
+    legacy = config_mod.legacy_config_path()
+    if not legacy.exists():
+        return ""
+    return f"提示：检测到前作配置 {legacy}——运行 crw config 可选择导入（不会修改前作文件）。"
+
+
+def _read_input_file(path: Path, *, command: str = "run") -> tuple[str | None, int]:
+    """读取输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。
+
+    ``command`` 只影响报错前缀：resume 读的是父运行的代码版本，报错里写 "crw run" 会把
+    用户引到错误的命令上。
+    """
     if not path.exists():
-        print(f"crw run：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
+        print(f"crw {command}：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
         return None, _EXIT_ERROR
     if path.is_dir():
-        print(f"crw run：运行失败 — 输入是目录：{path}（-f 需要一个代码文件）", file=sys.stderr)
+        print(
+            f"crw {command}：运行失败 — 输入是目录：{path}（-f 需要一个代码文件）",
+            file=sys.stderr,
+        )
         return None, _EXIT_ERROR
     try:
         return path.read_text(encoding="utf-8"), _EXIT_OK
     except UnicodeDecodeError:
-        print(f"crw run：运行失败 — 输入文件不是 UTF-8 文本：{path}", file=sys.stderr)
+        print(f"crw {command}：运行失败 — 输入文件不是 UTF-8 文本：{path}", file=sys.stderr)
         return None, _EXIT_ERROR
     except OSError as exc:
-        print(f"crw run：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
+        print(f"crw {command}：运行失败 — 输入文件读取失败：{path}（{exc}）", file=sys.stderr)
         return None, _EXIT_ERROR
 
 
@@ -287,6 +315,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         max_iterations_source=args.max_iter_source or state_mod.SOURCE_DEFAULT,
         strict=bool(args.strict),
         no_exec=bool(args.no_exec),
+        parallel_review=bool(args.parallel_review),
         resolved=resolved,
     )
     engine = engine_mod.WorkflowEngine(observer=render.RunRenderer(stream=not args.no_stream))
@@ -348,8 +377,31 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _inherited_rounds(parent_state: Mapping[str, Any], parent_run_id: str) -> int:
+    """续跑继承的轮次上限：与命令行同一套校验（0–10、ASCII 十进制）。
+
+    继承路径不得绕过上限：``state.json`` 可能被手改成 999，而该上限正是"防止误填大值造成
+    无界循环与无界调用费用"的硬闸（Design §4.4）。值非法时退回内置默认并如实提示。
+    """
+    raw = parent_state.get("max_iterations")
+    try:
+        return _max_iter_rounds(str(raw))
+    except argparse.ArgumentTypeError:
+        print(
+            f"crw resume：父运行 {parent_run_id} 的轮次上限（{raw!r}）不合法，"
+            f"已改用内置默认 {engine_mod.DEFAULT_MAX_ITERATIONS} 轮。",
+            file=sys.stderr,
+        )
+        return engine_mod.DEFAULT_MAX_ITERATIONS
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
-    """展示运行详情；省略运行号时列出记录供数字选择（Design §8.1）。"""
+    """展示运行详情；省略运行号时列出记录供数字选择（Design §8.1）。
+
+    ``state.json`` 损坏时按 §8.2 降级展示（摘要取自日志与产物清单）并给出退出码 2——
+    §8.1 的"记录损坏"口径即此：**展示照给，退出码照实**（脚本化消费能察觉异常，
+    人读仍拿得到可用信息）。
+    """
     run_id = args.run_id
     if run_id is None:
         summaries = records_mod.list_runs()
@@ -372,22 +424,93 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"crw show：{exc}", file=sys.stderr)
         return _EXIT_ERROR
     render.render_detail(detail)
+    if detail.degraded:
+        print(f"crw show：记录损坏，已降级展示 — {detail.degraded_reason}", file=sys.stderr)
+        return _EXIT_ERROR
     return _EXIT_OK
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    """续跑运行（占位，M3 落地）。"""
-    return _not_implemented("resume")
+    """续跑：以父运行的最新代码版本为新运行的起点（Design §4.4）。
+
+    ``-f`` 不适用（起点由父运行决定）；父运行须存在 ``current_code`` 且文件仍在，否则给出
+    可读原因并退出 2。未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
+    ``--strict`` 与审查形态一并继承——续跑是"接着修"，换判定标准会让结论不可比。
+    ``--no-exec`` 不继承（它不进状态快照，命令面无法可靠区分"显式关闭"与"从未设置"）。
+    """
+    try:
+        detail = records_mod.load_detail(args.run_id)
+    except records_mod.RunRecordError as exc:
+        print(f"crw resume：{exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    parent_state = detail.state
+    if detail.degraded:
+        print(
+            f"crw resume：父运行 {args.run_id} 的记录已损坏（state.json 不可读），"
+            "无法确定续跑起点与轮次设置；可用 crw show 查看降级信息。",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    code_path = Path(str(parent_state.get("current_code") or ""))
+    if not code_path.is_file():
+        print(
+            f"crw resume：父运行 {args.run_id} 没有可续跑的代码版本"
+            f"（current_code：{code_path or '（未记录）'}）——该运行可能在建码前就失败了。",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    source_text, error_code = _read_input_file(code_path, command="resume")
+    if source_text is None:
+        return error_code
+    resolved = _resolve_model(args.model, args.provider, "resume")
+    if resolved is None:
+        return _EXIT_ERROR
+    # 轮次取值来源：命令行显式 > 父运行继承（配置默认 ~/.crw/settings.json 随 M4 落地）
+    inherited_rounds = _inherited_rounds(parent_state, args.run_id)
+    request = engine_mod.RunRequest(
+        source_path=code_path,
+        source_text=source_text,
+        max_iterations=args.max_iter if args.max_iter_source else inherited_rounds,
+        max_iterations_source=args.max_iter_source or state_mod.SOURCE_PARENT,
+        strict=bool(args.strict) or bool(parent_state.get("strict")),
+        no_exec=bool(args.no_exec),
+        parallel_review=bool(args.parallel_review) or bool(parent_state.get("parallel_review")),
+        resolved=resolved,
+        parent_run_id=args.run_id,
+    )
+    engine = engine_mod.WorkflowEngine(observer=render.RunRenderer(stream=not args.no_stream))
+    result = engine.execute(request)
+    render.render_result(result, command="resume")
+    if args.out:
+        _export_outputs(result, Path(args.out))
+    return result.exit_code
 
 
 def _cmd_graph(args: argparse.Namespace) -> int:
-    """导出工作流图（占位，M3 落地）。"""
-    return _not_implemented("graph")
+    """导出工作流 mermaid 流程图（Design §8.1）：默认 stdout，``-o`` 写文件。
+
+    导出的节点 / 边集合与 ``build_graph`` 同源（同一份结构声明），由快照测试锁定；
+    ``--parallel-review`` 导出并行双视角形态的图。
+    """
+    parallel = bool(getattr(args, "parallel_review", False))
+    text = graph_mod.mermaid_flowchart(parallel_review=parallel)
+    if not args.out:
+        # 展示层故障（下游关闭管道）不改变结论，见 render.guarded 的说明
+        render.guarded(lambda: print(text, end=""))
+        return _EXIT_OK
+    target = Path(args.out)
+    try:
+        records_mod.atomic_write_text(target, text)
+    except OSError as exc:
+        print(f"crw graph：写入失败 — {target}（{exc}）", file=sys.stderr)
+        return _EXIT_ERROR
+    print(f"已写入：{target}", file=sys.stderr)
+    return _EXIT_OK
 
 
 def _cmd_uninstall(args: argparse.Namespace) -> int:
-    """卸载（占位，M3 落地）。"""
-    return _not_implemented("uninstall")
+    """卸载：分级确认（程序 / 垫片 → PATH 条目 → 登记的环境变量 → 用户数据），确认前零删除。"""
+    return uninstall_mod.run_uninstall()
 
 
 # ---- crw review：单 Agent 审查（不修复、不产生运行记录）----
@@ -1002,6 +1125,55 @@ def _config_update_key(session: _ConfigSession) -> None:
     session.save()
 
 
+def _maybe_import_legacy_config(session: _ConfigSession) -> None:
+    """零配置时提示导入前作 ``~/.cra/models.json``（Design §6.2 #2 / D7）。
+
+    只在"本工具尚无任何供应商"时探测前作配置的存在性，用户显式同意才导入；导入只读取
+    前作文件的供应商名称、接入点、模型清单与 key（条目结构两者同构），**不修改前作文件**。
+    导入前先按本项目的校验规则整表校验：前作配置与本工具冲突（如同名供应商）时给可读
+    原因并保持原状，不产生半导入状态。
+    """
+    if session.providers():
+        return
+    data = config_mod.load_legacy_config()
+    if data is None:
+        return
+    entries = config_mod.importable_providers(data)
+    if not entries:
+        return
+    _say(f"检测到前作配置：{config_mod.legacy_config_path()}（{len(entries)} 个供应商）")
+    answer = _ask("是否导入到本工具？（y/N；只读取前作文件，不修改它）")
+    if answer is None or answer.lower() not in ("y", "yes"):
+        _say("已跳过导入。")
+        return
+    candidate = list(entries)
+    default = data.get("default")
+    imported_default = ""
+    if isinstance(default, str) and "/" in default:
+        provider_name, _, model_name = default.partition("/")
+        if any(
+            item["name"] == provider_name and model_name in item["models"] for item in candidate
+        ):
+            imported_default = default
+    probe = {"providers": [*session.providers(), *candidate]}
+    if imported_default:
+        probe["default"] = imported_default
+    try:
+        config_mod.validate_config(probe)
+    except config_mod.ConfigError as exc:
+        _say_error(f"导入失败：前作配置不符合本工具的配置规则 — {exc}")
+        return
+    session.data["providers"] = probe["providers"]
+    if imported_default:
+        session.data["default"] = imported_default
+    session.save()
+    _say(f"已导入 {len(candidate)} 个供应商。")
+    if not imported_default:
+        _say(
+            "提示：前作的默认模型未一并导入（引用的供应商或模型不在清单内），可用菜单 4) 设置默认模型。"
+        )
+
+
 def _run_config_interactive() -> int:
     """``crw config``：交互式配置（增删供应商 / 模型、设默认、改 key）。"""
     try:
@@ -1013,6 +1185,7 @@ def _run_config_interactive() -> int:
     session = _ConfigSession(data)
     _say(f"crw 配置（{config_mod.config_path()}）")
     _print_providers(data)
+    _maybe_import_legacy_config(session)
     while True:
         _say(
             "\n菜单：1) 添加/更新供应商  2) 删除供应商  3) 管理供应商模型"

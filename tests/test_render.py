@@ -81,15 +81,32 @@ def test_node_end_renders_a_stage_line_on_stderr() -> None:
     assert out.getvalue() == ""
 
 
-def test_node_start_and_engine_end_stay_silent() -> None:
-    """M1 简版：阶段标题由结束事件给出；收尾结论由命令面用 RunResult 渲染。"""
+def test_node_start_renders_a_stage_banner_and_engine_end_stays_silent() -> None:
+    """阶段面板：节点开始即打一条横幅（Agent 切换可辨）；收尾结论由命令面用 RunResult 渲染。"""
     renderer, out, err = make_renderer()
 
     renderer.on_event({"node": "review", "event": "start", "iteration": 1})
     renderer.on_event({"node": "engine", "event": "end", "detail": "success"})
 
+    assert "── [审查] 第 1 轮 " in err.getvalue()
     assert out.getvalue() == ""
-    assert err.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("node", "iteration", "needle"),
+    [
+        ("encode", 1, "[编码] 生成初始代码"),
+        ("fix", 2, "[修复] 第 2 轮"),
+        ("review_correctness", 1, "[审查·正确性] 第 1 轮"),
+        ("merge_reviews", 1, "[汇合] 第 1 轮：合并双视角结论"),
+    ],
+)
+def test_stage_banner_labels_every_agent(node: str, iteration: int, needle: str) -> None:
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": node, "event": "start", "iteration": iteration})
+
+    assert needle in err.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -143,7 +160,7 @@ def test_fix_dispositions_go_to_stdout() -> None:
         findings=[finding()],
     )
 
-    assert "【修复】f-1 → skipped：需业务语义判断" in out.getvalue()
+    assert "f-1 → 未采纳：需业务语义判断" in out.getvalue()
 
 
 # ---- 收尾结论 ----
@@ -345,7 +362,7 @@ def test_detail_renders_summary_timeline_rounds_and_artifacts(tmp_path: Path) ->
     assert "上限 3（来源：命令行）" in text
     assert "时间线：" in text and "第 1 轮（code_v1.py）：1 严重" in text
     assert "逐轮审查：" in text
-    assert "← 处置：fixed" in text
+    assert "← 处置：已修复" in text
     assert "产物路径：" in text and "report.md" in text
 
 
@@ -611,3 +628,323 @@ def test_streamed_text_ending_with_newline_keeps_a_single_newline() -> None:
     renderer.on_event({"node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮：干净"})
 
     assert err.getvalue() == "整段正文\n[审查] 第 1 轮：干净\n"
+
+
+# ---- M3：围栏抑制 / 分级着色 / 阶段排版 ----
+
+
+def test_streamed_code_fence_is_not_dumped_to_the_terminal() -> None:
+    """产出的代码不进终端（只留一行形状摘要）：生产代码整份回显会刷屏。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": "encode", "event": "start", "iteration": 1})
+    renderer.on_delta("encode", "实现说明。\n\n```python\n")
+    renderer.on_delta("encode", "print('这一行不该出现在终端')\n" * 3)
+    renderer.on_delta("encode", "```\n")
+    renderer.on_event(
+        {"node": "encode", "event": "end", "iteration": 1, "detail": "生成 code_v1.py"}
+    )
+
+    text = err.getvalue()
+    assert "不该出现在终端" not in text
+    assert "  ⋯ 已收到代码块（3 行，内容不在此显示）" in text
+    assert "实现说明。" in text
+
+
+def test_streamed_json_fence_is_not_dumped_to_the_terminal() -> None:
+    renderer, _, err = make_renderer()
+
+    renderer.on_delta("review", "我先读了文件。\n")
+    renderer.on_delta(
+        "review", '```json\n{"findings": [{"severity": "严重", "issue": "除零"}]}\n```\n'
+    )
+
+    text = err.getvalue()
+    assert "findings" not in text
+    assert "  ⋯ 已收到 JSON 结论（1 行，内容不在此显示）" in text
+    assert "我先读了文件。" in text
+
+
+def test_fence_marker_split_across_deltas_is_still_suppressed() -> None:
+    """标记可能被切在任意位置（`` ` `` / ` `` ` / info 串分片）：仍不得漏出代码。"""
+    renderer, _, err = make_renderer()
+
+    for piece in ("说明\n", "`", "``", "python", "\n", "SECRET = 1\n", "`", "``", "`\n", "结束。"):
+        renderer.on_delta("encode", piece)
+    renderer.on_event(
+        {"node": "encode", "event": "end", "iteration": 1, "detail": "生成 code_v1.py"}
+    )
+
+    text = err.getvalue()
+    assert "SECRET" not in text
+    assert "说明" in text and "结束。" in text
+
+
+def test_code_fence_is_suppressed_in_no_stream_mode_too() -> None:
+    renderer, _, err = make_renderer()
+    renderer.stream = False
+
+    renderer.on_delta("fix", "修复说明。\n```python\nHIDDEN = 1\n```\n")
+    renderer.on_event({"node": "fix", "event": "end", "iteration": 1, "detail": "修复 1 项"})
+
+    text = err.getvalue()
+    assert "HIDDEN" not in text
+    assert "修复说明。" in text
+    assert "已收到代码块（1 行，内容不在此显示）" in text
+
+
+def test_unterminated_fence_still_gets_a_summary_line() -> None:
+    """围栏未闭合（模型截断 / 乱输出）：同样不泄漏内容（完整性由契约层判定，不由渲染层断言）。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_delta("encode", "```python\nprint(1)\n")
+    renderer.on_event(
+        {"node": "encode", "event": "end", "iteration": 1, "detail": "生成 code_v1.py"}
+    )
+
+    text = err.getvalue()
+    assert "print(1)" not in text
+    assert "已收到代码块（1 行，内容不在此显示）" in text
+
+
+def test_prose_is_streamed_incrementally() -> None:
+    """围栏抑制不得退化成整段缓存：普通正文仍逐片写出。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_delta("review", "第一片")
+    first = err.getvalue()
+    renderer.on_delta("review", "，第二片")
+
+    assert first == "第一片"
+    assert err.getvalue() == "第一片，第二片"
+
+
+def test_severity_and_stage_are_colored_when_enabled() -> None:
+    out, err = StringIO(), StringIO()
+    renderer = render.RunRenderer(out=out, err=err, color=True)
+
+    renderer.on_event({"node": "review", "event": "start", "iteration": 1})
+    renderer.on_review(
+        round_number=1,
+        file_name="code_v1.py",
+        findings=[finding(), finding("建议", id="f-2", location="code_v1.py:9")],
+        summary="",
+    )
+
+    assert "\x1b[" in err.getvalue()  # 阶段横幅着色
+    assert "\x1b[1;31m" in out.getvalue()  # 【严重】红
+    assert "\x1b[2m" in out.getvalue()  # 【建议】暗
+
+
+def test_colors_are_off_by_default_for_non_tty_streams() -> None:
+    renderer, out, err = make_renderer()
+
+    renderer.on_event({"node": "review", "event": "start", "iteration": 1})
+    renderer.on_review(round_number=1, file_name="code_v1.py", findings=[finding()], summary="")
+
+    assert "\x1b[" not in err.getvalue()
+    assert "\x1b[" not in out.getvalue()
+
+
+def test_stage_banner_is_separated_by_a_blank_line() -> None:
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": "encode", "event": "start", "iteration": 1})
+
+    assert err.getvalue().startswith("\n── [编码]")
+
+
+def test_parallel_view_listing_shows_a_counts_line() -> None:
+    renderer, out, _ = make_renderer()
+
+    renderer.on_review(
+        round_number=1,
+        file_name="code_v1.py",
+        findings=[finding()],
+        summary="",
+        view="正确性",
+    )
+
+    assert "· 正确性视角：1 严重 / 0 一般 / 0 建议" in out.getvalue()
+    assert "【严重】" not in out.getvalue()  # 分支只报规模，合并结果才展开逐条
+
+
+def test_degraded_detail_renders_log_summary_and_artifacts(tmp_path: Path) -> None:
+    """state.json 损坏：降级展示（日志时间线 + 产物清单 + 逐轮审查），并说明数据来源。"""
+    detail = records.RunDetail(
+        summary=summary(status=state_mod.STATUS_SUCCESS),
+        state={},
+        events=(
+            {"ts": "2026-10-12T10:00:00+08:00", "node": "review", "event": "start", "iteration": 1},
+            {
+                "ts": "2026-10-12T10:00:04+08:00",
+                "node": "review",
+                "event": "tool",
+                "iteration": 1,
+                "detail": 'read_file({"path": "code_v1.py"})',
+            },
+            {
+                "ts": "2026-10-12T10:00:09+08:00",
+                "node": "review",
+                "event": "end",
+                "iteration": 1,
+                "detail": "第 1 轮（code_v1.py）：1 严重 / 0 一般 / 0 建议",
+            },
+            {
+                "ts": "2026-10-12T10:00:09+08:00",
+                "node": "engine",
+                "event": "end",
+                "detail": "success",
+            },
+        ),
+        rounds=(
+            records.RoundReport(
+                round_number=1, file_name="code_v1.py", review={"findings": [finding()]}
+            ),
+        ),
+        artifacts=(tmp_path / "state.json",),
+        degraded=True,
+        degraded_reason="state.json 不可读或不是 JSON 对象（摘要取自 log.jsonl 与产物清单）",
+    )
+    out = StringIO()
+
+    render.render_detail(detail, out=out)
+
+    text = out.getvalue()
+    assert "（记录降级展示）" in text
+    assert "[来源] 以下摘要取自 log.jsonl 与产物清单" in text
+    assert "2026-10-12T10:00:00+08:00 → 2026-10-12T10:00:09+08:00（取自日志）" in text
+    assert "9000" in text  # 由 start / end 事件时间戳配对的耗时
+    assert "read_file(" in text  # 工具调用明细
+    assert "第 1 轮（code_v1.py）：1 严重" in text
+    assert "state.json" in text
+
+
+def test_detail_marks_not_converged_rounds(tmp_path: Path) -> None:
+    """未收敛标注（Design §4.4）：与上一轮问题集合一致时在详情与报告里如实标出。"""
+    detail = records.RunDetail(
+        summary=summary(status=state_mod.STATUS_RESIDUAL),
+        state={
+            "run_id": "r-20261012-0001",
+            "input": {"kind": "requirement", "requirement": "写一个计算器"},
+            "status": state_mod.STATUS_RESIDUAL,
+            "history": [],
+        },
+        events=(),
+        rounds=(
+            records.RoundReport(
+                round_number=1, file_name="code_v1.py", review={"findings": [finding()]}
+            ),
+            records.RoundReport(
+                round_number=2, file_name="code_v2.py", review={"findings": [finding()]}
+            ),
+        ),
+        artifacts=(),
+    )
+    out = StringIO()
+
+    render.render_detail(detail, out=out)
+
+    assert "未收敛：本轮问题集合与上一轮完全相同" in out.getvalue()
+
+
+def test_parallel_branches_do_not_interleave_their_prose() -> None:
+    """并行分支同时到达的正文按节点缓存、各在自己的阶段结束时整块输出（不逐句交错）。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": "review_correctness", "event": "start", "iteration": 1})
+    renderer.on_event({"node": "review_security", "event": "start", "iteration": 1})
+    renderer.on_delta("review_correctness", "正确性甲。")
+    renderer.on_delta("review_security", "安全性甲。")
+    renderer.on_delta("review_correctness", "正确性乙。")
+    renderer.on_delta("review_security", "安全性乙。")
+    renderer.on_event(
+        {"node": "review_security", "event": "end", "iteration": 1, "detail": "安全性：0 / 0 / 0"}
+    )
+    renderer.on_event(
+        {
+            "node": "review_correctness",
+            "event": "end",
+            "iteration": 1,
+            "detail": "正确性：1 / 0 / 0",
+        }
+    )
+
+    text = err.getvalue()
+    assert "正确性甲。正确性乙。" in text
+    assert "安全性甲。安全性乙。" in text
+    # 块的先后与阶段结束顺序一致（先前结束的先整块输出）
+    assert text.index("安全性甲。安全性乙。") < text.index("正确性甲。正确性乙。")
+
+
+def test_fence_closer_without_a_trailing_newline_is_recognized() -> None:
+    """末行无换行是常态：闭合标记照样算闭合（否则每次收尾都错报"未闭合"）。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_delta("encode", "```python\nprint(1)\n```")
+    renderer.on_event(
+        {"node": "encode", "event": "end", "iteration": 1, "detail": "生成 code_v1.py"}
+    )
+
+    text = err.getvalue()
+    assert "print(1)" not in text
+    assert "已收到代码块（1 行，内容不在此显示）" in text
+    assert "未闭合" not in text
+
+
+class _BrokenStream(StringIO):
+    """写入即抛 OSError 的流（模拟下游关闭管道：``crw show | head``）。"""
+
+    def write(self, text: str) -> int:  # type: ignore[override]
+        raise OSError(22, "Invalid argument")
+
+
+def test_render_detail_survives_a_closed_output_stream() -> None:
+    """展示层故障不改变命令结论（Design §4.6 的同口径）：管道被下游关掉不报成运行失败。"""
+    detail = records.RunDetail(
+        summary=summary(),
+        state={"run_id": "r-20261012-0001", "status": state_mod.STATUS_SUCCESS, "history": []},
+        events=(),
+        rounds=(),
+        artifacts=(),
+    )
+
+    render.render_detail(detail, out=_BrokenStream())  # 不抛出
+    render.render_result(
+        result_for(state_mod.STATUS_SUCCESS, exit_code=0), out=_BrokenStream(), err=_BrokenStream()
+    )
+    render.render_runs([summary()], out=_BrokenStream())
+
+
+def test_render_does_not_swallow_programming_errors() -> None:
+    """渲染器自身的缺陷（非 OSError）照常暴露，不被"管道容错"掩盖。"""
+
+    class _Boom(StringIO):
+        def write(self, text: str) -> int:  # type: ignore[override]
+            raise RuntimeError("渲染器缺陷")
+
+    with pytest.raises(RuntimeError):
+        render.render_runs([summary()], out=_Boom())
+
+
+def test_branch_prose_is_buffered_even_before_the_second_stage_starts() -> None:
+    """分支节点一律按节点缓存（不依赖"已开启阶段数"的时序启发式）：只开一个阶段也不抢先流出去。"""
+    renderer, _, err = make_renderer()
+
+    renderer.on_event({"node": "review_correctness", "event": "start", "iteration": 1})
+    renderer.on_delta("review_correctness", "甲句。")
+    first = err.getvalue()
+    renderer.on_event(
+        {"node": "review_correctness", "event": "end", "iteration": 1, "detail": "正确性：0/0/0"}
+    )
+
+    assert "甲句。" not in first  # 阶段结束前不写出（否则并行时与另一分支交错）
+    assert "甲句。" in err.getvalue()
+
+
+def test_fix_status_labels_cover_the_contract_enum() -> None:
+    """处置标签表的键集必须与契约层的状态枚举一致（新增状态时靠本用例拦住漂移）。"""
+    from crw.workflow import contracts as contracts_mod
+
+    assert set(render._STATUS_LABEL) == set(contracts_mod.FIX_STATUSES)
+    assert set(render._SEVERITY_STYLE) == set(contracts_mod.SEVERITIES)

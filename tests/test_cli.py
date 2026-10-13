@@ -307,22 +307,13 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
     assert excinfo.value.code == 2
 
 
-@pytest.mark.parametrize(
-    ("argv", "command"),
-    [
-        (["resume", "r-20261011-1a2b"], "resume"),
-        (["graph"], "graph"),
-        (["uninstall"], "uninstall"),
-    ],
-)
-def test_commands_still_placeholders_report_not_implemented(
-    argv: list[str], command: str, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """M2 已实现 run / runs / show / review / config；resume / graph / uninstall 待 M3。"""
-    assert main(argv) == 2
+def test_resume_of_an_unknown_run_reports_readably(capsys: pytest.CaptureFixture[str]) -> None:
+    """M3：resume 已落地；记录不存在时给可读原因并退出 2（Design §4.4）。"""
+    assert main(["resume", "r-20261011-1a2b"]) == 2
+
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert command in captured.err
+    assert "运行记录不存在" in captured.err
 
 
 def test_run_without_configuration_points_to_crw_config(capsys: pytest.CaptureFixture[str]) -> None:
@@ -358,7 +349,7 @@ def test_run_with_requirement_prints_conclusion_and_persists_record(
     assert "运行记录" in captured.out
     assert "[编码]" in captured.err  # 过程叙述走 stderr（Design §8.4）
     assert "[审查]" in captured.err
-    assert "[审查] 工具：" in captured.err  # 工具调用过程可见
+    assert "· 工具：" in captured.err  # 工具调用过程可见（阶段面板下的打点行）
 
     (summary,) = records.list_runs()
     assert summary.status == state_mod.STATUS_SUCCESS
@@ -402,7 +393,7 @@ def test_run_with_syntax_fixture_reports_the_fix_cycle(
 
     captured = capsys.readouterr()
     assert "【严重】" in captured.out  # findings 清单走 stdout
-    assert "【修复】f-1 → fixed" in captured.out
+    assert "f-1 → 已修复" in captured.out
     assert "完成：干净通过（共 2 轮审查 / 1 轮修复）" in captured.out
     assert "第 1 轮（code_v1.py）：1 严重" in captured.err
 
@@ -476,7 +467,7 @@ def test_run_streams_model_text_and_no_stream_buffers_it(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--no-stream`` 不丢内容：两种模式都完整输出模型正文（Design §8.1）。
+    """``--no-stream`` 不丢内容：两种模式都输出模型正文（围栏内容按 §6.2 #6 抑制）。
 
     流式与缓存的**差别**（立即写出 / 阶段结束整体写出）由 tests/test_render.py 的渲染器用例
     锁定——在整段 stderr 文本上两者的行序相同，只有写入时机不同，这里只保证内容可读。
@@ -492,9 +483,10 @@ def test_run_streams_model_text_and_no_stream_buffers_it(
     assert main(["run", "写一个计算器", "--no-stream"]) == 0
     buffered = capsys.readouterr().err
 
-    assert "实现说明" in buffered  # 内容不丢
-    assert "```json" in buffered  # 审查契约也完整输出（不是只留摘要）
-    assert "[编码] 生成 code_v1.py" in buffered  # 阶段标题在正文之后（阶段收尾时才落这一行）
+    assert "实现说明" in buffered  # 正文内容不丢
+    assert "已收到代码块" in buffered  # 代码围栏只留形状摘要（不刷屏）
+    assert "已收到 JSON 结论" in buffered  # 审查契约同理：校验后按分级清单呈现
+    assert "[编码] 生成 code_v1.py" in buffered  # 阶段摘要行在正文之后（阶段收尾时才落这一行）
 
 
 def test_run_out_copies_final_code_and_report(
@@ -617,7 +609,7 @@ def test_show_renders_the_record(
     assert f"── 运行 {summary.run_id}" in text
     assert "[状态] 干净通过" in text
     assert "时间线：" in text and "逐轮审查：" in text
-    assert "【严重】code_v1.py:7" in text and "← 处置：fixed" in text
+    assert "【严重】code_v1.py:7" in text and "← 处置：已修复" in text
     assert "report.md" in text
 
 

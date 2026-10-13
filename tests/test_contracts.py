@@ -432,3 +432,64 @@ def test_merge_review_reports_single_and_multiple() -> None:
     assert merged["summary"] == "a.py：干净。；b.py：也可接受。"
 
     assert contracts.merge_review_reports([])["files"] == []
+
+
+# ---- M3：并行双视角的汇合规则（Design §12.2）----
+
+
+def test_merge_findings_dedupes_and_keeps_the_more_severe_one() -> None:
+    """同一 (location, issue) 只留一条，取较严重者并记下来源视角。"""
+    correctness = [
+        finding("严重", issue="除零"),
+        finding("建议", location="code_v1.py:9", issue="命名"),
+    ]
+    security = [
+        finding("建议", issue="除零"),
+        finding("严重", location="code_v1.py:12", issue="注入"),
+    ]
+
+    merged = contracts.merge_findings([("正确性", correctness), ("安全性", security)])
+
+    assert [item["id"] for item in merged] == ["f-1", "f-2", "f-3"]
+    shared = merged[0]
+    assert shared["issue"] == "除零" and shared["severity"] == "严重"
+    assert shared["views"] == ["正确性", "安全性"]
+    assert merged[1]["views"] == ["正确性"] and merged[1]["severity"] == "建议"
+    assert merged[2]["views"] == ["安全性"] and merged[2]["severity"] == "严重"
+
+
+def test_merge_findings_prefers_the_more_severe_suggestion_and_flag() -> None:
+    """取较严重者时连同它的建议与 uncertain 标记一起采纳（结论与依据保持一致）。"""
+    merged = contracts.merge_findings(
+        [
+            ("正确性", [finding("建议", suggestion="补个注释", uncertain=False)]),
+            ("安全性", [finding("严重", suggestion="加长度上限", uncertain=True)]),
+        ]
+    )
+
+    assert merged[0]["severity"] == "严重"
+    assert merged[0]["suggestion"] == "加长度上限"
+    assert merged[0]["uncertain"] is True
+
+
+def test_merge_findings_keeps_first_seen_order_and_is_empty_safe() -> None:
+    assert contracts.merge_findings([]) == []
+    assert contracts.merge_findings([("正确性", []), ("安全性", [])]) == []
+    merged = contracts.merge_findings([("正确性", [finding()]), ("安全性", [])])
+    assert len(merged) == 1 and merged[0]["id"] == "f-1"
+
+
+def test_finding_keys_ignores_non_mapping_entries() -> None:
+    """未收敛判定读的是展示数据：残缺条目跳过，不因一条坏数据整体失败。"""
+    keys = contracts.finding_keys([finding(), "坏数据", None])  # type: ignore[list-item]
+
+    assert keys == frozenset({("code_v1.py:3", "示例问题")})
+
+
+def test_merge_findings_normalizes_unknown_severity() -> None:
+    """枚举外的 severity（手改过的记录）归一到【建议】：不得留在结果里"看不见地"绕过干净判定。"""
+    merged = contracts.merge_findings([("正确性", [finding("critical")])])
+
+    assert merged[0]["severity"] == contracts.ADVICE
+    assert contracts.judge_clean(merged) is True  # 归一后判定看得见它（【建议】不阻塞）
+    assert contracts.severity_counts(merged)[contracts.ADVICE] == 1

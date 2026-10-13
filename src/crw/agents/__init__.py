@@ -33,7 +33,15 @@ from .runtime import MAX_TOOL_ROUNDS, AgentRuntime, DeltaSink, EventSink, NodeFn
 NODE_TOOL_NAMES: Mapping[str, tuple[str, ...]] = {
     "encode": (),
     "review": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
+    "review_correctness": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
+    "review_security": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
     "fix": (READ_FILE_TOOL, EXEC_TOOL_NAME),
+}
+
+#: 并行双视角审查的节点名 → 视角（与 workflow/graph.py 的节点名映射由测试锁定一致性）
+PARALLEL_REVIEW_NODES: Mapping[str, str] = {
+    "review_correctness": "correctness",
+    "review_security": "security",
 }
 
 
@@ -67,7 +75,11 @@ def build_runtime(
 
 
 def build_nodes(
-    runtime: AgentRuntime, *, roots: Sequence[Path], no_exec: bool = False
+    runtime: AgentRuntime,
+    *,
+    roots: Sequence[Path],
+    no_exec: bool = False,
+    parallel_review: bool = False,
 ) -> dict[str, NodeFn]:
     """按节点装配（提示词 + 运行时 + 工具），返回 ``节点名 → 节点函数`` 的完整装配表。
 
@@ -75,16 +87,29 @@ def build_nodes(
         runtime: 单任务运行时（由引擎装配，带事件与增量回调）。
         roots: 上下文根（工作流运行 = 运行工作区）。
         no_exec: 关闭执行（工具注册表不注册 ``run_python``）。
+        parallel_review: 并行双视角形态：两个审查节点共用同一 runtime 与工具集，只有
+            系统提示词与任务说明按视角分派；汇合节点由 workflow 层补齐（本层不 import 上层）。
+
+    Returns:
+        该形态下除汇合节点以外的全部节点；既有的单视角键（``review``）在并行形态下不出现。
     """
+    names = ["encode", "review", "fix"]
+    if parallel_review:
+        names = ["encode", *PARALLEL_REVIEW_NODES, "fix"]
     registries = {
-        name: build_registry(roots, names=names, allow_exec=not no_exec)
-        for name, names in NODE_TOOL_NAMES.items()
+        name: build_registry(roots, names=NODE_TOOL_NAMES[name], allow_exec=not no_exec)
+        for name in names
     }
-    return {
+    nodes: dict[str, NodeFn] = {
         "encode": build_encode_node(runtime, registries["encode"]),
-        "review": build_review_node(runtime, registries["review"]),
         "fix": build_fix_node(runtime, registries["fix"]),
     }
+    if parallel_review:
+        for name, view in PARALLEL_REVIEW_NODES.items():
+            nodes[name] = build_review_node(runtime, registries[name], name=name, view=view)
+    else:
+        nodes["review"] = build_review_node(runtime, registries["review"])
+    return nodes
 
 
 def build_review_runtime(
@@ -108,6 +133,7 @@ REVIEW_EVIDENCE_KEY = EVIDENCE_KEY
 __all__ = [
     "ALL_TOOL_NAMES",
     "NODE_TOOL_NAMES",
+    "PARALLEL_REVIEW_NODES",
     "REVIEW_EVIDENCE_KEY",
     "AgentRuntime",
     "DeltaSink",

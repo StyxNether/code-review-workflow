@@ -128,6 +128,28 @@ class TestRuntimeBasics:
 
         assert runtime.model_label() == "ScriptedChatModel"
 
+    def test_first_attempt_keeps_the_prompt_and_the_tools(self, workspace: Path) -> None:
+        """首次尝试：提示词原样、工具照给。
+
+        回归防线：曾经把"上一轮不可用 / 不要再调用工具"无条件拼在首次消息末尾，模型照做后
+        放弃 read_file / run_python，凭清单重写整份代码（试用实测）。
+        """
+        model = fakes.ScriptedChatModel(responses=[fakes.ai_text("结论。")])
+        runtime = make_runtime(model)
+
+        runtime.run(
+            node="fix",
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt="修复这个问题",
+            registry=review_registry(workspace),
+        )
+
+        prompt = last_prompt(model)
+        assert "不要再调用工具" not in prompt
+        assert "上一轮回答不可用" not in prompt
+        assert prompt == "修复这个问题"
+        assert model.bound_tools[0]  # 首次尝试带着工具
+
     def test_empty_answer_is_retried_once(self, workspace: Path) -> None:
         """空回答按协议层偶发故障处理：原样重发一次（实测多出现在护栏去工具后的收官调用）。"""
         events: list[dict[str, Any]] = []
@@ -582,3 +604,11 @@ def test_task_prompt_json_examples_are_parseable() -> None:
     inline_examples = re.findall(r"\{.*\}", inline, flags=re.DOTALL)
     assert inline_examples
     json.loads(inline_examples[0])
+
+
+def test_unknown_review_view_is_rejected() -> None:
+    """拼错的视角显式报错：静默退回基座提示词会让两个审查者都失去职责边界且无人发现。"""
+    from crw.agents import prompts as prompts_mod
+
+    with pytest.raises(ValueError, match="未知的审查视角"):
+        prompts_mod.reviewer_system_prompt("correctnes")

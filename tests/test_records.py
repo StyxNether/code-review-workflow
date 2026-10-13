@@ -351,12 +351,37 @@ def test_load_detail_rejects_unknown_or_invalid_ids() -> None:
         records.load_detail("../etc/passwd")
 
 
-def test_load_detail_reports_corrupt_state_readably() -> None:
+def test_load_detail_degrades_when_state_is_corrupt() -> None:
+    """state.json 损坏 → 降级展示（Design §8.2）：给日志与产物，不抛异常、不假装完好。"""
     run_path = records.create_run_dir("r-20261012-0001")
     (run_path / "state.json").write_text("{损坏", encoding="utf-8")
+    records.append_log_event(
+        run_path / "log.jsonl", {"ts": "t1", "node": "review", "event": "start", "iteration": 1}
+    )
+    records.append_log_event(
+        run_path / "log.jsonl",
+        {"ts": "t2", "node": "review", "event": "end", "iteration": 1, "detail": "第 1 轮"},
+    )
+    (run_path / "workspace" / "review_1.json").write_text(
+        json.dumps({"file": "code_v1.py", "findings": []}), encoding="utf-8"
+    )
 
-    with pytest.raises(records.RunRecordError, match="运行记录损坏"):
-        records.load_detail("r-20261012-0001")
+    detail = records.load_detail("r-20261012-0001")
+
+    assert detail.degraded is True
+    assert detail.state == {}
+    assert "state.json" in detail.degraded_reason
+    assert [event["event"] for event in detail.events] == ["start", "end"]
+    assert [item.round_number for item in detail.rounds] == [1]
+
+
+def test_load_detail_is_not_degraded_for_a_healthy_record() -> None:
+    write_run(workspace={"code_v1.py": "print(1)\n"})
+
+    detail = records.load_detail("r-20261012-0001")
+
+    assert detail.degraded is False
+    assert detail.degraded_reason == ""
 
 
 # ---- 选择 ----

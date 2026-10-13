@@ -85,6 +85,7 @@ src/crw/
     exec_py.py     # run_python（限时强杀 / 截断 / 环境净化）
   llm.py           # ChatOpenAI 封装（重试映射 / 异常翻译）
   config.py        # 供应商配置（models.json / 预设 / 环境变量 / 连通自检）
+  uninstall.py     # 卸载：分级确认后的清理（程序 / 垫片 → PATH → 登记的环境变量 → 用户数据）
 tests/
   fixtures/buggy_samples/   # 预埋样例：syntax_error.py、divide_by_zero.py（供演示与回归）
 ```
@@ -149,10 +150,12 @@ flowchart TD
 | `max_iterations` | int | 修复轮次上限（默认 3；取值与来源见 §4.4） | engine |
 | `max_iterations_source` | str | 轮次取值来源：cli / requirement / config / parent / default | engine |
 | `rounds_mode` | str | 轮次语义：up-to（干净即早退）/ exact（跑满指定轮次） | engine |
+| `parallel_review` | bool | 是否并行双视角审查（`--parallel-review`；汇合形态见 §12.2） | engine |
 | `session_id` | str? | 所属会话号（会话轮次写入；`crw run` 一次性运行为空） | engine（初始化） |
 | `round_index` | int? | 会话内轮次序号（从 1 起；非会话运行为空） | engine（初始化） |
 | `current_code` | str | 最新代码文件路径 | encode / fix |
-| `findings` | list[Finding] | 最新一轮审查结论 | review |
+| `findings` | list[Finding] | 最新一轮审查结论 | review / 汇合 |
+| `findings_correctness` / `findings_security` | list[Finding] | 并行双视角的两个分支结论（**独立 key**，避免同超级步多写者冲突）；汇合后由 `findings` 承载权威结论，故不持久化（不进 state.json） | review 分支 |
 | `clean` | bool | 最新一轮是否干净（engine 依契约判定；`--strict` 影响判据） | engine |
 | `strict` | bool | 本次运行是否启用加严判定（`--strict`） | engine |
 | `history` | list[NodeEvent] | 节点执行事件（node、审查/修复轮次、started_at、duration_ms、摘要、产物） | engine（追加） |
@@ -173,12 +176,12 @@ Finding：
 ### 4.4 分支与循环语义
 
 - **干净判定**：本轮 findings 中【严重】数为 0（`--strict`：严重与一般均为 0）。
-- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为硬闸，防止误填大值造成无界循环与无界调用费用（默认 3、封顶 10 时最坏约 22 次模型调用）。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1；`--strict` 下残留可能全部由【一般】构成，故报告与终端文案统一写"阻塞问题"，"残留严重数"列仍只数【严重】）。engine 在图调用处显式设置 `recursion_limit = 2 × max_iter + 8` 作崩溃护栏（公式按串行默认图；扩展 / 并行时须按节点与边数复算，见 §12.2），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 报告标注"未收敛"，但不提前中止（标注落地排期 M3）。
+- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为硬闸，防止误填大值造成无界循环与无界调用费用（默认 3、封顶 10 时最坏约 22 次模型调用）。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1；`--strict` 下残留可能全部由【一般】构成，故报告与终端文案统一写"阻塞问题"，"残留严重数"列仍只数【严重】）。engine 在图调用处显式设置 `recursion_limit` 作崩溃护栏（**默认串行图**为 `2 × max_iter + 8`，并行双视角形态按 `3 × max_iter + 8` 复算，见 §12.2——护栏是崩溃保护，不是预算），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 阶段摘要、report.md 与 `crw show` 均标注"未收敛"，但**不提前中止**（标注已落地）。
 - **轮次模式**：`up-to`（默认）= 至多 n 轮修复、任一复审干净即早退（首审干净则不进入修复）；`exact` = 固定跑满 n 轮修复 + n+1 次审查，即使中途干净也继续（"精益求精"场景）。两种模式**结尾恒为一次审查**，因此不存在"已修复但未审查"的收尾状态；`exact` 下若某轮修复与上版逐字节相同，按 §4.2 标注"本轮未产生改动"后继续。
 - **轮次取值来源与优先级**：命令行 `--max-iter`/`--rounds-mode`（显式）> 本次用户消息的结构化提取值（会话模式，§5.4）> 配置默认（`~/.crw/settings.json`，§8.3）> 内置 3 / `up-to`；全部受硬上限约束，来源记入 `max_iterations_source`。越界语义分开：**命令行越界 = 参数错误（退出码 2）**；**消息提取值越界 = 夹到上限执行并在报告与时间线标注**（那是意图理解）。
 - **早退**：`up-to` 模式下首轮审查即干净 → 直接收尾，不进入修复。
 - **输入模式**：代码文件输入跳过 encode，其余流程一致。
-- **续跑**：`crw resume <运行号>` 仅当父运行存在 `current_code` 时可用（否则可读错误，退出码 2）；把父运行最新代码复制为新运行 `workspace/code_v1.py`（`input.kind=file`），`parent_run_id` 写入状态；`--max-iter`/`--rounds-mode`/`--strict`/`--no-exec` 由本次命令行决定，未显式给出时**继承父运行的轮次设置**（来源标 `parent`），无父设置时退回配置默认；新运行轮次从 `review_round=1`/`fix_rounds=0` 重新计数；报告标注父运行与父残留摘要。
+- **续跑**：`crw resume <运行号>` 仅当父运行存在 `current_code` 时可用（否则可读错误，退出码 2）；把父运行最新代码复制为新运行 `workspace/code_v1.py`（`input.kind=file`），`parent_run_id` 写入状态；`--max-iter`/`--rounds-mode`/`--strict`/`--no-exec` 由本次命令行决定，未显式给出的轮次设置**继承父运行**（来源标 `parent`），无父设置时退回配置默认；父运行的 `--strict` 与审查形态（`--parallel-review`）一并继承——续跑是"接着修"，换判定标准或换审查方式会让结论不可比；`--no-exec` 例外（它不进状态快照，命令面无法区分"显式关闭"与"从未设置"，故按未设置处理）。新运行轮次从 `review_round=1`/`fix_rounds=0` 重新计数；报告标注父运行与父残留摘要。
 
 ### 4.5 运行目录与产物
 
@@ -190,7 +193,9 @@ Finding：
 └── workspace/
     ├── code_v1.py       # 各版本代码（保留全部历史版本）
     ├── code_v2.py
-    ├── review_1.json    # 各轮审查结论（结构化）
+    ├── review_1.json    # 各轮审查结论（结构化；并行双视角时为汇合结果）
+    ├── review_1_correctness.json   # 并行双视角：正确性视角的原始结论
+    ├── review_1_security.json      # 并行双视角：安全性视角的原始结论
     ├── review_2.json
     └── fixes_1.json     # 各轮修复处置（逐条对应 findings id，与 review_N.json 配对）
 ```
@@ -269,6 +274,10 @@ Finding：
 - **校验规则**：`fixes` 覆盖上一轮 findings 的 `id` 全集（缺项 → 带缺失清单重试一次）；`skipped` 须给理由（不成立 / 不采纳）；报告按"问题 ← 处置"对照渲染。该契约与前述 findings 契约共同保证"问题 → 修复"可追溯。
 - **边界**：重复 `finding_id` 取最后一条；未知 id 忽略并在报告标注；`status` 非枚举或 `skipped` 缺理由 → 附错误清单重试一次。
 
+并行双视角审查（§12.2）下的契约不变：两个分支各自产出一份 §5.2 契约对象（落 `review_N_<视角>.json`），
+汇合后的 `review_N.json` 仍是同一 schema（`findings` 为去重合并结果）；每条 finding 多一个附加字段
+`views`（来源视角，如 `["正确性", "安全性"]`），供报告与审计追溯"这条结论是谁提的"。
+
 ### 5.3 设计理由
 
 - 结构化契约让"Agent 间通信"可验证（不是自然语言口头交接）：修复有明确输入、复审可核验修复效果、报告可程序化汇总。
@@ -344,6 +353,7 @@ Finding：
 | D10 | 交互形态：CLI 一次性运行 + 会话模式（`crw chat`）；**不做 Web 界面** | **修订（2026-10-12）** | 原为"不做 chat REPL"；用户 2026-10-12 解除该约束：会话由**三 Agent 之外的编排/路由节点**驱动，三 Agent 工作流保持纯净（D12）。Web 可视化界面仍不纳入（题面列为可选） |
 | D12 | 会话模式：`crw chat` = 编排/路由节点（独立 LLM，单口对话者）+ 调用三 Agent 工作流；三 Agent 记忆各自独立、追加式、随会话长久且可跨进程恢复；轮次语义 up-to/exact，上限由引擎强制；路由不确定时反问用户 | 采纳（2026-10-12） | ①单一对话口是 UX 必需（避免三 Agent 抢话与上下文错乱）；②工作流颗粒度不变——协作 Agent 仍为编码/审查/修复三个，编排节点不产出代码与结论、不计入 Agent 数（题面 2–3 个）；③记忆独立，因为"同一上下文多角色扮演"等于自审自修，评审独立性无从谈起；④追加式记忆对供应商前缀缓存友好（裁剪会打断前缀）；⑤上限与校验在引擎，成本可验证 |
 | D11 | 干净判定默认"无【严重】"，`--strict` 加严；达限以残留清单收尾（退出码 1） | 采纳 | 判据可程序化（退出码语义）；"修不完"如实汇报而非伪装成功 |
+| D13 | 终端呈现口径：模型产出的**代码 / JSON 围栏不进终端**（只留一行形状摘要），结论按分级着色、按 Agent 分阶段面板渲染；并行分支的正文按分支缓冲后整块输出 | 采纳（2026-10-13，M3 试用反馈驱动） | 生产代码整份回显会刷屏，围栏内容是交给系统的结构化载荷而非给人读的正文；多个 Agent 同时说话时必须能一眼分辨谁在说（用户试用反馈 ①②③）。后果：`--no-stream` 与流式的差别收敛为"何时写出"，围栏抑制在两种模式下一致（均有测试锁定） |
 
 ## 8. 接口规格
 
@@ -358,12 +368,13 @@ crw show [<运行号>]                       # 展示运行详情（省略运行
 crw resume <运行号>                       # 续跑（从最新版本新开运行）
 crw review <路径...> | - [选项]            # 单 Agent 审查（不修复；- 读 stdin）
 crw config [test]                         # 供应商配置 / 连通性自检
-crw graph [-o, --out <文件>]              # 导出 mermaid 流程图
+crw graph [-o, --out <文件>] [--parallel-review]   # 导出 mermaid 流程图（默认单视角形态）
 crw uninstall                             # 卸载
 crw --version                             # 版本号
 ```
 
-`crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--out <目录>`、`--model / --provider`、`--no-stream`。
+`crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--parallel-review`、`--out <目录>`、`--model / --provider`、`--no-stream`。
+`--parallel-review` = 并行双视角审查（正确性 + 安全性同轮审查、汇合去重，§12.2）；显式开关，默认关闭——开启后每轮审查的调用量约翻倍。`crw graph --parallel-review` 导出该形态的图。
 `crw chat` 选项：`-f, --file <文件>`（以既有代码开始会话）、`--resume <会话号>`、`--max-iter`、`--rounds-mode`、`--strict`、`--no-exec`、`--model / --provider`、`--no-stream`。
 `crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`。
 
@@ -375,7 +386,8 @@ crw --version                             # 版本号
   中断语义：**Ctrl+C 一次 = 中断本轮**（本轮落盘 `status=interrupted`、回提示符、会话保留），**两次 = 退出会话**；`/exit` 与 EOF 为正常退出；
   每轮结束汇报含结构化 `next_action`（done / review_again / fix_again）与"轮次使用情况"；`--resume <会话号>` 恢复记忆、代码版本与轮次设置。
 - `crw runs` 输出列：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数。
-- `crw show` 输出：运行摘要 / 时间线 / 逐轮 findings 表 / 产物路径 /（失败或中断时）错误与"已中断"标注（陈旧 running 标注"可能已中断"）；摘要数据取自 `state.json`（损坏时降级展示 `log.jsonl` 摘要），逐轮表数据来源 = `workspace/review_*.json`。
+- `crw show` 输出：运行摘要 / 时间线（含每节点的工具调用数与工具调用明细）/ 逐轮 findings 表（含"未收敛"标注与逐条处置）/ 产物路径 /（失败或中断时）错误与"已中断"标注（陈旧 running 标注"可能已中断"）；摘要数据取自 `state.json`（损坏时**降级展示** `log.jsonl` 摘要 + 产物清单，并在 stdout 与 stderr 各给一行说明），逐轮表数据来源 = `workspace/review_*.json`。
+- `crw show` 的"记录损坏"口径（定稿）：**降级展示照给，退出码照实为 2**——人读仍拿得到可用信息，脚本化消费能察觉异常。
 - `crw graph`：输出规范化 mermaid（`__start__`/END 映射为可读标签、条件边标签中文映射）；与实现的一致性核对以节点/边集合快照测试为准（§4.1 为概念图）。
 - `crw uninstall`：分级确认（程序 / 垫片 → PATH 条目 → 本程序登记的环境变量 → 用户数据目录），确认前零删除；未以 `uv tool` 安装时跳过程序清理并说明。
 - `--no-exec` 实施闸口唯一：工具注册表组装层不注册 `run_python`（不做提示词层假设）；fixer 在 `--no-exec` 下仅静态修复。
@@ -388,6 +400,8 @@ crw --version                             # 版本号
 | `crw review` | 完成 | 仅 `--json` 模式：存在【严重】 | 运行错误 |
 | `crw config test` | 全部 OK | 存在失败 | 配置错误 |
 | `crw runs` / `crw show` | 列表 / 详情输出完成（无记录时 `runs` 仍为 0） | — | `show`：记录不存在 / 记录损坏 / 取消选择 |
+| `crw graph` | 导出完成（stdout 或文件） | — | 写入失败 |
+| `crw uninstall` | 清理完成或用户取消（含"未安装 uv 工具"的跳过） | — | 存在未完成的清理失败项 |
 | `crw chat` | 会话正常结束且最后一轮干净 | 最后一轮达限残留 | 最后一轮运行错误 / 被中断，或会话异常退出 |
 
 ### 8.2 运行记录格式
@@ -395,7 +409,7 @@ crw --version                             # 版本号
 - `state.json`：§4.3 状态快照（含 input / review_round / fix_rounds / status / error / history / parent_run_id / strict）。
 - `log.jsonl`：每行一个事件 `{"ts", "node", "event", "iteration"?, "detail"?}`；event ∈ start / end / tool / retry / error / interrupt（`node` 覆盖 encode / review / fix 与引擎级事件 `engine`）。
 - `report.md`：§4.5 报告结构。
-- `review_N.json`：schema = §5.2 契约对象；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
+- `review_N.json`：schema = §5.2 契约对象（并行双视角时是汇合结果）；`review_N_<视角>.json`：并行双视角各分支的原始结论（同一 schema）；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
 - 写入与自检：临时文件 `.<名称>.tmp` + `os.replace` 原子替换（POSIX 尽力 0600）；列表 / 加载忽略 `*.tmp` 与非目录项；运行目录名白名单校验（`r-` 前缀，防路径穿越）；`log.jsonl` 读取时跳过最后一条不完整行、`detail` 只存截断预览（约 400 字符）；`state.json` 在每个节点结束与失败时各原子写一次（引入并行分支后改为图超级步边界，同一超级步只写一次）；`state.json` 损坏时 `crw show` 降级展示 `log.jsonl` 摘要 + 产物清单 + 可读提示；`status=running` 且长时间无更新（判据 = `max(mtime(state.json), mtime(log.jsonl))` 超过 30 分钟；log 逐事件 append + flush）→ 列表 / 展示标注"可能已中断"（不自动改状态）。
 - 会话相关：`session.json`（会话档案）/ `session.md`（会话总报告）/ `memory/<agent>.jsonl`（按 Agent 记忆）见 §4.7；会话轮次的 `state.json` 额外含 `session_id` / `round_index`；`status` 增 `interrupted`（被中断的本轮，`error.node="interrupt"`）；`crw runs` 跨 `runs/` 与 `sessions/*/rounds/` 两处聚合，会话列取自 `session_id`。
 - runs 列表降级派生（单条坏记录不拖垮列表页）：修复轮数 = `state.fix_rounds` → workspace 中 `code_v*.py` 数 − 1 → "?"；残留严重数 = `state.findings` 计数 → 最新可解析 `review_N.json` 计数 → "?"；状态 = `state.status` → `log.jsonl` 末条 event 推断 → unknown。
@@ -469,7 +483,7 @@ crw --version                             # 版本号
 
 - **修复质量依赖模型能力**：复杂缺陷可能修复不完全或引入新回归——以复审循环 + 残留清单如实汇报，不宣称"必然修完"。
 - **执行非沙箱**：审查 / 修复期间运行代码为本地直接执行（限时 + 截断 + 环境净化）；文件类工具已限制在上下文根内，但 `run_python` 执行任意代码**不受路径限制**（具备当前用户全部权限，可读取工作区外文件）——已知边界；缓解：`--no-exec` 整体关闭执行；输入不可信代码时不建议自动执行（前作的逐次确认闸门不随本产品提供）。
-- **成本与时长**：一次运行含多轮 LLM 调用（初始编码 + 每轮审查 / 修复）；复杂需求耗时与费用上升；`--max-iter` 为控制阀。
+- **成本与时长**：一次运行含多轮 LLM 调用（初始编码 + 每轮审查 / 修复）；复杂需求耗时与费用上升；`--max-iter` 为控制阀；`--parallel-review` 使每轮审查的调用量与耗时约翻倍（显式开关，默认关闭）。
 - **框架版本漂移**：LangChain / LangGraph 迭代快，以 uv.lock 锁定；升级属重构，须回归全绿。
 - **运行记录含生成代码**：位于用户目录（不含密钥）；分享报告时注意内容本身可能含敏感业务逻辑。
 - **会话模式的成本与记忆膨胀**：会话内每个 Agent 每次调用都会带上自己的全部历史（追加式），调用量随轮次增长；靠供应商的前缀缓存摊薄，但最终受模型上下文窗口约束——按 §4.7 的阈值压缩控制。`exact` 模式跑满 n 轮的调用量是确定的（约 n 次修复 + n+1 次审查 + 每条用户消息 1 次编排节点调用），可据此估预算。
@@ -498,10 +512,17 @@ crw --version                             # 版本号
 8. **文档**：更新本指南与 README 流程图（`crw graph` 输出核对）。
 9. **涉及会话层**：新增意图 / 路由分支时，改 `session/orchestrator.py` 的意图枚举与 §5.4 契约，并在 `session/state.py` 增会话态字段；**会话轮次仍走 §4.7 的"每轮一条运行记录"，不要另造记录格式**。
 
-**示例（M3 计划落地其一）**：**并行双视角审查**——在 `review` 后并行挂两个审查节点（正确性 / 安全性，同一 runtime、不同提示词），分别写 `findings_correctness` / `findings_security`（独立 key，无写冲突）；汇合节点按 `(location, issue)` 去重合并为 `findings`（取较严重者）、统一重编号 id、`review_round` +1，随后沿用既有条件边（判据 = 合并后【严重】数为 0，与单审查口径一致）；分支原始结论落 `review_N_<view>.json`、合并结果落 `review_N.json`。成本不可控时降级：以本指南 + 节点级示例测试替代（M3 验收据此）。
+**示例（已落地，`crw run --parallel-review`）**：**并行双视角审查**——`review_correctness` / `review_security` 两个审查节点（同一 runtime、同一工具集、不同系统提示词）在同一超级步**并行扇出**，各写独立 key `findings_correctness` / `findings_security`（无写冲突）；汇合节点 `merge_reviews` **无条件覆盖** `findings`（按 `(location, issue)` 去重取较严重者、统一重编号 `f-1…`、每条附 `views` 来源视角），随后沿用同一条复审条件边（判据 = 合并后【严重】数为 0，与单审查口径一致）；分支原始结论落 `review_N_<视角>.json`、合并结果落 `review_N.json`。落地要点（照做即可复现同一形态）：
+
+- **扇出**：入口由条件边路由函数返回**目标清单**触发并行（`route_entry_parallel`：需求 `["encode"]` / 文件 `["review_correctness", "review_security"]`）；"修复后复审"用 `fix` 到两个审查节点的**静态多出边**触发并行——两种写法都让两个分支落在同一超级步；
+- **护栏**：`workflow/graph.py` 的 `recursion_limit(max_iterations=n, parallel_review=True) == 3 × n + 8`（每轮多一个汇合超级步）；
+- **并发下的呈现**：两个分支的模型调用/工具调用真的同时进行（子图在线程池里跑），渲染层按分支缓冲正文、在自己的阶段结束时整块输出，避免两位审查者的叙述在终端交错；引擎的事件归属按**节点名**归档（不按线程/单槽），否则工具事件会被记到另一个分支的轮次上；
+- **测试策略**：并行用例的假模型按"提示词里的分支标记"路由响应，而非按调用顺序——并发执行下顺序不可依赖（这是本轮实测踩到的坑）。
+
+成本：每轮审查的模型调用与耗时约翻倍，故为显式开关（默认关闭）。
 
 ### 12.3 Backlog（未决功能池，新功能想法先入池再排期）
 
-并行多视角审查（若未在 M3 落地）；运行对比与审阅历史 diff；环境变量侧的供应商泛化（`CRW_API_KEY` / `CRW_PROVIDER`：当前 env 回退路径固定按 DeepSeek 变量名取 key）；`~/.crw/models.json` 中 `base_url` 的严格校验（要求可解析出主机名，收紧"key 串用"检测的假阴性）；运行记录与 `.crw/sessions` 容量策略（保留上限 / 清理）；`~/.cra/models.json` 导入（若未在 M3 落地）；Web 编排界面（评估）；多文件工作流与多语言审查扩展；跨会话长期记忆（当前语义为"记忆随会话存续、新会话从零开始"，见 §4.7 / D12）；会话内的并行审查（会话层就绪后评估）。
+编码 Agent 的**多文件产出**（2026-10-13 试用反馈：真实需求常需要多个文件；现为单文件硬约束，改动波及版本化产物、审查/修复契约与 `--out` 口径，须先立项——与下方"多文件工作流与多语言审查扩展"是两件事：前者指编码产物的版本化形态，后者指工作流与审查面的语言扩展）；运行对比与审阅历史 diff；环境变量侧的供应商泛化（`CRW_API_KEY` / `CRW_PROVIDER`：当前 env 回退路径固定按 DeepSeek 变量名取 key）；`~/.crw/models.json` 中 `base_url` 的严格校验（要求可解析出主机名，收紧"key 串用"检测的假阴性）；运行记录与 `.crw/sessions` 容量策略（保留上限 / 清理）；`~/.cra/models.json` 导入（若未在 M3 落地）；Web 编排界面（评估）；多文件工作流与多语言审查扩展；跨会话长期记忆（当前语义为"记忆随会话存续、新会话从零开始"，见 §4.7 / D12）；会话内的并行审查（会话层就绪后评估）。
 
 > **出池记录（2026-10-12）**：**轮次指定增强**已定稿并进入规格正文——轮次模式与来源优先级见 §4.4、会话意图与参数契约见 §5.4、配置项见 §8.3；**会话模式**已立项（D12），落 M4，不再留在未决池。

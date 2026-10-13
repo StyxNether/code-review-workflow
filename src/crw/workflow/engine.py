@@ -29,6 +29,16 @@ from .state import RunState
 #: 内置默认修复轮次上限（Design §4.4）
 DEFAULT_MAX_ITERATIONS = 3
 
+#: 节点名 → 显示名（终端阶段面板、报告、详情与退出码文案共用一处口径）
+NODE_LABELS: dict[str, str] = {
+    "encode": "编码",
+    "review": "审查",
+    "review_correctness": "审查·正确性",
+    "review_security": "审查·安全性",
+    "merge_reviews": "汇合",
+    "fix": "修复",
+}
+
 #: 失败信息与事件 detail 的显示上限（沿用 Design §8.2 的 400 字符惯例）
 MAX_ERROR_CHARS = 400
 
@@ -85,8 +95,9 @@ class RunObserver(Protocol):
         file_name: str,
         findings: Sequence[Mapping[str, Any]],
         summary: str,
+        view: str | None = None,
     ) -> None:
-        """一轮审查结论（findings 清单，已过契约校验）。"""
+        """一轮审查结论（findings 清单，已过契约校验）；``view`` 非空表示并行分支视角。"""
 
     def on_fixes(
         self,
@@ -114,6 +125,7 @@ class _NullObserver:
         file_name: str,
         findings: Sequence[Mapping[str, Any]],
         summary: str,
+        view: str | None = None,
     ) -> None:
         """忽略审查结论。"""
 
@@ -139,6 +151,8 @@ class RunRequest:
     rounds_mode: str = state_mod.ROUNDS_UP_TO
     strict: bool = False
     no_exec: bool = False
+    parallel_review: bool = False
+    """并行双视角审查（Design §12.2 的扩展示例）：两个审查视角同超级步并行、汇合后判干净。"""
     resolved: config_mod.ResolvedModel | None = None
     """本次运行的模型连接（命令面经 ``config.resolve`` 解析）。
 
@@ -192,6 +206,16 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class _Active:
+    """当前节点的执行上下文（按线程保存）：轮次、开始时间与计时起点。"""
+
+    node: str
+    round: int
+    started_at: str
+    started: float
+
+
+@dataclass(frozen=True)
 class _Listing:
     """节点产出的清单载荷：由包装层在 node end 事件之后交给观察者渲染。"""
 
@@ -231,13 +255,41 @@ class WorkflowEngine:
         self._run_dir: Path | None = None
         self._workspace: Path | None = None
         self._log_path: Path | None = None
-        self._current: tuple[str, int] | None = None
-        self._current_started_at = ""
-        self._current_started = 0.0
+        # 正在执行的节点上下文按**节点名**保存：并行双视角的两个分支会同时执行（子图在线程池
+        # 里跑，工具事件来自别的线程），单槽记录会让事件被归到另一个分支的轮次上——按名归档
+        # 既线程安全又与事件自带的 ``node`` 字段天然对齐
+        self._active_nodes: dict[str, _Active] = {}
         self._latest: dict[str, Any] | None = None
         self._runtime: agents_mod.AgentRuntime | None = None
         self._no_exec = False
+        self._parallel_review = False
         self._request: RunRequest | None = None
+        #: 双视角分支的评述缓存（键 = 审查轮次 → 视角 → 评述文本）：汇合产物要合并两边的评述，
+        #: 而分支结论此刻已落盘为 review_N_<view>.json，没必要再读回来
+        self._branch_summaries: dict[int, dict[str, str]] = {}
+
+    def _begin_node(self, name: str, round_number: int) -> _Active:
+        """登记一个正在执行的节点（返回其上下文；同一节点名重复登记即覆盖，重试属同一节点）。"""
+        active = _Active(
+            node=name,
+            round=round_number,
+            started_at=self._clock(),
+            started=self._timer(),
+        )
+        self._active_nodes[name] = active
+        return active
+
+    def _end_node(self, name: str) -> None:
+        self._active_nodes.pop(name, None)
+
+    def _any_active(self) -> _Active | None:
+        """任一在建节点（中断与顶层兜底用）：单节点路径下即当前节点。
+
+        先取快照再取值：并行双视角的分支在别的线程里增删这本字典，直接迭代会在尺寸变化时
+        抛 ``RuntimeError``——而本函数专用于中断 / 兜底这类异常路径，正是最容易撞上的时刻。
+        """
+        values = list(self._active_nodes.values())
+        return values[0] if values else None
 
     # ---- 对外入口 ----
 
@@ -256,9 +308,14 @@ class WorkflowEngine:
         self._log_path = run_dir / "log.jsonl"
         self._request = request
         self._no_exec = request.no_exec
+        self._parallel_review = request.parallel_review
         # 同一引擎实例被复用执行多次时，运行时必须按本次请求重建：它绑定了模型、上下文根
         # 与 no_exec，串用会让第二次运行拿着上一次的装配跑
         self._runtime = None
+        self._branch_summaries = {}
+        # 节点在建表同样重置：KeyboardInterrupt 等 BaseException 不会走 _end_node，
+        # 引擎实例被复用执行下一次时不得残留上一次的节点上下文
+        self._active_nodes = {}
         initial = state_mod.new_state(
             run_id=run_id,
             input_descriptor=request.input_descriptor(),
@@ -267,6 +324,7 @@ class WorkflowEngine:
             max_iterations_source=request.max_iterations_source,
             rounds_mode=request.rounds_mode,
             strict=request.strict,
+            parallel_review=request.parallel_review,
             model=request.model_label,
             created_at=self._clock(),
             parent_run_id=request.parent_run_id,
@@ -298,13 +356,13 @@ class WorkflowEngine:
         except PersistenceError as exc:
             return self._handle_persistence_failure(self._latest or initial, exc)
         except Exception as exc:  # noqa: BLE001 — 图执行层面的未预期异常转为可读运行失败
-            node, round_number = self._current or ("engine", 0)
+            active = self._any_active()
             failure = _NodeFailure(
-                node=node,
+                node=active.node if active else "engine",
                 message=_readable_error(exc),
-                round_number=round_number,
-                started_at=self._current_started_at or self._clock(),
-                duration_ms=self._elapsed_ms(),
+                round_number=active.round if active else 0,
+                started_at=(active.started_at if active else "") or self._clock(),
+                duration_ms=self._elapsed_ms(active) if active else 0,
             )
             return self._handle_node_failure(self._latest or initial, failure)
 
@@ -312,10 +370,14 @@ class WorkflowEngine:
 
     def _drive(self, initial: RunState) -> dict[str, Any]:
         """驱动图执行：节点边界快照原子写，返回最后一个超级步的状态。"""
-        resolved = graph_mod.resolve_nodes(self._nodes, defaults=self._default_nodes())
+        resolved = graph_mod.resolve_nodes(
+            self._nodes, defaults=self._default_nodes(), parallel_review=self._parallel_review
+        )
         wrapped = {name: self._wrap_node(name, fn) for name, fn in resolved.items()}
-        app = graph_mod.build_graph(nodes=wrapped)
-        recursion_limit = 2 * int(initial["max_iterations"]) + 8
+        app = graph_mod.build_graph(nodes=wrapped, parallel_review=self._parallel_review)
+        recursion_limit = graph_mod.recursion_limit(
+            max_iterations=int(initial["max_iterations"]), parallel_review=self._parallel_review
+        )
         latest: dict[str, Any] = dict(initial)
         # 初始快照已在建立运行目录时落盘：以它的序列化文本为基线，跳过首个（相同的）产出
         last_text = state_mod.dumps(initial)
@@ -336,16 +398,25 @@ class WorkflowEngine:
         return latest
 
     def _default_nodes(self) -> dict[str, NodeFn] | None:
-        """缺省节点装配（真实 Agent 节点）；``nodes`` 已覆盖全部节点时返回 ``None``。
+        """缺省节点装配（真实 Agent 节点 + 本层的汇合节点）；``nodes`` 已覆盖全部节点时返回 ``None``。
 
-        运行时只在确需缺省装配时构建：完全注入节点的测试不触碰模型与配置。
+        运行时只在确需缺省装配时构建：完全注入节点的测试不触碰模型与配置。并行形态多出的
+        汇合节点由本层提供（纯函数、无模型、无 IO），其余节点仍来自 agents 层——依赖方向
+        不变（workflow → agents，Design §3.1）。
         """
-        if self._nodes and set(graph_mod.NODE_NAMES) <= set(self._nodes):
+        names = graph_mod.node_names(parallel_review=self._parallel_review)
+        if self._nodes and set(names) <= set(self._nodes):
             return None
         runtime = self._make_runtime()
-        return agents_mod.build_nodes(
-            runtime, roots=[self._workspace_path()], no_exec=self._no_exec
+        nodes = agents_mod.build_nodes(
+            runtime,
+            roots=[self._workspace_path()],
+            no_exec=self._no_exec,
+            parallel_review=self._parallel_review,
         )
+        if self._parallel_review:
+            nodes[graph_mod.MERGE_NODE] = graph_mod.merge_review_node
+        return nodes
 
     def _make_runtime(self) -> agents_mod.AgentRuntime:
         """构建（或复用）本次运行的 Agent 运行时。"""
@@ -381,12 +452,9 @@ class WorkflowEngine:
         补齐——运行时只知道自己服务于哪个节点，轮次口径由引擎掌握（工具事件据此可归轮）。
         """
         payload = dict(event)
-        if (
-            self._current is not None
-            and payload.get("node") == self._current[0]
-            and payload.get("iteration") is None
-        ):
-            payload["iteration"] = self._current[1]
+        active = self._active_nodes.get(str(payload.get("node") or ""))
+        if active is not None and payload.get("iteration") is None:
+            payload["iteration"] = active.round
         record = {"ts": self._clock(), **payload}
         if self._log_path is not None:
             try:
@@ -400,42 +468,41 @@ class WorkflowEngine:
 
         def wrapped(state: Mapping[str, Any]) -> Mapping[str, Any]:
             round_number = self._round_of(name, state)
-            self._current = (name, round_number)
-            self._current_started_at = self._clock()
-            self._current_started = self._timer()
+            active = self._begin_node(name, round_number)
+            started_at = active.started_at
             self._emit({"node": name, "event": "start", "iteration": round_number})
             try:
                 update, summary, artifacts, listing = self._produce(name, fn, state)
             except PersistenceError:
                 # 落盘失败按落盘失败归因（Design §4.6）：交 execute 的持久化失败分支处理，
                 # 不在这里被归为"节点自身失败"——两者都退出 2，但原因定位必须准确。
-                self._current = None
+                self._end_node(name)
                 raise
             except Exception as exc:
                 message = _readable_error(exc)
                 # 护栏触达信息一并带上：节点在"工具/预算已达上限"之后失败时，这是最有力的线索
                 message = _append_notices(message, self._drain_notices())
-                duration = self._elapsed_ms()
+                duration = self._elapsed_ms(active)
                 self._emit(
                     {"node": name, "event": "error", "iteration": round_number, "detail": message}
                 )
-                self._current = None
+                self._end_node(name)
                 raise _NodeFailure(
                     node=name,
                     message=message,
                     round_number=round_number,
-                    started_at=self._current_started_at,
+                    started_at=started_at,
                     duration_ms=duration,
                 ) from exc
-            duration = self._elapsed_ms()
+            duration = self._elapsed_ms(active)
             summary = _append_notices(summary, self._drain_notices())
             self._emit({"node": name, "event": "end", "iteration": round_number, "detail": summary})
             self._render_listing(listing)
-            self._current = None
+            self._end_node(name)
             entry = state_mod.NodeEvent(
                 node=name,
                 round=round_number,
-                started_at=self._current_started_at,
+                started_at=started_at,
                 duration_ms=duration,
                 summary=summary,
                 artifacts=list(artifacts),
@@ -447,12 +514,18 @@ class WorkflowEngine:
     def _produce(
         self, name: str, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """按节点执行契约包装：调用 → 抽取 → 校验（失败重试一次）→ 产物落盘。"""
+        """按节点种类执行契约包装：调用 → 抽取 → 校验（失败重试一次）→ 产物落盘。
+
+        种类由节点名决定（``encode`` / ``fix`` / ``review``（含并行视角分支）/ 汇合），两种图
+        形态共用同一套包装逻辑——扩展形态只在"谁来写权威字段"上不同（Design §12.2）。
+        """
         if name == "encode":
             return self._produce_encode(fn, state)
-        if name == "review":
-            return self._produce_review(fn, state)
-        return self._produce_fix(fn, state)
+        if name == "fix":
+            return self._produce_fix(fn, state)
+        if name == graph_mod.MERGE_NODE:
+            return self._produce_merge(fn, state)
+        return self._produce_review(fn, state, view=graph_mod.view_of_review_node(name))
 
     def _produce_encode(
         self, fn: NodeFn, state: Mapping[str, Any]
@@ -471,12 +544,14 @@ class WorkflowEngine:
         return {"current_code": str(path)}, summary, [self._relative(path)], None
 
     def _produce_review(
-        self, fn: NodeFn, state: Mapping[str, Any]
+        self, fn: NodeFn, state: Mapping[str, Any], *, view: str | None = None
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """审查节点：契约校验 → ``workspace/review_N.json`` 落盘 → clean 判定（Design §5.2）。
+        """审查节点：契约校验 → ``workspace/review_N[_<视角>].json`` 落盘 → clean 判定（Design §5.2）。
 
         执行有效性门禁由审查节点交回的 ``review_evidence`` 决定（本轮是否至少一次成功
         工具事件）；不返回该键的节点（脚本化假节点 / 注入桩）按"内联送达记录"视为满足。
+        并行双视角下每个视角只写自己的**独立 key**（``findings_<视角>``）：审查轮次推进与
+        clean 判定归汇合节点，否则同一超级步的两个分支会互相覆盖。
         """
         round_number = state_mod.round_number_for_review(state)
         version = state_mod.code_version(state)
@@ -501,18 +576,14 @@ class WorkflowEngine:
                 file_name=file_name,
                 has_tool_evidence=evidence,
             )
-        path = self._workspace_path() / state_mod.review_file_name(round_number)
+        path = self._workspace_path() / state_mod.review_file_name(round_number, view=view)
         self._write_artifact(path, json.dumps(result.contract, ensure_ascii=False, indent=2) + "\n")
         counts = contracts.severity_counts(result.findings)
-        clean = contracts.judge_clean(result.findings, strict=bool(state.get("strict")))
+        scope = f"·{graph_mod.VIEW_LABELS[view]}视角" if view else ""
         summary = (
-            f"第 {round_number} 轮（{file_name}）：{counts[contracts.SEVERE]} 严重 / "
+            f"第 {round_number} 轮{scope}（{file_name}）：{counts[contracts.SEVERE]} 严重 / "
             f"{counts[contracts.MODERATE]} 一般 / {counts[contracts.ADVICE]} 建议"
         )
-        if clean:
-            # "建议不影响判定"只在确有【建议】时说明；0 findings 时加括号属噪音
-            tail = "（建议不影响判定）" if counts[contracts.ADVICE] else ""
-            summary = f"{summary} —— 干净通过{tail}"
         listing = _Listing(
             kind="review",
             payload={
@@ -520,10 +591,96 @@ class WorkflowEngine:
                 "file_name": file_name,
                 "findings": list(result.findings),
                 "summary": result.summary,
+                "view": graph_mod.VIEW_LABELS.get(view) if view else None,
             },
         )
-        update = {"findings": result.findings, "clean": clean, "review_round": round_number}
+        if view is not None:
+            # 分支只交回自己的独立 key；评述缓存供汇合产物合并两边评述用
+            self._branch_summaries.setdefault(round_number, {})[view] = result.summary
+            return (
+                {graph_mod.findings_key_for_view(view): result.findings},
+                summary,
+                [self._relative(path)],
+                listing,
+            )
+        if contracts.judge_clean(result.findings, strict=bool(state.get("strict"))):
+            # "建议不影响判定"只在确有【建议】时说明；0 findings 时加括号属噪音
+            tail = "（建议不影响判定）" if counts[contracts.ADVICE] else ""
+            summary = f"{summary} —— 干净通过{tail}"
+        summary = f"{summary}{self._convergence_tail(state, result.findings)}"
+        update = {
+            "findings": result.findings,
+            "clean": contracts.judge_clean(result.findings, strict=bool(state.get("strict"))),
+            "review_round": round_number,
+        }
         return update, summary, [self._relative(path)], listing
+
+    def _produce_merge(
+        self, fn: NodeFn, state: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
+        """汇合节点：合并双视角 findings → ``review_N.json`` → 当轮 clean 判定（Design §12.2）。
+
+        ``findings`` 由本步**显式覆盖、无条件写**（未运行分支的旧值不得残留）；分支原始结论
+        已分别落 ``review_N_<视角>.json``，合并结果落 ``review_N.json``——"这条结论由谁提出"
+        可从 findings 的 ``views`` 字段追溯。
+        """
+        round_number = state_mod.round_number_for_review(state)
+        version = state_mod.code_version(state)
+        file_name = state_mod.code_file_name(version)
+        output = _call_node(fn, state, retry_feedback=None)
+        merged = [item for item in (output.get("findings") or []) if isinstance(item, Mapping)]
+        contract_object = {
+            "iteration": round_number,
+            "code_version": version,
+            "file": file_name,
+            "findings": merged,
+            "summary": self._merged_summary(round_number),
+        }
+        path = self._workspace_path() / state_mod.review_file_name(round_number)
+        self._write_artifact(path, json.dumps(contract_object, ensure_ascii=False, indent=2) + "\n")
+        counts = contracts.severity_counts(merged)
+        clean = contracts.judge_clean(merged, strict=bool(state.get("strict")))
+        summary = (
+            f"第 {round_number} 轮（{file_name}）：{counts[contracts.SEVERE]} 严重 / "
+            f"{counts[contracts.MODERATE]} 一般 / {counts[contracts.ADVICE]} 建议（双视角合并）"
+        )
+        if clean:
+            tail = "（建议不影响判定）" if counts[contracts.ADVICE] else ""
+            summary = f"{summary} —— 干净通过{tail}"
+        summary = f"{summary}{self._convergence_tail(state, merged)}"
+        listing = _Listing(
+            kind="review",
+            payload={
+                "round_number": round_number,
+                "file_name": file_name,
+                "findings": list(merged),
+                "summary": str(contract_object["summary"]),
+                "view": None,
+            },
+        )
+        update = {"findings": merged, "clean": clean, "review_round": round_number}
+        return update, summary, [self._relative(path)], listing
+
+    def _merged_summary(self, round_number: int) -> str:
+        """汇合产物的评述：把两个视角各自的整体评价并成一句（设计上不做二次模型总结）。"""
+        cached = self._branch_summaries.get(round_number) or {}
+        parts = [
+            f"{graph_mod.VIEW_LABELS.get(view, view)}视角："
+            f"{str(cached.get(view) or '').strip() or '（无补充评述）'}"
+            for view in graph_mod.REVIEW_VIEWS
+        ]
+        return "；".join(parts)
+
+    def _convergence_tail(
+        self, state: Mapping[str, Any], findings: Sequence[Mapping[str, Any]]
+    ) -> str:
+        """未收敛标注（Design §4.4）：与上一轮问题集合一致时在阶段摘要标注，不提前中止。"""
+        previous = state.get("findings") or []
+        if not isinstance(previous, list) or not previous or not findings:
+            return ""
+        if not_converged({"findings": previous}, {"findings": list(findings)}):
+            return "（未收敛：与上一轮问题集合一致，已记入报告）"
+        return ""
 
     def _produce_fix(
         self, fn: NodeFn, state: Mapping[str, Any]
@@ -651,7 +808,8 @@ class WorkflowEngine:
             }
         )
         self._latest = state
-        node = (self._current or ("engine", 0))[0]
+        active = self._any_active()
+        node = active.node if active else "engine"
         try:
             self._emit(
                 {
@@ -718,6 +876,7 @@ class WorkflowEngine:
             rounds=records.read_rounds(run_dir),
             run_dir=run_dir,
             artifacts=artifacts,
+            parent_residual=self._parent_residual(state),
         )
         try:
             records.atomic_write_text(run_dir / "report.md", text)
@@ -725,6 +884,31 @@ class WorkflowEngine:
             raise PersistenceError(
                 f"report.md 写入失败：{exc}（状态已保留：{run_dir / 'state.json'}）"
             ) from exc
+
+    def _parent_residual(self, state: Mapping[str, Any]) -> str | None:
+        """续跑来源的残留摘要（Design §4.4 的报告口径）：读父运行的 state.json，读不到则留空。
+
+        报告是收尾产物：父运行记录被清理 / 损坏时只是少一行标注，不得影响本次运行的结论。
+        """
+        parent = str(state.get("parent_run_id") or "")
+        if not parent or not records.is_valid_run_id(parent):
+            return None
+        try:
+            parent_state = records.read_state(records.run_dir(parent))
+            if not isinstance(parent_state, Mapping):
+                return None
+            findings = parent_state.get("findings")
+            conclusion = conclusion_text(
+                status=str(parent_state.get("status") or ""),
+                review_round=int(parent_state.get("review_round") or 0),
+                fix_rounds=int(parent_state.get("fix_rounds") or 0),
+                findings=findings if isinstance(findings, list) else [],
+                strict=bool(parent_state.get("strict")),
+            )
+        except (OSError, TypeError, ValueError):
+            # 父记录被清理 / 字段被手改成非法值时少一行标注即可，报告本身必须照样产出
+            return None
+        return f"{parent}：{conclusion}"
 
     # ---- 基础设施 ----
 
@@ -848,7 +1032,8 @@ class WorkflowEngine:
     def _start_detail(self, request: RunRequest) -> str:
         """运行开始事件的 detail：输入摘要 + 轮次上限与来源（log 预览与渲染头行共用）。
 
-        ``-f`` 输入额外标注"原文件名 → 工作区名"映射（Design §4.5 的报告口径）。
+        ``-f`` 输入额外标注"原文件名 → 工作区名"映射（Design §4.5 的报告口径）；续跑与并行
+        审查各加一句，使终端头行与日志能一眼看出这一轮是怎么起的。
         """
         descriptor = request.input_descriptor()
         if descriptor.get("kind") == state_mod.INPUT_FILE:
@@ -857,20 +1042,28 @@ class WorkflowEngine:
         else:
             summary = state_mod.summarize_input(descriptor, limit=80)
         strict = "，--strict 已启用" if request.strict else ""
-        return (
-            f"{summary}；修复轮次上限 {request.max_iterations}"
-            f"（来源：{source_label(request.max_iterations_source)}）{strict}"
-        )
+        parts = [
+            (
+                f"{summary}；修复轮次上限 {request.max_iterations}"
+                f"（来源：{source_label(request.max_iterations_source)}）{strict}"
+            )
+        ]
+        if request.parent_run_id:
+            parts.append(f"续跑自 {request.parent_run_id}")
+        if request.parallel_review:
+            parts.append("并行双视角审查（正确性 + 安全性）")
+        return "；".join(parts)
 
     def _round_of(self, name: str, state: Mapping[str, Any]) -> int:
-        if name == "review":
-            return state_mod.round_number_for_review(state)
+        """节点所属轮次：编码恒为 1；修复按已完成修复数；审查与汇合按已完成的审查数。"""
         if name == "fix":
             return state_mod.round_number_for_fix(state)
-        return 1
+        if name == "encode":
+            return 1
+        return state_mod.round_number_for_review(state)
 
-    def _elapsed_ms(self) -> int:
-        return max(0, int((self._timer() - self._current_started) * 1000))
+    def _elapsed_ms(self, active: _Active) -> int:
+        return max(0, int((self._timer() - active.started) * 1000))
 
     def _workspace_path(self) -> Path:
         if self._workspace is None:  # pragma: no cover — execute 前调用属编程缺陷
@@ -896,6 +1089,7 @@ def build_report(
     rounds: Sequence[RoundReport],
     run_dir: Path,
     artifacts: Sequence[Path],
+    parent_residual: str | None = None,
 ) -> str:
     """生成运行报告（结构见 Design §4.5）：摘要 → 时间线 → 逐轮问题清单 → 产物清单。"""
     status = str(state.get("status") or "")
@@ -922,6 +1116,10 @@ def build_report(
     lines.append(f"| 输入 | {_cell(state_mod.summarize_input(input_descriptor, limit=200))} |")
     lines.append(f"| 模型 | {_cell(state.get('model') or '（未记录）')} |")
     lines.append(f"| 状态 | {status_label(status)} |")
+    if state.get("parallel_review"):
+        lines.append(
+            "| 审查方式 | 双视角并行（正确性 + 安全性，汇合后按 (location, issue) 去重） |"
+        )
     lines.append(f"| 审查 / 修复轮次 | {review_round} / {fix_rounds} |")
     lines.append(
         f"| 轮次上限 | {_cell(state.get('max_iterations'))}（来源：{source_label(state.get('max_iterations_source'))}） |"
@@ -934,6 +1132,8 @@ def build_report(
     )
     if state.get("parent_run_id"):
         lines.append(f"| 父运行 | {_cell(state.get('parent_run_id'))} |")
+        if parent_residual:
+            lines.append(f"| 父运行残留 | {_cell(parent_residual)} |")
     if state.get("session_id"):
         lines.append(
             f"| 会话 / 轮次 | {_cell(state.get('session_id'))} / 第 {_cell(state.get('round_index'))} 轮 |"
@@ -959,8 +1159,15 @@ def build_report(
     lines.append("## 逐轮问题清单")
     lines.append("")
     if rounds:
-        for item in rounds:
-            lines.extend(_round_section(item, status=status))
+        for index, item in enumerate(rounds):
+            previous = rounds[index - 1] if index else None
+            lines.extend(
+                _round_section(
+                    item,
+                    status=status,
+                    not_converged=bool(previous and not_converged(previous.review, item.review)),
+                )
+            )
     else:
         lines.append("（无审查结论）")
     lines.append("")
@@ -1001,8 +1208,12 @@ def _cell(value: Any) -> str:
     return " ".join(str(value if value is not None else "").split()).replace("|", "\\|")
 
 
-def _round_section(item: RoundReport, *, status: str) -> list[str]:
-    """单轮问题清单：标题固定为"第 i 轮审查（基于 code_vi.py）"，含"问题 ← 处置"对照。"""
+def _round_section(item: RoundReport, *, status: str, not_converged: bool = False) -> list[str]:
+    """单轮问题清单：标题固定为"第 i 轮审查（基于 code_vi.py）"，含"问题 ← 处置"对照。
+
+    ``not_converged`` 为真时插入"未收敛"标注（Design §4.4）：问题集合与上一轮一致说明
+    修复没有改变问题清单——如实标出，但不改变流程与退出码。
+    """
     lines: list[str] = [f"### 第 {item.round_number} 轮审查（基于 `{item.file_name}`）", ""]
     findings = item.review.get("findings")
     findings = findings if isinstance(findings, list) else []
@@ -1014,6 +1225,12 @@ def _round_section(item: RoundReport, *, status: str) -> list[str]:
     if isinstance(summary, str) and summary.strip():
         lines.append(f"{summary}")
         lines.append("")
+    if not_converged:
+        lines.append(
+            "> ⚠ **未收敛**：本轮问题集合与上一轮完全相同（location + issue 集合一致），"
+            "修复未改变问题清单；报告如实标注，运行未因此提前中止。"
+        )
+        lines.append("")
     dispositions = _dispositions(item)
     for finding in findings:
         if not isinstance(finding, Mapping):
@@ -1021,7 +1238,7 @@ def _round_section(item: RoundReport, *, status: str) -> list[str]:
         severity = finding.get("severity") or "未分级"
         location = finding.get("location") or "（未定位）"
         issue = finding.get("issue") or ""
-        lines.append(f"- **【{severity}】** `{location}` — {issue}")
+        lines.append(f"- **【{severity}】** `{location}` — {issue}{_views_note(finding)}")
         suggestion = finding.get("suggestion")
         if isinstance(suggestion, str) and suggestion.strip():
             lines.append(f"  - 修改建议：{suggestion}")
@@ -1035,6 +1252,19 @@ def _round_section(item: RoundReport, *, status: str) -> list[str]:
         )
     lines.append("")
     return lines
+
+
+def _views_note(finding: Mapping[str, Any]) -> str:
+    """并行双视角的来源标注（findings 的附加字段 ``views``，单视角审查时为空串）。
+
+    汇合节点写入的是显示名；此处再按显示名表映射一次，手改成内部键（``correctness``）的
+    记录也能渲染成中文，不至于同一份报告里两种口径并存。
+    """
+    views = finding.get("views")
+    if not isinstance(views, list) or not views:
+        return ""
+    labels = [graph_mod.VIEW_LABELS.get(str(view), str(view)) for view in views]
+    return f"（视角：{' + '.join(labels)}）"
 
 
 def _dispositions(item: RoundReport) -> dict[str, str]:
@@ -1083,18 +1313,21 @@ def conclusion_text(
 
 
 def status_label(status: str) -> str:
-    """运行状态的显示名（报告、列表与详情共用）。"""
+    """运行状态的显示名（报告、列表与详情共用）；``unknown`` = 由日志也读不出来的降级态。"""
     return {
         state_mod.STATUS_RUNNING: "运行中",
         state_mod.STATUS_SUCCESS: "干净通过",
         state_mod.STATUS_RESIDUAL: "达限残留",
         state_mod.STATUS_FAILED: "运行失败",
         state_mod.STATUS_INTERRUPTED: "已中断",
+        "unknown": "未知（记录损坏）",
     }.get(status, status or "未知")
 
 
 def source_label(source: Any) -> str:
-    """轮次取值来源的显示名（Design §4.4 的来源枚举）。"""
+    """轮次取值来源的显示名（Design §4.4 的来源枚举）；缺失时给可读占位而非 ``None``。"""
+    if source is None or not str(source).strip():
+        return "（未记录）"
     return {
         state_mod.SOURCE_CLI: "命令行",
         state_mod.SOURCE_REQUIREMENT: "需求文本提取",
@@ -1105,8 +1338,25 @@ def source_label(source: Any) -> str:
 
 
 def node_label(node: Any) -> str:
-    """节点名的显示名（编码 / 审查 / 修复）。"""
-    return {"encode": "编码", "review": "审查", "fix": "修复"}.get(str(node), str(node))
+    """节点名的显示名（编码 / 审查 / 修复；并行形态含视角与汇合）。"""
+    return NODE_LABELS.get(str(node), str(node))
+
+
+def not_converged(previous: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    """未收敛判定（Design §4.4）：两份审查契约的 ``(location, issue)`` 集合完全相同。
+
+    Args:
+        previous / current: ``review_N.json`` 形态的契约对象（含 ``findings`` 数组）。
+
+    Returns:
+        上一轮与本轮问题集合一致（且两轮都非空）时为真——报告据此标注"未收敛"，
+        但仍然**不提前中止**（标注 ≠ 改变流程）。
+    """
+    before = previous.get("findings") if isinstance(previous.get("findings"), list) else []
+    after = current.get("findings") if isinstance(current.get("findings"), list) else []
+    if not before or not after:
+        return False
+    return contracts.finding_keys(before) == contracts.finding_keys(after)
 
 
 def _relative_display(path: Path, run_dir: Path) -> str:

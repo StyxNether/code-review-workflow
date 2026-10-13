@@ -31,7 +31,9 @@ ENCODER_SYSTEM_PROMPT = """你是一位资深 Python 工程师。你的任务是
 
 # 输出格式（必须严格遵守）
 先写一到三句实现说明（放在围栏之外），然后给出代码块——**有且仅有一个 ```python 围栏**，\
-围栏内是完整文件内容（含全部导入）。不要输出其他任何围栏。"""
+围栏内是完整文件内容（含全部导入）。不要输出其他任何围栏。
+
+说明里**不要复述或粘贴代码**：代码只在围栏内出现一次（终端不展示围栏内容，只抽取落盘）。"""
 
 
 REVIEWER_SYSTEM_PROMPT = """你是一位资深代码审查员，有多年跨语言、跨技术栈的项目评审经验。\
@@ -59,6 +61,8 @@ REVIEWER_SYSTEM_PROMPT = """你是一位资深代码审查员，有多年跨语�
 
 - `location` 用**工作区实名**加 1-based 行号（如 `code_v1.py:18`）；指向整个文件时可只写文件名。
 - 无问题时 `findings` 为空数组，但 `summary` 必须写清"检查了什么、为什么没问题"。
+- 围栏不会被原样展示给用户（系统校验后按分级清单渲染）：`issue` / `suggestion` 要写清事实\
+与依据，不要依赖读者看到代码原文。
 - 围栏之外可以先用几句话说明你的检查过程，但**不要输出第二个 json 围栏**，也不要输出\
 code 围栏。不要输出 iteration / code_version（系统按权威值补全）。
 - 任务里若另有输出格式要求（单文件快速审查会要求分级文本格式），**以任务中的要求为准**。"""
@@ -68,6 +72,8 @@ FIXER_SYSTEM_PROMPT = """你是一位资深 Python 工程师，负责按审查�
 
 # 工作方式
 - 先 read_file 读取当前代码与清单逐条对照；清单里的每条问题都必须给出处置，不允许遗漏。
+- **必须基于读到的真实文件改**：禁止凭清单描述重写/重建整个文件；改完要保证未涉及的部分\
+与原文一致（文件读不出来就如实说明，不要猜内容）。
 - 修复要**针对问题本身**做最小改动：不要顺手重构、不要改变无关行为、不要丢功能。
 - 允许用 run_python 验证候选代码（把完整候选代码用 `code=` 内联执行，或写成文件后执行）——\
 提交前自验过再给出结论，比让复审再发现一遍更省时间。
@@ -83,7 +89,53 @@ FIXER_SYSTEM_PROMPT = """你是一位资深 Python 工程师，负责按审查�
 
 - `fixes` 必须覆盖清单中**每一条** finding 的 id；不要输出清单之外的 id。
 - `skipped` 必须写明理由（note 不能为空）。
-- 两个围栏之外可以有一两句说明，但不要输出其他围栏。"""
+- `note` 是人读的处置说明（会进运行报告的"问题 ← 处置"对照），写清改了什么、为什么；
+  这个 JSON 是给系统的结构化记录，不是给用户看的正文。
+- 两个围栏之外只用一两句说明处置要点，不要复述代码、不要重复贴 JSON 内容。"""
+
+
+_CORRECTNESS_VIEW = """
+
+# 本轮视角（并行双视角审查，Design §12.2 的落地形态）
+你只负责**正确性**视角：逻辑与算法错误、边界与异常处理、类型与数值语义、状态与副作用、\
+可运行性。安全类问题（越权、注入、敏感信息、资源滥用等）由并行的另一位审查者负责，\
+**不要重复报告**；同一处代码同时涉及两类问题时，你只报正确性那一面。"""
+
+_SECURITY_VIEW = """
+
+# 本轮视角（并行双视角审查，Design §12.2 的落地形态）
+你只负责**安全性**视角：不可信输入导致的注入 / 逃逸 / 越权、资源滥用（无界内存 / 耗时 /\
+递归）、敏感信息泄露、危险 API 与文件路径处置、异常被吞导致的静默失败。正确性类问题\
+（逻辑与算法错误、边界处理、类型语义）由并行的另一位审查者负责，**不要重复报告**；\
+同一处代码同时涉及两类问题时，你只报安全性那一面。"""
+
+#: 并行双视角审查的系统提示词（常量：与单视角同一基座，只加职责边界）
+CORRECTNESS_REVIEW_SYSTEM_PROMPT = REVIEWER_SYSTEM_PROMPT + _CORRECTNESS_VIEW
+SECURITY_REVIEW_SYSTEM_PROMPT = REVIEWER_SYSTEM_PROMPT + _SECURITY_VIEW
+
+#: 视角 → 提示词（引擎经 ``reviewer_system_prompt`` 取用；单视角传 ``None``）
+_VIEW_SYSTEM_PROMPTS: Mapping[str, str] = {
+    "correctness": CORRECTNESS_REVIEW_SYSTEM_PROMPT,
+    "security": SECURITY_REVIEW_SYSTEM_PROMPT,
+}
+#: 视角 → 显示名（任务提示词里说明"另一位审查者负责什么"）
+VIEW_DISPLAY: Mapping[str, str] = {"correctness": "正确性", "security": "安全性"}
+
+
+def reviewer_system_prompt(view: str | None = None) -> str:
+    """审查节点的系统提示词：单视角用基座，并行双视角按视角加一段职责边界。
+
+    未知视角显式报错而不是静默退回基座：拼错的视角会让两个审查者都失去职责边界、
+    各自把同一类问题报一遍（且没人发现），不如在装配/调用处直接失败。
+    """
+    if view is None:
+        return REVIEWER_SYSTEM_PROMPT
+    try:
+        return _VIEW_SYSTEM_PROMPTS[view]
+    except KeyError as exc:
+        raise ValueError(
+            f"未知的审查视角：{view!r}（可选：{sorted(_VIEW_SYSTEM_PROMPTS)}）"
+        ) from exc
 
 
 def encode_task_prompt(
@@ -108,8 +160,13 @@ def review_task_prompt(
     code_version: int,
     allow_exec: bool,
     retry_feedback: str | None = None,
+    view: str | None = None,
 ) -> str:
-    """审查任务：说明本轮要读哪个工作区文件、可用的核实手段与输出契约。"""
+    """审查任务：说明本轮要读哪个工作区文件、可用的核实手段与输出契约。
+
+    ``view`` 非空表示并行双视角审查的分支：任务里写明本视角负责什么、另一位负责什么，
+    避免两个审查者把同一类问题各报一遍（汇合阶段虽会去重，但重复会白花一轮调用）。
+    """
     lines = [
         f"请审查工作区中的当前代码：{file_name}（第 {review_round} 轮审查，代码版本 v{code_version}）。",
         "",
@@ -118,6 +175,16 @@ def review_task_prompt(
             f"（超过 400 行时分段读完），再下结论。"
         ),
     ]
+    if view is not None:
+        mine = VIEW_DISPLAY.get(view, view)
+        others = (
+            "、".join(label for key, label in VIEW_DISPLAY.items() if key != view) or "其他视角"
+        )
+        lines.append(
+            f"本轮是**并行双视角审查**：你只负责【{mine}】视角（另一位审查者并行负责"
+            f"【{others}】），不要把【{others}】类问题报进来；同一处代码两者都涉及的问题"
+            f"留给你判断属于哪一类，重复条目会在汇合阶段去重。"
+        )
     if allow_exec:
         lines.append(
             "需要核实时用 run_python 实际跑一遍（例如构造边界输入验证行为），基于运行结果下结论。"

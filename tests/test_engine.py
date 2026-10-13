@@ -977,3 +977,221 @@ def test_the_runtime_is_rebuilt_for_every_run(
     assert first.exit_code == engine_mod._EXIT_ERROR
     assert second.exit_code == engine_mod._EXIT_ERROR
     assert len(built) == 2  # 第二次运行没有复用第一次的运行时
+
+
+# ---- M3：并行双视角审查（Design §12.2 的扩展示例）----
+
+
+def make_parallel_engine(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str], **kwargs: Any
+) -> engine_mod.WorkflowEngine:
+    """构造并行形态引擎：同样注入脚本化节点整表（含汇合节点，与生产装配同形）。"""
+    kwargs.setdefault("clock", fixed_clock)
+    kwargs.setdefault("run_id_factory", run_id_sequence)
+    overrides = dict(kwargs.pop("nodes", None) or {})
+    kwargs["nodes"] = {**fakes.PARALLEL_SCRIPTED_NODES(), **overrides}
+    return engine_mod.WorkflowEngine(**kwargs)
+
+
+def test_parallel_review_runs_two_views_and_merges_them(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """两视角同轮并行、分支结论各落一份、汇合去重合并（Design §12.2 的汇合规则）。"""
+    engine = make_parallel_engine(fixed_clock, run_id_sequence)
+
+    # 以缺陷样例为输入：脚本化修复对语义型缺陷只会标注未采纳，代码逐轮不变，
+    # 因此两个视角每轮都报同一批位置——正好覆盖去重与"取较严重者"
+    result = engine.execute(
+        file_request("divide_by_zero.py", parallel_review=True, max_iterations=1)
+    )
+
+    assert result.exit_code == 1  # 安全性视角独有的一项【严重】无法修掉 → 达限残留
+    state = read_state(result)
+    assert state["parallel_review"] is True
+    assert state["review_round"] == state["fix_rounds"] + 1  # 汇合完成时不变式成立
+    workspace = result.run_dir / "workspace"
+    assert (workspace / "review_1_correctness.json").is_file()
+    assert (workspace / "review_1_security.json").is_file()
+    assert (workspace / "review_1.json").is_file()
+
+    merged = state["findings"]
+    assert merged, "两个视角各自都报出了问题，合并结果不应为空"
+    assert [item["id"] for item in merged] == [f"f-{index}" for index in range(1, len(merged) + 1)]
+    shared = [item for item in merged if item["views"] == ["正确性", "安全性"]]
+    assert shared, "同一 (location, issue) 应当被合并为一条并记下来源视角"
+    assert all(item["severity"] == "严重" for item in shared), "取较严重者（正确性侧更严重）"
+    security_only = [item for item in merged if item["views"] == ["安全性"]]
+    assert len(security_only) == 1 and security_only[0]["severity"] == "严重"
+    # 汇合结果即干净判定依据：安全性独有的一项是【严重】→ 不得干净通过
+    assert state["clean"] is False
+    assert contracts.judge_clean(merged, strict=False) is state["clean"]
+
+
+def test_parallel_review_branch_keys_are_not_persisted(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """分支 key 是图执行期的中间态：不写进运行记录（产物落 review_N_<视角>.json）。"""
+    engine = make_parallel_engine(fixed_clock, run_id_sequence)
+
+    result = engine.execute(
+        engine_mod.RunRequest(requirement="写一个命令行计算器", parallel_review=True)
+    )
+
+    state = read_state(result)
+    assert "findings_correctness" not in state
+    assert "findings_security" not in state
+    assert result.run_dir is not None
+    assert (result.run_dir / "workspace" / "review_1_correctness.json").is_file()
+
+
+def test_parallel_review_timeline_names_views_and_merge(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """时间线 / 日志把两个视角与汇合分别记名（可审计：这一轮是谁在审、谁在合并）。"""
+    engine = make_parallel_engine(fixed_clock, run_id_sequence)
+
+    result = engine.execute(
+        engine_mod.RunRequest(requirement="写一个命令行计算器", parallel_review=True)
+    )
+
+    state = read_state(result)
+    nodes = [entry["node"] for entry in state["history"]]
+    assert {"review_correctness", "review_security", "merge_reviews"} <= set(nodes)
+    assert nodes.count("merge_reviews") == state["review_round"]
+    report = report_text(result)
+    assert "双视角并行（正确性 + 安全性，汇合后按 (location, issue) 去重）" in report
+    summary = next(
+        entry["summary"] for entry in state["history"] if entry["node"] == "merge_reviews"
+    )
+    assert "双视角合并" in summary
+
+
+def test_parallel_review_second_round_fans_out_again(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """修复后重新扇出到两个视角（同一超级步），汇合后再判干净。"""
+    engine = make_parallel_engine(fixed_clock, run_id_sequence)
+
+    result = engine.execute(
+        engine_mod.RunRequest(
+            requirement="写一个命令行计算器", parallel_review=True, max_iterations=1
+        )
+    )
+
+    state = read_state(result)
+    assert state["fix_rounds"] == 1
+    assert state["review_round"] == 2
+    assert (result.run_dir / "workspace" / "review_2_correctness.json").is_file()
+    assert (result.run_dir / "workspace" / "review_2.json").is_file()
+
+
+# ---- M3：未收敛标注（Design §4.4）----
+
+
+def test_unchanged_finding_set_is_flagged_as_not_converged(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """同轮与上轮 (location, issue) 集合一致 → 报告与阶段摘要标注，但不提前中止。"""
+    review = scripted_review([severe_finding()], [severe_finding()])
+    engine = make_engine(fixed_clock, run_id_sequence, nodes={"review": review})
+
+    result = engine.execute(file_request("divide_by_zero.py", max_iterations=1))
+
+    assert result.exit_code == 1  # 仍按达限残留收尾：标注不改变流程
+    state = read_state(result)
+    assert state["review_round"] == 2
+    summaries = [str(entry["summary"]) for entry in state["history"] if entry["node"] == "review"]
+    assert "未收敛" not in summaries[0]  # 首轮没有可比较的上一轮
+    assert "未收敛" in summaries[-1]  # 次轮集合与首轮一致 → 标注
+    assert "**未收敛**" in report_text(result)
+
+
+def test_changed_finding_set_is_not_flagged(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """问题清单有变化（哪怕仍是同一级别）就不算未收敛。"""
+    review = scripted_review([severe_finding()], [severe_finding(issue="换了一条问题")])
+    engine = make_engine(fixed_clock, run_id_sequence, nodes={"review": review})
+
+    result = engine.execute(file_request("divide_by_zero.py", max_iterations=1))
+
+    assert all("未收敛" not in str(entry["summary"]) for entry in read_state(result)["history"])
+    assert "**未收敛**" not in report_text(result)
+
+
+# ---- M3：续跑的父运行标注（Design §4.4 / §4.5）----
+
+
+def test_resumed_run_records_parent_and_reports_parent_residual(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """续跑新运行记 parent_run_id，报告标注父运行与父残留摘要。"""
+    engine = make_engine(fixed_clock, run_id_sequence)
+    parent = engine.execute(file_request("divide_by_zero.py", max_iterations=1))
+    assert parent.exit_code == 1  # 父运行：达限残留
+
+    code_path = Path(str(read_state(parent)["current_code"]))
+    resumed = engine.execute(
+        engine_mod.RunRequest(
+            parent_run_id=parent.run_id,
+            source_path=code_path,
+            source_text=code_path.read_text(encoding="utf-8"),
+            max_iterations=1,
+            max_iterations_source=state_mod.SOURCE_PARENT,
+        )
+    )
+
+    state = read_state(resumed)
+    assert state["parent_run_id"] == parent.run_id
+    assert state["max_iterations_source"] == state_mod.SOURCE_PARENT
+    report = report_text(resumed)
+    assert f"| 父运行 | {parent.run_id} |" in report
+    assert "| 父运行残留 | " in report and "达修复轮次上限" in report
+    assert parent.run_id in f"{state.get('parent_run_id')}"
+
+
+def test_resumed_run_notes_the_source_in_the_start_event(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    engine = make_engine(fixed_clock, run_id_sequence)
+    parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
+    code_path = Path(str(read_state(parent)["current_code"]))
+
+    resumed = engine.execute(
+        engine_mod.RunRequest(
+            parent_run_id=parent.run_id,
+            source_path=code_path,
+            source_text=code_path.read_text(encoding="utf-8"),
+        )
+    )
+
+    first = read_events(resumed)[0]
+    assert first["event"] == "start" and f"续跑自 {parent.run_id}" in str(first["detail"])
+
+
+def test_report_survives_a_corrupt_parent_record(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """父记录被清理 / 字段非法时少一行标注即可：报告本身必须照样产出（注释口径即契约）。"""
+    engine = make_engine(fixed_clock, run_id_sequence)
+    parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))
+    parent_dir = parent.run_dir
+    assert parent_dir is not None
+    code_path = Path(str(read_state(parent)["current_code"]))
+    (parent_dir / "state.json").write_text(
+        json.dumps({"status": "residual", "review_round": "坏值", "findings": []}), encoding="utf-8"
+    )
+
+    resumed = engine.execute(
+        engine_mod.RunRequest(
+            parent_run_id=parent.run_id,
+            source_path=code_path,
+            source_text=code_path.read_text(encoding="utf-8"),
+            max_iterations=0,
+        )
+    )
+
+    assert resumed.report_written is True
+    report = report_text(resumed)
+    assert f"| 父运行 | {parent.run_id} |" in report
+    assert "| 父运行残留 |" not in report  # 读不出父状态 → 少一行标注，不影响报告
