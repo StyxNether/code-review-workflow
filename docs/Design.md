@@ -414,7 +414,7 @@ crw --version                             # 版本号
 ```
 
 `crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--parallel-review`、`--out <目录>`、`--model / --provider`、`--thinking <挡位|off>`（快捷切换思考挡位，可与 `--model/--provider` 同用；只认内置等级表，表外名称 = 参数错误并列出可用挡位）、`--no-stream`。
-`--parallel-review` = 并行双视角审查（正确性 + 安全性同轮审查、汇合去重，§12.2）；显式开关，默认关闭——开启后每轮审查的调用量约翻倍。`crw graph --parallel-review` 导出该形态的图。
+`--parallel-review` = 并行双视角审查（正确性 + 安全性同轮审查、汇合去重，§12.2）；显式开关，默认关闭（**用户裁决 2026-10-14 确认维持默认关闭**）——开启后每轮审查的调用量约翻倍。`crw graph --parallel-review` 导出该形态的图。
 `crw chat` 选项：`-f, --file <文件>`（以既有代码开始会话）、`--resume <会话号>`、`--max-iter`、`--rounds-mode`、`--strict`、`--no-exec`、`--model / --provider`、`--no-stream`。
 `crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`、`--thinking <挡位|off>`。
 
