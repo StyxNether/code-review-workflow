@@ -93,7 +93,7 @@ class _Session:
         overrides: chat_mod.RoundOverrides | None = None,
         initial: chat_mod.RoundSettings | None = None,
         rounds_limit: int | None = None,
-        strict: bool = False,
+        severe_only: bool = False,
     ) -> tuple[int, str]:
         """驱动一次会话；返回 ``(退出码, stdout 汇总)``。"""
         io = self.io(messages)
@@ -113,7 +113,7 @@ class _Session:
             overrides=overrides,
             file_input=file_input,
             resume_session_id=resume,
-            strict=strict,
+            severe_only=severe_only,
         )
         return code, "\n".join(self.out)
 
@@ -818,3 +818,106 @@ def test_review_fix_with_explicit_rounds_runs_them_all(
     assert second["max_iterations"] == 2
     assert second["review_round"] == 3
     assert second["fix_rounds"] == 2
+
+
+# ---- 干净判定（默认加严 / --severe-only 放宽，Design §4.4）----
+
+
+def _moderate_review_calls(*, version: int = 1, name: str = "main.py") -> list[Any]:
+    """审查轮次：读文件后只报一条【一般】——默认判据下它同样阻塞。"""
+    item = {
+        "severity": "一般",
+        "location": f"{name}:1",
+        "issue": "异常被静默吞掉",
+        "suggestion": "记录并给出可读错误",
+    }
+    return [
+        ai_tool_call("read_file", path=f"code_v{version}/{name}"),
+        ai_text(review_fence([item], "有一处一般级缺陷。", files=[name])),
+    ]
+
+
+def test_moderate_findings_still_drive_a_fix_round_in_a_session(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """会话里的默认判据同样加严：首审只有【一般】也不再早退，修复后仍以残留收尾。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *_moderate_review_calls(),
+            ai_text(
+                fix_fence(
+                    {"main.py": FIXED_CODE},
+                    [{"finding_id": "f-1", "status": "fixed", "note": "已补可读错误"}],
+                )
+            ),
+            *_moderate_review_calls(version=2),
+        ]
+    )
+
+    code, out = session.run(
+        ["写一个加法计算器"], overrides=chat_mod.RoundOverrides(max_iterations=1)
+    )
+
+    assert code == 1
+    state = _round_state(1)
+    assert state["severe_only"] is False
+    assert (state["review_round"], state["fix_rounds"]) == (2, 1)
+    assert "项阻塞问题（【严重】或【一般】）残留" in out
+
+
+def test_severe_only_option_reaches_the_round_and_the_archive(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """``--severe-only`` 放宽后：只有【一般】的首审即干净早退，并随会话档案留存。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *_moderate_review_calls(),
+        ]
+    )
+
+    code, out = session.run(["写一个加法计算器"], severe_only=True)
+
+    assert code == 0
+    assert "仅【严重】阻塞（--severe-only 放宽）" in out
+    assert _round_state(1)["severe_only"] is True
+    assert _archive()["settings"]["severe_only"] is True
+
+
+def test_session_header_states_the_clean_judgement(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """头行写清判据：默认加严后，用户开工前就该知道"有【一般】也要修"。
+
+    放宽开关在恢复会话时给（命令行只能放宽、不能收紧）时，头行仍按**档案现状**显示——
+    与轮次设置同口径；本轮实际生效的判据由每轮的引擎头行（``--severe-only 放宽``）给出。
+    """
+    fake_chat_model.load([orchestrator_reply("ask", reply="你想改哪一部分？")])
+
+    _code, out = session.run(["这个工具有什么用"])
+
+    assert "【严重】与【一般】都算阻塞" in out
+
+
+def test_resumed_session_keeps_the_relaxed_judgement(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """恢复会话不重给开关：档案里的放宽继续生效（与轮次设置同一继承口径）。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *_moderate_review_calls(),
+            orchestrator_reply("review", reply="再看一轮。"),
+            *_moderate_review_calls(version=2),
+        ]
+    )
+
+    assert session.run(["写一个加法计算器"], severe_only=True)[0] == 0
+    code, _out = session.run(["再检查一轮"], resume="s-20261012-0001")
+
+    assert code == 0
+    assert _round_state(2)["severe_only"] is True

@@ -43,7 +43,7 @@ def node_state(
         "fix_rounds": 0,
         "review_round": 0,
         "max_iterations": max_iterations,
-        "strict": False,
+        "severe_only": False,
     }
     base.update(overrides)
     return base

@@ -166,7 +166,7 @@ class RunRequest:
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_iterations_source: str = state_mod.SOURCE_DEFAULT
     rounds_mode: str = state_mod.ROUNDS_UP_TO
-    strict: bool = False
+    severe_only: bool = False
     no_exec: bool = False
     parallel_review: bool = False
     """并行双视角审查（Design §12.2 的扩展示例）：两个审查视角同超级步并行、汇合后判干净。"""
@@ -370,7 +370,7 @@ class WorkflowEngine:
             max_iterations=request.max_iterations,
             max_iterations_source=request.max_iterations_source,
             rounds_mode=request.rounds_mode,
-            strict=request.strict,
+            severe_only=request.severe_only,
             parallel_review=request.parallel_review,
             model=request.model_label,
             created_at=self._clock(),
@@ -726,14 +726,16 @@ class WorkflowEngine:
                 [self._relative(path)],
                 listing,
             )
-        if contracts.judge_clean(result.findings, strict=bool(state.get("strict"))):
+        if contracts.judge_clean(result.findings, severe_only=bool(state.get("severe_only"))):
             # "建议不影响判定"只在确有【建议】时说明；0 findings 时加括号属噪音
             tail = "（建议不影响判定）" if counts[contracts.ADVICE] else ""
             summary = f"{summary} —— 干净通过{tail}"
         summary = f"{summary}{self._convergence_tail(state, result.findings)}"
         update = {
             "findings": result.findings,
-            "clean": contracts.judge_clean(result.findings, strict=bool(state.get("strict"))),
+            "clean": contracts.judge_clean(
+                result.findings, severe_only=bool(state.get("severe_only"))
+            ),
             "review_round": round_number,
         }
         return update, summary, [self._relative(path)], listing
@@ -763,7 +765,7 @@ class WorkflowEngine:
         path = self._workspace_path() / state_mod.review_file_name(round_number)
         self._write_artifact(path, json.dumps(contract_object, ensure_ascii=False, indent=2) + "\n")
         counts = contracts.severity_counts(merged)
-        clean = contracts.judge_clean(merged, strict=bool(state.get("strict")))
+        clean = contracts.judge_clean(merged, severe_only=bool(state.get("severe_only")))
         summary = (
             f"第 {round_number} 轮（{version_label}，{len(files)} 个文件）："
             f"{counts[contracts.SEVERE]} 严重 / "
@@ -1151,7 +1153,7 @@ class WorkflowEngine:
                 review_round=int(parent_state.get("review_round") or 0),
                 fix_rounds=int(parent_state.get("fix_rounds") or 0),
                 findings=findings if isinstance(findings, list) else [],
-                strict=bool(parent_state.get("strict")),
+                severe_only=bool(parent_state.get("severe_only")),
             )
         except (OSError, TypeError, ValueError):
             # 父记录被清理 / 字段被手改成非法值时少一行标注即可，报告本身必须照样产出
@@ -1395,11 +1397,11 @@ class WorkflowEngine:
                     {"kind": state_mod.INPUT_FILE, "source_path": source}, limit=120
                 )
                 summary = f"{summary}（基于 {label} 继续开发 → {start_label}/）"
-        strict = "，--strict 已启用" if request.strict else ""
+        criterion = "，判定已放宽为仅【严重】阻塞（--severe-only）" if request.severe_only else ""
         parts = [
             (
                 f"{summary}；修复轮次上限 {request.max_iterations}"
-                f"（来源：{source_label(request.max_iterations_source)}）{strict}"
+                f"（来源：{source_label(request.max_iterations_source)}）{criterion}"
             )
         ]
         if request.rounds_mode == state_mod.ROUNDS_EXACT:
@@ -1455,14 +1457,14 @@ def build_report(
     review_round = int(state.get("review_round", 0))
     fix_rounds = int(state.get("fix_rounds", 0))
     findings = state.get("findings") if isinstance(state.get("findings"), list) else []
-    strict = bool(state.get("strict"))
+    severe_only = bool(state.get("severe_only"))
     input_descriptor = state.get("input") if isinstance(state.get("input"), Mapping) else {}
     conclusion = conclusion_text(
         status=status,
         review_round=review_round,
         fix_rounds=fix_rounds,
         findings=findings,
-        strict=strict,
+        severe_only=severe_only,
     )
 
     lines: list[str] = [f"# 运行报告 · {_cell(state.get('run_id') or '（未知运行号）')}", ""]
@@ -1484,7 +1486,13 @@ def build_report(
         f"| 轮次上限 | {_cell(state.get('max_iterations'))}（来源：{source_label(state.get('max_iterations_source'))}） |"
     )
     lines.append(
-        "| 干净判定 | " + ("无【严重】且无【一般】（--strict）" if strict else "无【严重】") + " |"
+        "| 干净判定 | "
+        + (
+            "无【严重】且无【一般】（默认判据）"
+            if not severe_only
+            else "无【严重】（--severe-only 放宽）"
+        )
+        + " |"
     )
     lines.append(
         f"| 开始 / 结束 | {_cell(state.get('created_at'))} → {_cell(state.get('finished_at'))} |"
@@ -1753,19 +1761,21 @@ def conclusion_text(
     review_round: int,
     fix_rounds: int,
     findings: Sequence[Mapping[str, Any]] = (),
-    strict: bool = False,
+    severe_only: bool = False,
 ) -> str:
     """收尾结论句（报告与终端渲染共用单一来源，避免两处口径漂移）。
 
-    阻塞性结论数按 ``strict`` 计入【一般】（``contracts.blocking_count``），与干净判定同源。
+    阻塞性结论数与干净判定同源（``contracts.blocking_count``）：默认判据把【严重】与
+    【一般】都算阻塞，``severe_only`` 放宽为只算【严重】——残留可能全部由【一般】构成，
+    文案因此不得写死"【严重】"。
     """
     if status == state_mod.STATUS_SUCCESS:
         return f"干净通过（共 {review_round} 轮审查 / {fix_rounds} 轮修复）"
     if status == state_mod.STATUS_RESIDUAL:
-        blocking = contracts.blocking_count(findings, strict=strict)
-        kind = "阻塞问题（--strict：含【一般】）" if strict else "【严重】"
+        blocking = contracts.blocking_count(findings, severe_only=severe_only)
+        kind = "项【严重】残留" if severe_only else "项阻塞问题（【严重】或【一般】）残留"
         return (
-            f"达修复轮次上限，仍有 {blocking} 项{kind}残留"
+            f"达修复轮次上限，仍有 {blocking} {kind}"
             f"（共 {review_round} 轮审查 / {fix_rounds} 轮修复）"
         )
     if status == state_mod.STATUS_INTERRUPTED:

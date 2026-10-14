@@ -481,9 +481,9 @@ def _parse_deleted_declaration(
     return result
 
 
-def judge_clean(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) -> bool:
-    """干净判定（Design §4.4）：默认无【严重】；``strict`` 加严为无严重且无一般。"""
-    return blocking_count(findings, strict=strict) == 0
+def judge_clean(findings: Sequence[Mapping[str, Any]], *, severe_only: bool = False) -> bool:
+    """干净判定（Design §4.4）：默认【严重】与【一般】都阻塞；``severe_only`` 放宽为只阻塞【严重】。"""
+    return blocking_count(findings, severe_only=severe_only) == 0
 
 
 #: severity 的严重度次序（越小越严重）
@@ -664,13 +664,13 @@ def merge_review_reports(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"files": files, "summary": summary}
 
 
-def blocking_count(findings: Sequence[Mapping[str, Any]], *, strict: bool = False) -> int:
-    """阻塞性结论条数（默认只数【严重】，``strict`` 下并入【一般】）。
+def blocking_count(findings: Sequence[Mapping[str, Any]], *, severe_only: bool = False) -> int:
+    """阻塞性结论条数（默认【严重】+【一般】；``severe_only`` 放宽为只数【严重】）。
 
-    与 :func:`judge_clean` 同源：达限残留的文案与判定口径必须一致——``--strict`` 下
+    与 :func:`judge_clean` 同源：达限残留的文案与判定口径必须一致——默认判据下
     残留可能全部由【一般】构成，报告与渲染不得再写死"【严重】"。
     """
-    blocking = (SEVERE, MODERATE) if strict else (SEVERE,)
+    blocking = (SEVERE,) if severe_only else (SEVERE, MODERATE)
     return sum(
         1 for item in findings if isinstance(item, Mapping) and item.get("severity") in blocking
     )

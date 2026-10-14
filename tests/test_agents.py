@@ -312,7 +312,7 @@ class TestNodeAssembly:
             "current_code": str(workspace / "code_v1.py"),
             "review_round": 0,
             "fix_rounds": 0,
-            "strict": False,
+            "severe_only": False,
         }
 
         with_tools = fakes.ScriptedChatModel(
@@ -349,7 +349,7 @@ class TestNodeAssembly:
             "current_code": str(workspace / "code_v1.py"),
             "review_round": 0,
             "fix_rounds": 0,
-            "strict": False,
+            "severe_only": False,
         }
 
         first = review(state)
@@ -369,7 +369,7 @@ class TestNodeAssembly:
                 "current_code": str(workspace / "code_v1.py"),
                 "review_round": 1,
                 "fix_rounds": 0,
-                "strict": False,
+                "severe_only": False,
             },
             retry_feedback="findings 必须为数组",
         )
@@ -412,7 +412,7 @@ class TestNodeAssembly:
                 "current_code": str(workspace / "code_v1.py"),
                 "review_round": 1,
                 "fix_rounds": 0,
-                "strict": False,
+                "severe_only": False,
             }
         )
 
@@ -430,7 +430,7 @@ class TestNodeAssembly:
                 "current_code": str(workspace / "code_v1.py"),
                 "review_round": 1,
                 "fix_rounds": 0,
-                "strict": False,
+                "severe_only": False,
             }
         )
 

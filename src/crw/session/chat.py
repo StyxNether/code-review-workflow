@@ -125,7 +125,7 @@ def run_chat(
     overrides: RoundOverrides | None = None,
     file_input: tuple[Path, str] | None = None,
     resume_session_id: str | None = None,
-    strict: bool = False,
+    severe_only: bool = False,
     no_exec: bool = False,
     confirm_deletions: engine_mod.DeletionConfirmer | None = None,
 ) -> int:
@@ -142,7 +142,8 @@ def run_chat(
         overrides: 命令行显式给出的轮次覆盖（按字段生效，优先级最高，Design §4.4）。
         file_input: ``-f`` 起始的输入（路径与内容；仅新建会话的第 1 轮使用）。
         resume_session_id: ``--resume`` 的会话号（恢复记忆、代码版本与轮次设置）。
-        strict: 干净判定是否加严（随档案保留；恢复时取"档案或本次命令行"的并集）。
+        severe_only: 是否放宽干净判定（只把【严重】当阻塞；随档案保留，恢复时取"档案或本次
+            命令行"的并集）。
         no_exec: 是否关闭代码执行（按轮传入，不进档案——无法区分"显式关闭"与"未设置"）。
         confirm_deletions: 删除确认闸门（与 ``crw run`` 同一闸门，Design §4.2.2）。
 
@@ -158,7 +159,7 @@ def run_chat(
             new_session_id_factory=new_session_id_factory or _default_session_id_factory(clock),
             initial_rounds=initial_rounds,
             file_input=file_input,
-            strict=strict,
+            severe_only=severe_only,
         )
     except (OSError, ValueError) as exc:
         io.warn(f"crw chat：会话无法建立 — {exc}")
@@ -185,7 +186,7 @@ def run_chat(
             rounds_limit=limit,
             overrides=overrides,
             file_input=file_input,
-            strict=strict,
+            severe_only=severe_only,
             no_exec=no_exec,
             confirm_deletions=confirm_deletions,
         )
@@ -217,7 +218,7 @@ def _start_session(
     new_session_id_factory: Callable[[], str],
     initial_rounds: RoundSettings | None,
     file_input: tuple[Path, str] | None,
-    strict: bool,
+    severe_only: bool,
 ) -> SessionState:
     """恢复既有会话或新建会话（返回会话状态；失败抛可读异常）。"""
     if resume_session_id:
@@ -268,7 +269,7 @@ def _start_session(
             "max_iterations": rounds.max_iterations,
             "max_iterations_source": rounds.max_iterations_source,
             "rounds_mode": rounds.rounds_mode,
-            "strict": strict,
+            "severe_only": severe_only,
         },
         input_descriptor=descriptor,
     )
@@ -292,7 +293,7 @@ def _conversation_loop(
     rounds_limit: int,
     overrides: RoundOverrides | None,
     file_input: tuple[Path, str] | None,
-    strict: bool,
+    severe_only: bool,
     no_exec: bool,
     confirm_deletions: engine_mod.DeletionConfirmer | None,
 ) -> int:
@@ -321,7 +322,7 @@ def _conversation_loop(
                 rounds_limit=rounds_limit,
                 overrides=overrides,
                 file_input=file_input,
-                strict=strict,
+                severe_only=severe_only,
                 no_exec=no_exec,
                 confirm_deletions=confirm_deletions,
             )
@@ -348,7 +349,7 @@ def _handle_message(
     rounds_limit: int,
     overrides: RoundOverrides | None,
     file_input: tuple[Path, str] | None,
-    strict: bool,
+    severe_only: bool,
     no_exec: bool,
     confirm_deletions: engine_mod.DeletionConfirmer | None,
 ) -> int | None:
@@ -405,7 +406,7 @@ def _handle_message(
         clock=clock,
         run_id_factory=run_id_factory,
         file_input=file_input,
-        strict=strict,
+        severe_only=severe_only,
         no_exec=no_exec,
         confirm_deletions=confirm_deletions,
     )
@@ -554,7 +555,7 @@ def _run_round(
     clock: Callable[[], str],
     run_id_factory: engine_mod.RunIdFactory | None,
     file_input: tuple[Path, str] | None,
-    strict: bool,
+    severe_only: bool,
     no_exec: bool,
     confirm_deletions: engine_mod.DeletionConfirmer | None,
 ) -> RoundOutcome | None:
@@ -595,7 +596,7 @@ def _run_round(
         max_iterations=settings.max_iterations,
         max_iterations_source=settings.max_iterations_source,
         rounds_mode=settings.rounds_mode,
-        strict=_effective_strict(state, cli_strict=strict),
+        severe_only=_effective_severe_only(state, cli_severe_only=severe_only),
         no_exec=no_exec,
         resolved=resolved,
         session_id=session_id,
@@ -652,10 +653,14 @@ def _memory_snapshot_safely(
         return {}
 
 
-def _effective_strict(state: Mapping[str, Any], *, cli_strict: bool) -> bool:
-    """本轮干净判定是否加严：档案里的设置或本次命令行（Design §4.4 的继承口径）。"""
+def _effective_severe_only(state: Mapping[str, Any], *, cli_severe_only: bool) -> bool:
+    """本轮是否放宽干净判定：本次命令行或档案里的设置（Design §4.4 的继承口径）。
+
+    并集方向与 ``--severe-only`` 的语义一致：命令行只能放宽判定，不能把档案里的放宽
+    重新收紧——续跑 / 恢复会话是"接着干"，换判定标准会让结论不可比。
+    """
     settings = state.get("settings") if isinstance(state.get("settings"), Mapping) else {}
-    return bool(cli_strict) or bool(settings.get("strict"))
+    return bool(cli_severe_only) or bool(settings.get("severe_only"))
 
 
 def _update_session_after_round(
@@ -695,7 +700,7 @@ def _update_session_after_round(
         review_round=int(run_state.get("review_round") or 0),
         fix_rounds=int(run_state.get("fix_rounds") or 0),
         findings=run_state.get("findings") if isinstance(run_state.get("findings"), list) else [],
-        strict=bool(run_state.get("strict")),
+        severe_only=bool(run_state.get("severe_only")),
     )
     session_state.record_round(
         state,
@@ -868,7 +873,11 @@ def build_session_md(state: Mapping[str, Any], *, session_path: Path) -> str:
     )
     lines.append(
         "| 干净判定 | "
-        + ("无【严重】且无【一般】（--strict）" if settings.get("strict") else "无【严重】")
+        + (
+            "无【严重】（--severe-only 放宽）"
+            if settings.get("severe_only")
+            else "无【严重】且无【一般】（默认判据）"
+        )
         + " |"
     )
     lines.append("")
@@ -989,6 +998,14 @@ def _print_session_header(
         version_note = f"；当前代码 code_v{version}/" if version else ""
         io.say(f"[会话] 已恢复：已完成 {len(rounds)} 轮{version_note}")
     io.say("[会话] 直接说需求即可；/exit 或 Ctrl+C 退出；一轮进行中 Ctrl+C 可中断本轮（会话保留）")
+    io.say(
+        "[判定] "
+        + (
+            "仅【严重】阻塞（--severe-only 放宽）"
+            if settings.get("severe_only")
+            else "【严重】与【一般】都算阻塞，不阻塞的只有【建议】"
+        )
+    )
     io.say(f"会话记录：{session_state.session_dir(str(state.get('session_id') or ''))}")
     io.say("")
 

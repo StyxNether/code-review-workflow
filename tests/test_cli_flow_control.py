@@ -26,7 +26,7 @@ def write_parent_record(
     *,
     code: str = "print(1)\n",
     max_iterations: int = 2,
-    strict: bool = False,
+    severe_only: bool = False,
     parallel_review: bool = False,
     with_code: bool = True,
 ) -> Path:
@@ -56,7 +56,7 @@ def write_parent_record(
         "version_files": ["main.py"] if with_code else [],
         "findings": [fakes.finding(location="main.py:1")],
         "clean": False,
-        "strict": strict,
+        "severe_only": severe_only,
         "history": [],
         "status": state_mod.STATUS_RESIDUAL,
         "next_action": state_mod.NEXT_FIX_AGAIN,
@@ -102,13 +102,13 @@ def test_resume_inherits_parent_rounds_and_records_parent_run_id(
     assert "| 父运行残留 |" in report
 
 
-def test_resume_inherits_strict_and_explicit_rounds_win(
+def test_resume_inherits_severe_only_and_explicit_rounds_win(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """父运行的判定标准一并继承；命令行显式给出轮次时以命令行为准（来源标 cli）。"""
-    write_parent_record(max_iterations=2, strict=True)
+    write_parent_record(max_iterations=2, severe_only=True)
     configured_provider()
     fake_chat_model.load(
         [
@@ -125,7 +125,38 @@ def test_resume_inherits_strict_and_explicit_rounds_win(
     assert state is not None
     assert state["max_iterations"] == 0
     assert state["max_iterations_source"] == state_mod.SOURCE_CLI
-    assert state["strict"] is True
+    assert state["severe_only"] is True
+
+
+def test_resume_of_a_pre_severe_only_record_judges_strictly(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """旧记录没有 ``severe_only`` 字段：按缺省 False（加严）解释——口径统一，不是缺陷。
+
+    同一条记录续跑时判据比它当初更严（Design §8.2 记一句），测试把这条预期钉住：
+    不得因为字段缺席就退回"只数【严重】"的旧默认。
+    """
+    run_dir = write_parent_record()
+    legacy = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    legacy.pop("severe_only")
+    (run_dir / "state.json").write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_tool_call("read_file", path="code_v1/main.py"),
+            fakes.ai_text(fakes.review_fence([], "已读完文件。")),
+        ]
+    )
+
+    assert main(["resume", "r-20261012-0001"]) == 0
+    capsys.readouterr()
+
+    child = next(item for item in records.list_runs() if item.run_id != "r-20261012-0001")
+    state = records.read_state(child.path)
+    assert state is not None
+    assert state["severe_only"] is False
 
 
 def test_resume_without_a_code_version_is_readable(

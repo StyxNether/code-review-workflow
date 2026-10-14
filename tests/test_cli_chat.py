@@ -151,7 +151,7 @@ def test_resume_inherits_the_parent_rounds_mode(
     fake_chat_model: ScriptedChatModel,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """续跑未显式给 --rounds-mode 时继承父运行的模式（与 --strict / 审查形态同口径）。"""
+    """续跑未显式给 --rounds-mode 时继承父运行的模式（与 --severe-only / 审查形态同口径）。"""
     _configured(configured_provider, fake_chat_model)
     fake_chat_model.load(
         [

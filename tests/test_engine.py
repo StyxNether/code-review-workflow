@@ -343,7 +343,7 @@ def test_residual_report_lists_the_last_round_without_disposition(
 
     text = report_text(result)
 
-    assert "结论：达修复轮次上限，仍有 1 项【严重】残留" in text
+    assert "结论：达修复轮次上限，仍有 1 项阻塞问题（【严重】或【一般】）残留" in text
     assert "### 第 2 轮审查（基于 `code_v2/`）" in text
     assert "处置：—" in text  # 末轮无修复轮，未处置
 
@@ -394,40 +394,54 @@ def test_injected_review_sequence_can_force_residual(
     assert contracts.residual_severe(read_state(result)["findings"]) == 1
 
 
-def test_strict_mode_blocks_on_moderate_findings(
+def test_moderate_findings_block_by_default(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """--strict 加严判定：无【严重】但有【一般】时仍判不干净（Design §4.4）。"""
+    """默认判据把【一般】也算阻塞；``--severe-only`` 才放宽回"只数【严重】"（Design §4.4）。"""
     moderate = [{"severity": "一般", "location": "code_v1.py:3", "issue": "静默吞异常"}]
     nodes = {"review": scripted_review(moderate)}
 
-    lenient = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+    default = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
         engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0)
     )
-    strict = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
-        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0, strict=True)
+    relaxed = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0, severe_only=True)
     )
 
-    assert lenient.exit_code == 0
-    assert strict.exit_code == 1
-    assert read_state(strict)["strict"] is True
+    assert default.exit_code == 1
+    assert read_state(default)["severe_only"] is False
+    assert relaxed.exit_code == 0
+    assert read_state(relaxed)["severe_only"] is True
 
 
-def test_strict_residual_report_counts_blocking_findings(
+def test_residual_report_counts_moderate_findings_as_blocking(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """--strict 下残留可能全部由【一般】构成：报告口径与判定同源，不得写"0 项【严重】"。"""
+    """默认判据下残留可全部由【一般】构成：报告口径与判定同源，不得写"0 项【严重】"。"""
     moderate = [{"severity": "一般", "location": "code_v1.py:3", "issue": "静默吞异常"}]
     nodes = {"review": scripted_review(moderate)}
 
     result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
-        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0, strict=True)
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0)
     )
 
     text = report_text(result)
-    assert "仍有 1 项阻塞问题（--strict：含【一般】）残留" in text
+    assert "仍有 1 项阻塞问题（【严重】或【一般】）残留" in text
     assert "仍有 0 项" not in text
     assert contracts.residual_severe(result.findings) == 0  # runs 列表的"残留严重数"仍只数严重
+
+
+def test_severe_only_residual_names_the_severe_findings(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """放宽判据后的残留文案仍逐项指明【严重】——两种口径的文案都不得含糊。"""
+    nodes = {"review": scripted_review([severe_finding()])}
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=0, severe_only=True)
+    )
+
+    assert "仍有 1 项【严重】残留" in report_text(result)
 
 
 def test_contract_violation_retries_once_with_feedback(
@@ -1042,7 +1056,7 @@ def test_parallel_review_runs_two_views_and_merges_them(
     assert len(security_only) == 1 and security_only[0]["severity"] == "严重"
     # 汇合结果即干净判定依据：安全性独有的一项是【严重】→ 不得干净通过
     assert state["clean"] is False
-    assert contracts.judge_clean(merged, strict=False) is state["clean"]
+    assert contracts.judge_clean(merged, severe_only=False) is state["clean"]
 
 
 def test_parallel_review_branch_keys_are_not_persisted(

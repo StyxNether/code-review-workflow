@@ -325,7 +325,7 @@ def round_report(
         review_round=_as_int(state.get("review_round")),
         fix_rounds=_as_int(state.get("fix_rounds")),
         findings=state.get("findings") if isinstance(state.get("findings"), list) else [],
-        strict=bool(state.get("strict")),
+        severe_only=bool(state.get("severe_only")),
     )
     next_action = str(state.get("next_action") or "")
     version_dir = str(state.get("current_version_dir") or "")

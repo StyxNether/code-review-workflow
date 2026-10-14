@@ -84,7 +84,7 @@ def test_run_defaults() -> None:
     assert args.requirement is None
     assert args.file is None
     assert args.max_iter == engine_mod.DEFAULT_MAX_ITERATIONS
-    assert args.strict is False
+    assert args.severe_only is False
     assert args.no_exec is False
     assert args.out is None
     assert args.model is None
@@ -99,7 +99,7 @@ def test_run_accepts_all_documented_options() -> None:
             "写一个命令行计算器",
             "--max-iter",
             "1",
-            "--strict",
+            "--severe-only",
             "--no-exec",
             "--out",
             "dist",
@@ -113,7 +113,7 @@ def test_run_accepts_all_documented_options() -> None:
 
     assert args.requirement == "写一个命令行计算器"
     assert args.max_iter == 1
-    assert args.strict is True
+    assert args.severe_only is True
     assert args.no_exec is True
     assert args.out == "dist"
     assert args.model == "deepseek-chat"
@@ -423,7 +423,7 @@ def test_run_with_divide_by_zero_fixture_residual(
     assert main(["run", "--max-iter", "1", "-f", str(sample_path("divide_by_zero.py"))]) == 1
 
     captured = capsys.readouterr()
-    assert "达修复轮次上限，仍有 1 项【严重】残留" in captured.out
+    assert "达修复轮次上限，仍有 1 项阻塞问题（【严重】或【一般】）残留" in captured.out
 
     (summary,) = records.list_runs()
     assert summary.status == state_mod.STATUS_RESIDUAL
@@ -698,7 +698,7 @@ def test_run_state_file_records_the_cli_options(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """选项落进状态快照：``--max-iter 0``（只审不修）与 ``--strict``。"""
+    """选项落进状态快照：``--max-iter 0``（只审不修）与 ``--severe-only``（放宽判定）。"""
     configured_provider()
     fake_chat_model.load(
         [
@@ -711,17 +711,22 @@ def test_run_state_file_records_the_cli_options(
         ]
     )
 
-    assert (
-        main(["run", "-f", str(sample_path("divide_by_zero.py")), "--max-iter", "0", "--strict"])
-        == 1
-    )
+    argv = [
+        "run",
+        "-f",
+        str(sample_path("divide_by_zero.py")),
+        "--max-iter",
+        "0",
+        "--severe-only",
+    ]
+    assert main(argv) == 1
     capsys.readouterr()
 
     (summary,) = records.list_runs()
     state = records.read_state(summary.path)
     assert state is not None
     assert state["max_iterations"] == 0
-    assert state["strict"] is True
+    assert state["severe_only"] is True
     assert state["input"]["kind"] == state_mod.INPUT_FILE
     assert state["findings"] and state["next_action"] == state_mod.NEXT_FIX_AGAIN
 

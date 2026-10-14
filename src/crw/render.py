@@ -614,7 +614,7 @@ def _render_result(
             review_round=result.review_round,
             fix_rounds=result.fix_rounds,
             findings=result.findings,
-            strict=bool(result.state.get("strict")),
+            severe_only=bool(result.state.get("severe_only")),
         )
         head = f"── 完成：{conclusion} "
         style = "bold green" if result.succeeded else "bold yellow"

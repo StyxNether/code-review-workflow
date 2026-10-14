@@ -120,7 +120,7 @@ class RunState(TypedDict, total=False):
     findings_correctness: list[Finding]
     findings_security: list[Finding]
     clean: bool
-    strict: bool
+    severe_only: bool
     history: Annotated[list[NodeEvent], operator.add]
     status: str
     next_action: str | None
@@ -152,7 +152,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "version_files",
     "findings",
     "clean",
-    "strict",
+    "severe_only",
     "history",
     "status",
     "next_action",
@@ -184,7 +184,7 @@ _DEFAULTS: dict[str, Any] = {
     "version_files": [],
     "findings": [],
     "clean": False,
-    "strict": False,
+    "severe_only": False,
     "history": [],
     "status": STATUS_RUNNING,
     "next_action": None,
@@ -258,7 +258,7 @@ def new_state(
     model: str,
     created_at: str,
     rounds_mode: str = ROUNDS_UP_TO,
-    strict: bool = False,
+    severe_only: bool = False,
     parallel_review: bool = False,
     parent_run_id: str | None = None,
     session_id: str | None = None,
@@ -275,7 +275,7 @@ def new_state(
         model: 本次运行的模型标识（``供应商/模型名``，Design §4.3）。
         created_at: 开始时间戳（ISO 8601，由注入时钟给出）。
         rounds_mode: 轮次语义（up-to 干净即早退 / exact 跑满，Design §4.4）。
-        strict: 是否启用加严干净判定（Design §4.4）。
+        severe_only: 是否放宽干净判定（只把【严重】当阻塞，Design §4.4 的 ``--severe-only``）。
         parallel_review: 是否启用并行双视角审查（Design §12.2 的扩展示例）。
         parent_run_id: 续跑来源运行号（resume 时写入，新运行为空）。
         session_id: 所属会话号（会话轮次写入；一次性运行为空）。
@@ -307,7 +307,7 @@ def new_state(
         findings_correctness=[],
         findings_security=[],
         clean=False,
-        strict=strict,
+        severe_only=severe_only,
         history=[],
         status=STATUS_RUNNING,
         next_action=None,

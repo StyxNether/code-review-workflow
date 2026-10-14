@@ -141,7 +141,9 @@ def _add_workflow_options(
         help=("轮次语义：up-to = 干净即早退（默认）；exact = 跑满指定轮次，结尾恒为一次审查"),
     )
     parser.add_argument(
-        "--strict", action="store_true", help="干净判定加严：无【严重】且无【一般】"
+        "--severe-only",
+        action="store_true",
+        help="放宽干净判定：只把【严重】当阻塞（默认【严重】与【一般】都算阻塞）",
     )
     if include_parallel_review:
         parser.add_argument(
@@ -393,7 +395,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         max_iterations=rounds,
         max_iterations_source=source,
         rounds_mode=args.rounds_mode or state_mod.ROUNDS_UP_TO,
-        strict=bool(args.strict),
+        severe_only=bool(args.severe_only),
         no_exec=bool(args.no_exec),
         parallel_review=bool(args.parallel_review),
         resolved=resolved,
@@ -587,7 +589,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         overrides=overrides,
         file_input=file_input,
         resume_session_id=args.resume,
-        strict=bool(args.strict),
+        severe_only=bool(args.severe_only),
         no_exec=bool(args.no_exec),
         confirm_deletions=_deletion_confirmer(),
     )
@@ -632,7 +634,7 @@ def _rounds_for_resume(
 ) -> tuple[int, str, str]:
     """``crw resume`` 的轮次取值（Design §4.4）：命令行显式 > 继承父运行 > 配置默认 > 内置。
 
-    ``--strict`` 与审查形态（``--parallel-review``）一并继承父运行——续跑是"接着修"，
+    ``--severe-only`` 与审查形态（``--parallel-review``）一并继承父运行——续跑是"接着修"，
     换判定标准或换审查方式会让结论不可比；``--no-exec`` 例外（它不进状态快照）。
     父运行的轮次数值只在未被命令行显式覆盖时才解析：否则那句"不合法 / 已回退"的提示
     描述的是一个并未发生的回退。
@@ -705,7 +707,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     ``-f`` 不适用（起点由父运行决定）；父运行须存在 ``current_version_dir`` 且目录仍在，
     否则给出可读原因并退出 2。旧单文件格式记录不做兼容（用户裁决 2026-10-13）：给一行
     可读提示并退出 2。未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
-    ``--strict`` 与审查形态一并继承——续跑是"接着修"，换判定标准会让结论不可比。
+    ``--severe-only`` 与审查形态一并继承——续跑是"接着修"，换判定标准会让结论不可比。
     ``--no-exec`` 不继承（它不进状态快照，命令面无法可靠区分"显式关闭"与"从未设置"）。
     """
     try:
@@ -751,7 +753,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         max_iterations=rounds,
         max_iterations_source=rounds_source,
         rounds_mode=rounds_mode,
-        strict=bool(args.strict) or bool(parent_state.get("strict")),
+        severe_only=bool(args.severe_only) or bool(parent_state.get("severe_only")),
         no_exec=bool(args.no_exec),
         parallel_review=bool(args.parallel_review) or bool(parent_state.get("parallel_review")),
         resolved=resolved,
@@ -1786,7 +1788,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: 命令行参数（不含程序名）；省略时取 ``sys.argv[1:]``。
 
     Returns:
-        进程退出码：0 完成 / 1 达修复轮次上限仍有【严重】/ 2 运行错误（Design §8.1）。
+        进程退出码：0 完成 / 1 达修复轮次上限仍有阻塞问题（默认含【一般】，
+        ``--severe-only`` 时只算【严重】）/ 2 运行错误（Design §8.1）。
     """
     command: str | None = None
     try:

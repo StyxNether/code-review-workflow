@@ -247,21 +247,24 @@ def test_review_contract_accepts_empty_findings_with_summary() -> None:
 
 
 @pytest.mark.parametrize(
-    ("severities", "strict", "expected"),
+    ("severities", "severe_only", "expected"),
     [
         ([], False, True),
         (["建议"], False, True),
-        (["一般"], False, True),
+        (["一般"], False, False),
         (["严重"], False, False),
-        (["建议", "一般"], True, False),
-        (["建议"], True, True),
+        (["建议", "一般"], False, False),
         ([], True, True),
+        (["建议"], True, True),
+        (["一般"], True, True),
+        (["严重"], True, False),
     ],
 )
-def test_judge_clean(severities: list[str], strict: bool, expected: bool) -> None:
+def test_judge_clean(severities: list[str], severe_only: bool, expected: bool) -> None:
+    """默认判据把【一般】也当阻塞（Design §4.4）；``severe_only`` 才是旧的"只数【严重】"。"""
     findings = [finding(severity) for severity in severities]
 
-    assert contracts.judge_clean(findings, strict=strict) is expected
+    assert contracts.judge_clean(findings, severe_only=severe_only) is expected
 
 
 def test_severity_counts_and_residual_severe() -> None:

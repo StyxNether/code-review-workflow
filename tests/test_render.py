@@ -207,25 +207,41 @@ def test_residual_conclusion_counts_severe_findings() -> None:
         err=err,
     )
 
-    assert "达修复轮次上限，仍有 1 项【严重】残留" in out.getvalue()
+    assert "达修复轮次上限，仍有 1 项阻塞问题（【严重】或【一般】）残留" in out.getvalue()
     assert err.getvalue() == ""
 
 
-def test_strict_residual_conclusion_counts_blocking_findings() -> None:
-    """--strict 下残留可能全部是【一般】：文案与判定口径一致（不得写"0 项【严重】"）。"""
+def test_residual_conclusion_counts_moderate_findings_as_blocking() -> None:
+    """默认判据下残留可能全部是【一般】：文案与判定口径一致（不得写"0 项【严重】"）。"""
     moderate = {"id": "f-1", "severity": "一般", "location": "code_v1.py:3", "issue": "静默吞异常"}
     out, err = StringIO(), StringIO()
 
     render.render_result(
+        result_for(state_mod.STATUS_RESIDUAL, exit_code=1, findings=(moderate,)),
+        out=out,
+        err=err,
+    )
+
+    assert "仍有 1 项阻塞问题（【严重】或【一般】）残留" in out.getvalue()
+    assert "0 项" not in out.getvalue()
+
+
+def test_severe_only_conclusion_keeps_the_severe_wording() -> None:
+    """``--severe-only`` 的残留文案指名【严重】——放宽口径下读数的人要能看出判据不同。"""
+    out, err = StringIO(), StringIO()
+
+    render.render_result(
         result_for(
-            state_mod.STATUS_RESIDUAL, exit_code=1, findings=(moderate,), state={"strict": True}
+            state_mod.STATUS_RESIDUAL,
+            exit_code=1,
+            findings=(finding(),),
+            state={"severe_only": True},
         ),
         out=out,
         err=err,
     )
 
-    assert "仍有 1 项阻塞问题（--strict：含【一般】）残留" in out.getvalue()
-    assert "0 项" not in out.getvalue()
+    assert "仍有 1 项【严重】残留" in out.getvalue()
 
 
 def test_interrupted_status_label_is_live_for_session_records() -> None:
