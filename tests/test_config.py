@@ -507,3 +507,32 @@ def test_importable_providers_keeps_object_entries() -> None:
         "deepseek-flash",
         {"name": "deepseek-v4-pro", "thinking": {"levels": ["high"]}},
     ]
+
+
+def _preset_levels(preset: config.ProviderPreset, model: str) -> list[str] | None:
+    payload = config.model_thinking_config(list(preset.models), model)
+    return payload["levels"] if payload else None
+
+
+def test_presets_prefill_thinking_levels_per_user_rulings() -> None:
+    """预设回填锁住 2026-10-14 的四项用户裁决。
+
+    裁决：GLM 接受"不可关闭思考"→ 不预填；Kimi k2.6 新增 on 映射（thinking.type 开启）；
+    百炼新增 enable-off 映射（enable_thinking 关闭）；OpenAI 按 5.6 系列口径预填。
+    """
+    presets = {preset.name: preset for preset in config.PROVIDER_PRESETS}
+
+    assert _preset_levels(presets["DeepSeek"], "deepseek-flash") == [
+        "off",
+        "none",
+        "low",
+        "high",
+        "max",
+    ]
+    assert _preset_levels(presets["Kimi (Moonshot)"], "kimi-k2.6") == ["off", "on"]
+    assert _preset_levels(presets["Kimi (Moonshot)"], "kimi-k3") == ["low", "high"]
+    assert _preset_levels(presets["阿里云百炼"], "qwen3.8-max") == ["enabled", "enable-off"]
+    assert _preset_levels(presets["OpenAI"], "gpt-6-astra") == ["none", "low", "medium", "high"]
+    # GLM（Z.ai / BigModel）：思考恒开、无可配置项 → 条目保持纯字符串（不预填）
+    for name in ("Z.ai Coding Plan", "Z.ai API", "BigModel Coding Plan", "BigModel API"):
+        assert all(isinstance(item, str) for item in presets[name].models)

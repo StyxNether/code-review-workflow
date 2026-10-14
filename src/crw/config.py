@@ -66,19 +66,21 @@ class ProviderPreset:
     env_var: str
 
 
-# 思考挡位预填说明（2026-10-14 查证各供应商官网，Design §8.3 的"查证才预填"口径）：
+# 思考挡位预填说明（2026-10-14 查证各供应商官网；四项通道差异已由用户裁决，同日落地）：
 # - DeepSeek：thinking.type=enabled/disabled 与 reasoning_effort=none/low/high/max（V4 系档位
 #   为 low/high/max，medium 未列入文档 → 不预填），off 走 thinking.type、none 走 effort=none；
-# - Kimi：k2.6 支持 thinking.type=disabled（off 可用）；k3 无 thinking 参数、用
-#   reasoning_effort=low/high/max（low/high 预填，max 的内置映射复合了 thinking.type → 不预填）；
-# - OpenAI：reasoning_effort=none/low/medium/high（GPT-5.1 起 none 取代 minimal）；
+# - Kimi：k2.6 支持 thinking.type=disabled，开启用 thinking.type=enabled（内置 on）→ 预填
+#   off/on（用户裁决 2026-10-14 新增 on 映射）；k3 无 thinking 参数、用 reasoning_effort
+#   （预填 low/high；max 的内置映射复合了 thinking.type → 不预填）；
+# - OpenAI：reasoning_effort=none/low/medium/high——按 5.6 系列（当代 GPT）口径预填
+#   （用户裁决："gpt 走 5.6 系列"；官网逐模型核实仍由用户按需进行，可随时在菜单 6 清空/修改）；
 # - 阿里云百炼：enable_thinking 布尔与 thinking_budget 走 extra_body（qwen3.8 混合思考模型），
-#   enabled 与内置映射一致；off 通道不同（Qwen 用 enable_thinking=false）→ 不预填；
-# - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 报错），正确通道
-#   thinking.type=enabled 与内置任何名字的映射都不完全一致 → 不预填，交用户裁决（见收尾总结）。
+#   enabled / enable-off 与内置映射一致（关闭对偶为用户裁决 2026-10-14 新增）→ 预填两者；
+# - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 报错，官方口径），
+#   思考恒开（默认交错思考）→ 用户裁决"接受不可关闭"，**不预填**（无可用配置项，保持字符串条目）。
 _THINKING_DEEPSEEK = {"levels": ["off", "none", "low", "high", "max"]}
 _THINKING_OPENAI = {"levels": ["none", "low", "medium", "high"]}
-_THINKING_QWEN = {"levels": ["enabled"]}
+_THINKING_QWEN = {"levels": ["enabled", "enable-off"]}
 
 PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset(
@@ -95,7 +97,7 @@ PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
         "https://api.moonshot.cn/v1",
         (
             {"name": "kimi-k3", "thinking": {"levels": ["low", "high"]}},
-            {"name": "kimi-k2.6", "thinking": {"levels": ["off"]}},
+            {"name": "kimi-k2.6", "thinking": {"levels": ["off", "on"]}},
         ),
         "CRW_MOONSHOT_API_KEY",
     ),

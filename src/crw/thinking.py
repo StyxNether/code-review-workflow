@@ -15,12 +15,14 @@ BUILTIN_LEVELS: tuple[str, ...] = (
     "off",
     "none",
     "disabled",
+    "on",
     "minimal",
     "low",
     "medium",
     "high",
     "max",
     "enabled",
+    "enable-off",
 )
 
 #: 数值预算挡位的前缀，完整形态为 ``budget:<正整数>``
@@ -67,11 +69,13 @@ def resolve_level_params(level: str) -> dict[str, Any]:
     通道设计依据 Design §8.3 内置等级表：关闭族有两个通道（``thinking.type=disabled``
     与 ``reasoning_effort=none``），按名分派——``off`` / ``disabled`` 走前者（DeepSeek
     等兼容层支持 Anthropic 风格参数），``none`` 走后者（OpenAI / DeepSeek 的
-    ``reasoning_effort`` 取值，``none`` 即关闭思考）；minimal..high 走
+    ``reasoning_effort`` 取值，``none`` 即关闭思考）；``on`` 是 ``off`` 的开启对偶
+    （``thinking.type=enabled``，Kimi k2.6 等用此通道开启）；minimal..high 走
     ``reasoning_effort`` 一等参数；max 复合注入（effort 顶格 high，另以
-    ``thinking.type=enabled`` 声明开启）；enabled 用 ``enable_thinking`` 通用开关
-    （Qwen 系的百炼兼容层）；budget:<n> 以 ``thinking_budget`` 传数值预算；其余名称
-    视为用户自定义的供应商参数，原样透传给兼容层解释。
+    ``thinking.type=enabled`` 声明开启）；enabled / enable-off 是 ``enable_thinking``
+    布尔开关的开与关（Qwen 系的百炼兼容层，用户裁决 2026-10-14 新增关闭对偶）；
+    budget:<n> 以 ``thinking_budget`` 传数值预算；其余名称视为用户自定义的供应商参数，
+    原样透传给兼容层解释。
     """
     name = level.strip()
     if not name:
@@ -85,6 +89,8 @@ def resolve_level_params(level: str) -> dict[str, Any]:
         return {"extra_body": {"thinking_budget": int(digits)}}
     if name in ("off", "disabled"):
         return {"extra_body": {"thinking": {"type": "disabled"}}}
+    if name == "on":
+        return {"extra_body": {"thinking": {"type": "enabled"}}}
     if name == "none":
         return {"reasoning_effort": "none"}
     if name in ("minimal", "low", "medium", "high"):
@@ -96,6 +102,8 @@ def resolve_level_params(level: str) -> dict[str, Any]:
         }
     if name == "enabled":
         return {"extra_body": {"enable_thinking": True}}
+    if name == "enable-off":
+        return {"extra_body": {"enable_thinking": False}}
     return {"extra_body": {name: True}}
 
 

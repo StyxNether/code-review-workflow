@@ -471,21 +471,24 @@ crw --version                             # 版本号
   |---|---|---|
   | `off` / `disabled` | `extra_body={"thinking": {"type": "disabled"}}` | 关闭思考（DeepSeek 等兼容层支持 Anthropic 风格参数） |
   | `none` | `reasoning_effort="none"`（OpenAI / DeepSeek 均以 none 表示关闭思考） | 关闭思考的第二通道，按名分派 |
+  | `on` | `extra_body={"thinking": {"type": "enabled"}}` | `off` 的开启对偶（Kimi k2.6 等需显式开启的通道；用户裁决 2026-10-14 新增） |
   | `minimal` / `low` / `medium` / `high` | `reasoning_effort="<等级>"` | OpenAI 系与 DeepSeek 系（DeepSeek 官方示例用 `high`） |
   | `max` | `extra_body={"thinking": {"type": "enabled"}}` + `reasoning_effort="high"` | 供应商自定义的"最高档" |
   | `enabled`（布尔开关） | `extra_body={"enable_thinking": true}` | 部分国产兼容端点（以官网为准） |
+  | `enable-off`（布尔开关） | `extra_body={"enable_thinking": false}` | `enabled` 的关闭对偶（百炼 Qwen 系的关闭通道；用户裁决 2026-10-14 新增） |
   | `budget:<n>`（数值预算） | `extra_body={"thinking_budget": n}` | 供应商自定义预算 |
 
   实现轮已**查各预配置供应商官网回填**（查证日 2026-10-14）：
   - **DeepSeek**：`thinking.type` 与 `reasoning_effort`（V4 系档位 `none/low/high/max`）→ 预填 `off/none/low/high/max`；
   - **Kimi**：`kimi-k3` 用 `reasoning_effort`（`low/high/max`，无 `thinking` 参数）→ 预填 `low/high`；
-    `kimi-k2.6` 支持 `thinking.type=disabled` → 预填 `off`（其开启走 `thinking.type=enabled`，与内置 `enabled` 的
-    `enable_thinking` 通道不同，故不预填）；
-  - **OpenAI**：`reasoning_effort=none/low/medium/high`（GPT-5.1 起 `none` 取代 `minimal`）→ 按此预填；
-  - **阿里云百炼**：`enable_thinking`（布尔）与 `thinking_budget` 走 `extra_body` → 预填 `enabled`（关闭通道为
-    `enable_thinking=false`，与内置 `off` 通道不同，故不预填）；
-  - **Z.ai / BigModel（GLM-5.3 系）**：**不支持关闭思考**（`thinking.type=disabled` 报错），正确通道
-    `thinking.type=enabled` 与内置任何名字的映射都不完全一致 → **不预填**，交用户裁决（告知已列入收尾总结）。
+    `kimi-k2.6` 用 `thinking.type`（可关可开）→ 预填 `off/on`（用户裁决 2026-10-14"新增映射"：
+    内置 `on` 即 `thinking.type=enabled`）；
+  - **OpenAI**：`reasoning_effort=none/low/medium/high` → 按 **5.6 系列（当代 GPT）口径**预填
+    （用户裁决 2026-10-14；官网逐模型核实由用户按需进行，可随时在菜单 6 清空 / 修改）；
+  - **阿里云百炼**：`enable_thinking`（布尔）与 `thinking_budget` 走 `extra_body` → 预填 `enabled/enable-off`
+    （用户裁决 2026-10-14"新增映射"：内置 `enable-off` 即 `enable_thinking=false`）；
+  - **Z.ai / BigModel（GLM-5.3 系）**：思考恒开（`thinking.type=disabled` 报错，官方口径不支持关闭）→
+    用户裁决 2026-10-14"接受不可关闭"：**不预填**（无可用配置项，条目保持字符串形态）。
   - 已核实（锁定版本行为）：`langchain-openai 1.7.0` / `openai 3.28.0` 均把 `reasoning_effort` 作一等参数并支持
     `extra_body`；`thinking` 非一等参数，必须走 `extra_body`。
   **官网查不到挡位的供应商不猜、不预填**：在收尾总结里**逐条列出交给用户**（用户裁决 2026-10-13："查不到的告诉我，

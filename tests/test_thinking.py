@@ -15,6 +15,16 @@ def test_off_family_sends_thinking_disabled(name: str) -> None:
     assert thinking.resolve_level_params(name) == {"extra_body": {"thinking": {"type": "disabled"}}}
 
 
+def test_on_sends_thinking_type_enabled() -> None:
+    """on 是 off 的开启对偶：thinking.type=enabled（Kimi k2.6 这类"可关但需显式开"的通道）。"""
+    assert thinking.resolve_level_params("on") == {"extra_body": {"thinking": {"type": "enabled"}}}
+
+
+def test_enable_off_sends_enable_thinking_false() -> None:
+    """enable-off 是 enabled 的关闭对偶：enable_thinking=False（Qwen 系百炼兼容层的关闭通道）。"""
+    assert thinking.resolve_level_params("enable-off") == {"extra_body": {"enable_thinking": False}}
+
+
 def test_none_sends_reasoning_effort_none() -> None:
     """none 走 reasoning_effort=none 通道（OpenAI / DeepSeek 均以 none 表示关闭思考）。"""
     assert thinking.resolve_level_params("none") == {"reasoning_effort": "none"}
