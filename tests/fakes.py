@@ -119,17 +119,25 @@ def fake_review(state: Mapping[str, Any]) -> Mapping[str, Any]:
 def fake_fix(state: Mapping[str, Any]) -> Mapping[str, Any]:
     """假修复节点：只做可脚本化且可复核的修复（语法缺陷），其余逐条标记 skipped。
 
-    输出版本内的**全部文件**（未改动的原样给出，每文件一个 ``python file=`` 围栏）。
+    与真实修复节点同形态（Design §4.2.2 的写盘形态）：把**改动过的文件**写回本轮的版本
+    目录（引擎已把上一版本复制进来），只交回 fixes 清单文本，未改动的文件不动。
     """
     files = read_version_files(state)
     findings = list(state.get("findings") or [])
     repaired_files, fixes = scripted_repair(files, findings)
-    fences = "\n\n".join(
-        f"```python file={name}\n{repaired_files[name]}```" for name in sorted(repaired_files)
-    )
-    payload = {"fixes": fixes}
-    text = f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
-    return {"fix_text": text}
+    target = Path(str(state.get("current_version_dir") or ""))
+    for name in sorted(repaired_files):
+        if _normalized(repaired_files[name]) == _normalized(files.get(name, "")):
+            continue
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(repaired_files[name], encoding="utf-8")
+    return {"fix_text": fix_contract(fixes)}
+
+
+def _normalized(code: str) -> str:
+    """与引擎落盘同口径的归一化（首尾换行剥离 + 单个结尾换行）：比较"有没有真的改动"。"""
+    return code.strip("\n") + "\n"
 
 
 def read_version_files(state: Mapping[str, Any]) -> dict[str, str]:
@@ -557,23 +565,34 @@ def review_fence(
     return f"检查完毕。\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
 
 
-def fix_fence(
+def fix_contract(fixes: Sequence[Mapping[str, Any]], *, deleted: Sequence[str] = ()) -> str:
+    """修复轮的输出契约：恰好一个 ```json 围栏。
+
+    产物内容不在契约里——修复节点用 ``write_file`` 只写改动的文件（Design §4.2.2），
+    版本目录的实际内容由引擎按磁盘校验并重算 manifest。
+    """
+    payload: dict[str, Any] = {"fixes": list(fixes)}
+    if deleted:
+        payload["deleted"] = list(deleted)
+    return f"已修复。\n\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
+
+
+def fix_turn(
     files: Mapping[str, str],
     fixes: Sequence[Mapping[str, Any]],
     *,
     deleted: Sequence[str] = (),
-) -> str:
-    """修复产出：版本内全部文件的围栏 + fixes 围栏（可附删除申请）。"""
-    payload: dict[str, Any] = {"fixes": list(fixes)}
-    if deleted:
-        payload["deleted"] = list(deleted)
-    fences = "\n\n".join(
-        f"```python file={path}\n{content}\n```" for path, content in sorted(files.items())
-    )
-    return (
-        f"已修复。\n\n{fences}\n\n"
-        f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
-    )
+) -> list[Any]:
+    """修复轮（假模型驱动真实节点）：用 ``write_file`` 写改动文件，再交回 fixes 围栏。
+
+    ``write_file`` 的 ``path`` 相对上下文根，而修复节点的根就是本轮产出的版本目录，
+    所以路径**不带** ``code_vN/`` 前缀。
+    """
+    calls = [
+        ai_tool_call("write_file", path=path, content=content)
+        for path, content in sorted(files.items())
+    ]
+    return [*calls, ai_text(fix_contract(fixes, deleted=deleted))]
 
 
 def finding(
@@ -622,11 +641,9 @@ def fix_cycle_script(
     return [
         ai_tool_call("read_file", path=f"code_v1/{name}"),
         ai_text(review_fence([finding(location=where, issue=issue)], files=[name])),
-        ai_text(
-            fix_fence(
-                {name: fixed_code},
-                [{"finding_id": "f-1", "status": "fixed", "note": "已按建议修复并自验通过。"}],
-            )
+        *fix_turn(
+            {name: fixed_code},
+            [{"finding_id": "f-1", "status": "fixed", "note": "已按建议修复并自验通过。"}],
         ),
         ai_tool_call("read_file", path=f"code_v2/{name}"),
         ai_text(review_fence([], "复审通过。", files=[name])),
@@ -640,9 +657,8 @@ def residual_script(*, code: str, name: str = "main.py", location: str | None = 
         ai_tool_call("read_file", path=f"code_v1/{name}"),
         ai_text(review_fence([finding(location=where, issue="除零风险未处理")], files=[name])),
         ai_text(
-            fix_fence(
-                {name: code},
-                [{"finding_id": "f-1", "status": "skipped", "note": "脚本化样例：本轮不改动。"}],
+            fix_contract(
+                [{"finding_id": "f-1", "status": "skipped", "note": "脚本化样例：本轮不改动。"}]
             )
         ),
         ai_tool_call("read_file", path=f"code_v2/{name}"),

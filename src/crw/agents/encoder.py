@@ -13,8 +13,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from .. import rounds as rounds_mod
 from ..tools import ToolRegistry
-from ..workflow import state as state_mod
 from . import prompts
 from .runtime import AgentRuntime, history_from_state
 
@@ -39,7 +39,7 @@ def build_encode_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
             system_prompt=prompts.ENCODER_SYSTEM_PROMPT,
             user_prompt=prompts.encode_task_prompt(
                 requirement=requirement,
-                version_label=state_mod.code_version_dir_name(state_mod.code_version(state)),
+                version_label=rounds_mod.code_version_dir_name(rounds_mod.code_version(state)),
                 retry_feedback=retry_feedback,
                 prior_files=prior if isinstance(prior, Mapping) else None,
                 prior_source=str(descriptor.get("source_path") or ""),

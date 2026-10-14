@@ -452,18 +452,44 @@ class TestThinkingModelEntries:
         assert resolved.thinking == "high"
         assert resolved.label() == "DeepSeek/deepseek-flash（思考：high）"
 
-    def test_unconfigured_level_keeps_the_plain_label(self) -> None:
-        """未配置 selected（或纯字符串条目）：标签不带括号，行为与 M3 一致。"""
+    def test_levels_without_a_hand_picked_default_follows_the_preset(self) -> None:
+        """只勾了可选挡位、没手选默认：用预设的"关闭"默认挡位（产品默认 = 少花输出）。"""
         data = _thinking_config()
         data["providers"][0]["models"] = [
-            {"name": "deepseek-flash", "thinking": {"levels": ["high"]}}
+            {"name": "deepseek-flash", "thinking": {"levels": ["off", "high"]}}
         ]
         config.save_raw(data)
 
         resolved = config.resolve()
 
+        assert resolved is not None and resolved.thinking == "off"
+        assert resolved.label() == "DeepSeek/deepseek-flash（思考：off）"
+
+    def test_string_entry_of_a_preset_model_still_sends_the_off_default(self) -> None:
+        """纯字符串条目但模型在预设里：仍按预设默认关闭发送参数。
+
+        "什么都不发"在 DeepSeek 侧等于"思考开、effort high"，所以默认关闭必须落到
+        显式参数上（用户裁决 2026-10-14）。
+        """
+        data = _thinking_config()
+        data["providers"][0]["models"] = ["deepseek-flash"]
+        config.save_raw(data)
+
+        resolved = config.resolve()
+
+        assert resolved is not None and resolved.thinking == "off"
+
+    def test_model_outside_the_presets_sends_no_thinking_params(self) -> None:
+        """预设里没有的模型：不发送任何思考参数——查不到就不猜、不预填。"""
+        data = _thinking_config()
+        data["default"] = "DeepSeek/some-new-model"
+        data["providers"][0]["models"] = ["some-new-model"]
+        config.save_raw(data)
+
+        resolved = config.resolve()
+
         assert resolved is not None and resolved.thinking is None
-        assert resolved.label() == "DeepSeek/deepseek-flash"
+        assert resolved.label() == "DeepSeek/some-new-model"
 
 
 def test_exec_timeout_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from .. import agents as agents_mod
 from .. import config as config_mod
+from .. import rounds as rounds_mod
 from .. import usage as usage_mod
 from . import contracts, records
 from . import graph as graph_mod
@@ -165,7 +166,7 @@ class RunRequest:
     """既有版本目录（resume / 会话审查轮次：复制为新运行的起始版本目录，Design §4.2.2）。"""
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_iterations_source: str = state_mod.SOURCE_DEFAULT
-    rounds_mode: str = state_mod.ROUNDS_UP_TO
+    rounds_mode: str = rounds_mod.ROUNDS_UP_TO
     severe_only: bool = False
     no_exec: bool = False
     parallel_review: bool = False
@@ -641,7 +642,7 @@ class WorkflowEngine:
         except ContractViolation as exc:
             output = self._retry("encode", 1, fn, state, str(exc))
             files, duplicates, _ = self._extract_version_files(output)
-        version = state_mod.code_version(state)
+        version = rounds_mod.code_version(state)
         version_dir = self._write_version(version, files)
         total_lines = sum(len(content.splitlines()) for content in files.values())
         summary = f"生成 {version_dir.name}/（{len(files)} 个文件，共 {total_lines} 行）"
@@ -674,10 +675,10 @@ class WorkflowEngine:
         （``findings_<视角>``）：审查轮次推进与 clean 判定归汇合节点，否则同一超级步的
         两个分支会互相覆盖。
         """
-        round_number = state_mod.round_number_for_review(state)
-        version = state_mod.code_version(state)
+        round_number = rounds_mod.round_number_for_review(state)
+        version = rounds_mod.code_version(state)
         files = _version_files_of(state)
-        version_label = f"{state_mod.code_version_dir_name(version)}/"
+        version_label = f"{rounds_mod.code_version_dir_name(version)}/"
         output = _call_node(fn, state, retry_feedback=None)
         evidence = bool(output.get(agents_mod.REVIEW_EVIDENCE_KEY, True))
         try:
@@ -749,10 +750,10 @@ class WorkflowEngine:
         已分别落 ``review_N_<视角>.json``，合并结果落 ``review_N.json``——"这条结论由谁提出"
         可从 findings 的 ``views`` 字段追溯。
         """
-        round_number = state_mod.round_number_for_review(state)
-        version = state_mod.code_version(state)
+        round_number = rounds_mod.round_number_for_review(state)
+        version = rounds_mod.code_version(state)
         files = _version_files_of(state)
-        version_label = f"{state_mod.code_version_dir_name(version)}/"
+        version_label = f"{rounds_mod.code_version_dir_name(version)}/"
         output = _call_node(fn, state, retry_feedback=None)
         merged = [item for item in (output.get("findings") or []) if isinstance(item, Mapping)]
         contract_object = {
@@ -812,39 +813,51 @@ class WorkflowEngine:
     def _produce_fix(
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """修复节点：契约校验 → ``code_vN+1/`` 与 ``fixes_N.json`` 落盘（Design §4.2.2 / §5.2）。
+        """修复节点：复制上一版本为新版本目录 → 节点用 ``write_file`` 只写改动文件 →
+        引擎按目录实际内容校验并重算 manifest（Design §4.2.2 / §5.2 的写盘形态）。
 
-        修复必须给出版本内的全部文件（声明删除的除外）；删除只是**提出**——引擎先打印
-        待删清单并经确认闸门征询 ``y/N``，拒绝 / 中断 / 非交互一律保留文件并在摘要与报告
-        标注"待确认删除（未执行）"。"本轮未产生改动"按整版本 ``路径 → sha256`` 比较。
+        整版本不可变快照、逐字节比较判"本轮未产生改动"、删除确认闸门、``resume`` 与
+        ``--out`` 的产物语义全部不变；变的是产物**怎么产生**——不再要求模型把未改动的
+        文件整份重贴（重贴既花输出 token，也有"顺手改坏"的真实风险）。写盘结果按契约
+        校验（缺文件 / 空文件 / 超量级 / 声称已修复却无改动），违规重试一次。
         """
-        round_number = state_mod.round_number_for_fix(state)
-        current_version = state_mod.code_version(state)
+        round_number = rounds_mod.round_number_for_fix(state)
+        current_version = rounds_mod.code_version(state)
         new_version = current_version + 1
         findings = list(state.get("findings") or [])
         current_files = _version_files_of(state)
-        output = _call_node(fn, state, retry_feedback=None)
-        try:
-            result = contracts.parse_fix_output(
-                _node_text(output, "fix_text"), findings=findings, current_files=current_files
-            )
-        except ContractViolation as exc:
-            output = self._retry("fix", round_number, fn, state, str(exc))
-            result = contracts.parse_fix_output(
-                _node_text(output, "fix_text"), findings=findings, current_files=current_files
-            )
-        # 删除确认闸门（Design §4.2.2）：确认前零删除；未确认的文件从上一版本目录保留下来
-        deleted_confirmed, carried = self._resolve_deletions(
-            result.deleted, findings, current_version
-        )
-        files = dict(result.files)
-        files.update(carried)
-        # 围栏抽取会剥掉内容首尾的换行，而磁盘上的版本内容是归一化的（单个结尾换行）：
-        # 先归一再算指纹，"本轮未产生改动"的整版本比较才不会因这个表示差误报
-        files = {path: _normalize_code(content) for path, content in files.items()}
-        previous = self._previous_fingerprint(state)
-        changed = _fingerprint(files) != previous
+        previous_dir = self._workspace_path() / rounds_mod.code_version_dir_name(current_version)
+        base_files = {
+            path: _normalize_code(content)
+            for path, content in self._read_version_files(previous_dir).items()
+        }
+        version_dir = self._write_version(new_version, base_files)
+        # 交给节点的当前版本就是本轮要产出的目录：写入根取它，路径因此限定在目录之内
+        fix_state = {**dict(state), "current_version_dir": str(version_dir)}
+        output = _call_node(fn, fix_state, retry_feedback=None)
+        for attempt in (1, 2):
+            try:
+                result = contracts.parse_fix_output(
+                    _node_text(output, "fix_text"),
+                    findings=findings,
+                    current_files=current_files,
+                )
+                files = self._verify_fix_writes(version_dir, result, current_files, base_files)
+                break
+            except ContractViolation as exc:
+                if attempt == 2:
+                    raise
+                # 重试前先复位：上一次尝试可能已把某些文件写坏，不清零就会让坏内容混进
+                # 本轮产物（写盘形态特有的失败模式——产物不在契约文本里，重试看不到旧输出）
+                self._write_version(new_version, base_files)
+                output = self._retry("fix", round_number, fn, fix_state, str(exc))
+        # 删除确认闸门（Design §4.2.2）：确认前零删除；确认的文件此刻才从新版本目录移除
+        deleted_confirmed = self._resolve_deletions(result.deleted, findings)
+        for path in deleted_confirmed:
+            files.pop(path, None)
+            self._unlink_version_file(version_dir, path)
         version_dir = self._write_version(new_version, files)
+        changed = _fingerprint(files) != _fingerprint(base_files)
         fixes_path = self._workspace_path() / state_mod.fixes_file_name(round_number)
         payload = {
             "round": round_number,
@@ -874,8 +887,6 @@ class WorkflowEngine:
         pending = [path for path in result.deleted if path not in deleted_confirmed]
         if pending:
             parts.append(f"（待确认删除（未执行）：{', '.join(sorted(pending))}）")
-        if result.duplicate_declarations:
-            parts.append(f"（已忽略 {result.duplicate_declarations} 个重复声明）")
         if result.extra_fences:
             # Design §4.2.1：多余围栏忽略但留痕（写进阶段摘要即进 log.jsonl 与时间线）
             parts.append(f"（已忽略 {result.extra_fences} 个多余围栏）")
@@ -898,20 +909,58 @@ class WorkflowEngine:
         artifacts = [self._relative(fixes_path), *self._version_artifacts(version_dir.name, files)]
         return update, summary, artifacts, listing
 
-    def _resolve_deletions(
+    def _verify_fix_writes(
         self,
-        deleted: Sequence[str],
-        findings: Sequence[Mapping[str, Any]],
-        current_version: int,
-    ) -> tuple[list[str], dict[str, str]]:
-        """落实删除确认：返回 ``(已确认删除, 从上一版本保留下来的文件)``。
+        version_dir: Path,
+        result: contracts.FixResult,
+        current_files: Sequence[str],
+        base_files: Mapping[str, str],
+    ) -> dict[str, str]:
+        """按目录**实际内容**校验修复写盘结果，返回归一化后的文件表（Design §4.2.2）。
 
-        确认闸门（``confirm_deletions``）缺失 / 返回否 / 抛异常时一律保留；保留的内容从
-        上一版本目录读出——修复 Agent 对声明删除的文件可不给内容，版本完整性由这里兜底。
+        整版本快照的完整性由这里兜底：文件不得丢（模型没有删除能力，丢了就是写坏了路径）、
+        不得为空、量级不超限；另外把"处置声称已修复但目录内容一个字节没变"也列为违规——
+        那是 ``write_file`` 没被调用的典型形态，放过去就等于报告了一轮不存在的修复。
+        """
+        files = {
+            path: _normalize_code(content)
+            for path, content in read_written_files(version_dir).items()
+        }
+        errors: list[str] = []
+        # 声明要删的文件豁免"缺失"检查：提出删除的模型没有删除能力，磁盘上少了只可能是
+        # 记录与磁盘脱节（旧版本里本就没有该文件），不该把这种无操作升级成整轮失败
+        required = set(current_files) - set(result.deleted)
+        missing = sorted(required - set(files))
+        if missing:
+            errors.append(f"版本目录缺少文件（未改动的文件不要删除或改名）：{', '.join(missing)}")
+        empty = sorted(path for path, content in files.items() if not content.strip())
+        if empty:
+            errors.append(f"以下文件被写成空内容：{', '.join(empty)}")
+        errors.extend(contracts.version_size_errors(files))
+        claimed = [
+            str(item.get("finding_id"))
+            for item in result.fixes
+            if item.get("status") in ("fixed", "partial")
+        ]
+        if claimed and _fingerprint(files) == _fingerprint(base_files):
+            errors.append(
+                "处置标记为 fixed / partial，但版本目录内容没有变化——"
+                f"请用 write_file 写入改动后的文件（{', '.join(claimed)}）"
+            )
+        if errors:
+            raise ContractViolation(errors)
+        return files
+
+    def _resolve_deletions(
+        self, deleted: Sequence[str], findings: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """落实删除确认：返回已确认删除的路径（确认前零删除，Design §4.2.2）。
+
+        确认闸门（``confirm_deletions``）缺失 / 返回否 / 抛异常时一律返回空表——删除
+        永不静默发生；未确认的文件本来就在新版本目录里（引擎复制自上一版本），无须回填。
         """
         if not deleted:
-            return [], {}
-        previous_dir = self._workspace_path() / state_mod.code_version_dir_name(current_version)
+            return []
         requests: list[dict[str, Any]] = []
         for path in deleted:
             reasons = [
@@ -920,35 +969,25 @@ class WorkflowEngine:
                 if _finding_in_file(finding, str(path))
             ]
             requests.append({"path": path, "reasons": reasons})
-        confirmed: list[str] = []
-        if self._confirm_deletions is not None and requests:
-            try:
-                if self._confirm_deletions(requests):
-                    confirmed = list(deleted)
-            except Exception:  # noqa: BLE001 — 确认闸门故障按"未确认"处理，删除永不静默发生
-                confirmed = []
-        carried: dict[str, str] = {}
-        for path in deleted:
-            if path in confirmed:
-                continue
-            try:
-                # 与写入侧同一防线：拼接进文件系统路径前再验一次（模型输入路径是
-                # 本项目风险最高的一类输入，读取边界不依赖上游自觉）
-                safe_path = contracts.validate_version_path(path)
-            except ContractViolation as exc:
-                raise PersistenceError(f"待删除路径不合法：{exc}") from exc
-            source = previous_dir / safe_path
-            try:
-                carried[path] = source.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                if isinstance(exc, FileNotFoundError):
-                    # 上一版本里已不存在该文件（记录与磁盘脱节）：没有内容可"保留"，
-                    # 继续按待确认标注即可，不把无操作升级成整轮运行失败
-                    continue
-                raise PersistenceError(
-                    f"待删除文件 {path} 保留失败（无法从上一版本读出）：{exc}"
-                ) from exc
-        return confirmed, carried
+        if self._confirm_deletions is None or not requests:
+            return []
+        try:
+            if self._confirm_deletions(requests):
+                return list(deleted)
+        except Exception:  # noqa: BLE001 — 确认闸门故障按"未确认"处理，删除永不静默发生
+            return []
+        return []
+
+    def _unlink_version_file(self, version_dir: Path, path: str) -> None:
+        """移除**已确认删除**的文件：拼接进文件系统路径前先再验一次边界。"""
+        try:
+            safe_path = contracts.validate_version_path(path)
+        except ContractViolation as exc:
+            raise PersistenceError(f"待删除路径不合法：{exc}") from exc
+        try:
+            (version_dir / safe_path).unlink(missing_ok=True)
+        except OSError as exc:
+            raise PersistenceError(f"已确认删除的文件 {path} 移除失败：{exc}") from exc
 
     # ---- 收尾 ----
 
@@ -1189,7 +1228,7 @@ class WorkflowEngine:
         else:
             return
         version_dir = self._write_version(
-            state_mod.normalize_version_base(request.start_version), files
+            rounds_mod.normalize_version_base(request.start_version), files
         )
         initial["current_version_dir"] = str(version_dir)
         initial["version_files"] = sorted(files)
@@ -1207,7 +1246,7 @@ class WorkflowEngine:
         manifest 最后写：它是"该版本包含哪些文件"的权威声明，出现半写文件比缺文件更误导。
         落盘失败按持久化失败处理（Design §4.6），不产生半更新的状态引用。
         """
-        version_dir = self._workspace_path() / state_mod.code_version_dir_name(version)
+        version_dir = self._workspace_path() / rounds_mod.code_version_dir_name(version)
         # 纵深防御：路径在契约层已校验过（拒绝绝对路径 / 盘符 / `..`），这里落盘前再验一次——
         # "模型输出拼进文件系统路径"是本项目风险最高的一类输入，写盘边界不能只靠上游自觉
         normalized = {
@@ -1229,20 +1268,6 @@ class WorkflowEngine:
     def _read_version_files(self, directory: Path) -> dict[str, str]:
         """读出版本目录的代码文件（委托模块级 :func:`read_version_files`）。"""
         return read_version_files(directory)
-
-    def _previous_fingerprint(self, state: Mapping[str, Any]) -> dict[str, str]:
-        """上一版本的 ``路径 → sha256`` 指纹（"本轮未产生改动"的比较基准）。
-
-        上一版本目录缺失 / 不可读时返回空表——比较结果为"有改动"，宁可漏标注也不误标。
-        """
-        version = state_mod.code_version(state)
-        previous_dir = self._workspace_path() / state_mod.code_version_dir_name(version)
-        if not previous_dir.is_dir():
-            return {}
-        try:
-            return _fingerprint(read_version_files(previous_dir))
-        except PersistenceError:
-            return {}
 
     def _version_artifacts(self, dir_name: str, files: Mapping[str, str]) -> list[str]:
         """版本内文件的产物名（相对运行目录、posix 风格，报告与时间线共用）。"""
@@ -1378,8 +1403,8 @@ class WorkflowEngine:
         会话轮次与并行审查各加一句，使终端头行与日志能一眼看出这一轮是怎么起的。
         """
         descriptor = request.input_descriptor()
-        start_label = state_mod.code_version_dir_name(
-            state_mod.normalize_version_base(request.start_version)
+        start_label = rounds_mod.code_version_dir_name(
+            rounds_mod.normalize_version_base(request.start_version)
         )
         if descriptor.get("kind") == state_mod.INPUT_FILE:
             source = str(descriptor.get("source_path") or "")
@@ -1404,7 +1429,7 @@ class WorkflowEngine:
                 f"（来源：{source_label(request.max_iterations_source)}）{criterion}"
             )
         ]
-        if request.rounds_mode == state_mod.ROUNDS_EXACT:
+        if request.rounds_mode == rounds_mod.ROUNDS_EXACT:
             parts.append("轮次模式 exact（跑满指定轮次）")
         if request.parent_run_id:
             parts.append(f"续跑自 {request.parent_run_id}")
@@ -1418,10 +1443,10 @@ class WorkflowEngine:
     def _round_of(self, name: str, state: Mapping[str, Any]) -> int:
         """节点所属轮次：编码恒为 1；修复按已完成修复数；审查与汇合按已完成的审查数。"""
         if name == "fix":
-            return state_mod.round_number_for_fix(state)
+            return rounds_mod.round_number_for_fix(state)
         if name == "encode":
             return 1
-        return state_mod.round_number_for_review(state)
+        return rounds_mod.round_number_for_review(state)
 
     def _elapsed_ms(self, active: _Active) -> int:
         return max(0, int((self._timer() - active.started) * 1000))
@@ -1550,7 +1575,7 @@ def build_report(
         input_descriptor.get("source_path") if isinstance(input_descriptor, Mapping) else None
     )
     mapped_name = Path(str(source_path)).name if source_path else ""
-    start_dir = state_mod.code_version_dir_name(_version_base_of(state))
+    start_dir = rounds_mod.code_version_dir_name(_version_base_of(state))
     for path in artifacts:
         relative = _relative_display(path, run_dir)
         if source_path and mapped_name and relative == f"workspace/{start_dir}/{mapped_name}":
@@ -1576,9 +1601,9 @@ def _append_notices(summary: str, notices: Sequence[str]) -> str:
     return f"{summary}（{'；'.join(notices)}，结论可能不完整）"
 
 
-#: 用量小节的表头（列序与 :func:`crw.usage.cells` 的单元一一对应）
-_USAGE_HEADER = ("节点", "调用", "输入", "缓存命中", "输出", "其中思考")
-_USAGE_DIVIDER = "| --- | --- | --- | --- | --- | --- |"
+#: 用量小节的表头（复用记账模块的列口径；思考单列，避免"输出"被读成重复计费）
+_USAGE_HEADER = usage_mod.TABLE_HEADER
+_USAGE_DIVIDER = "| " + " | ".join("---" for _ in usage_mod.TABLE_HEADER) + " |"
 
 
 def _usage_section(state: Mapping[str, Any]) -> list[str]:
@@ -1859,18 +1884,36 @@ def read_version_files(directory: Path) -> dict[str, str]:
     会话层（命令面）读取既有版本内容时复用本函数：版本内容的唯一权威口径只在此处。
     """
     manifest_files = _manifest_file_names(directory)
-    names = sorted(manifest_files) if manifest_files is not None else None
-    if names is None:
-        names = [
-            path.relative_to(directory).as_posix()
-            for path in sorted(directory.rglob("*"))
-            if path.is_file()
-            and path.name != "manifest.json"
-            and not path.name.startswith(".")
-            and not path.name.endswith(".tmp")
-            and path.suffix != ".pyc"
-            and "__pycache__" not in path.relative_to(directory).parts
-        ]
+    names = sorted(manifest_files) if manifest_files is not None else _scanned_files(directory)
+    return _read_named_files(directory, names)
+
+
+def read_written_files(directory: Path) -> dict[str, str]:
+    """按**目录实际内容**读版本文件（修复写盘后重算清单用，Design §4.2.2）。
+
+    这里刻意不看 manifest：修复节点可以用 ``write_file`` 新增文件，而 manifest 还是
+    引擎复制上一版本时写下的旧清单；副产物（字节码 / 隐藏 / 临时文件）由目录扫描的
+    排除规则挡掉，与缺 manifest 时的回退口径完全一致。
+    """
+    return _read_named_files(directory, _scanned_files(directory))
+
+
+def _scanned_files(directory: Path) -> list[str]:
+    """目录内实际的版本文件相对路径（排除 manifest、隐藏 / 临时文件与字节码）。"""
+    return [
+        path.relative_to(directory).as_posix()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+        and path.name != "manifest.json"
+        and not path.name.startswith(".")
+        and not path.name.endswith(".tmp")
+        and path.suffix != ".pyc"
+        and "__pycache__" not in path.relative_to(directory).parts
+    ]
+
+
+def _read_named_files(directory: Path, names: Sequence[str]) -> dict[str, str]:
+    """按名字清单读出文件内容；任一文件读不出都按持久化失败上报。"""
     files: dict[str, str] = {}
     for name in names:
         try:
@@ -1907,8 +1950,8 @@ def _version_files_of(state: Mapping[str, Any]) -> list[str]:
 
 
 def _version_base_of(state: Mapping[str, Any]) -> int:
-    """状态的起始版本号（展示与报告用）：坏值按 1 处理（口径见 state.normalize_version_base）。"""
-    return state_mod.normalize_version_base(state.get("version_base"))
+    """状态的起始版本号（展示与报告用）：坏值按 1 处理（口径见 rounds.normalize_version_base）。"""
+    return rounds_mod.normalize_version_base(state.get("version_base"))
 
 
 def _fingerprint(files: Mapping[str, str]) -> dict[str, str]:

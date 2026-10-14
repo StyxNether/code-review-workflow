@@ -13,6 +13,7 @@ import pytest
 from fakes import ScriptedChatModel, ai_text
 
 from crw import agents as agents_mod
+from crw import rounds as rounds_mod
 from crw import tools as tools_mod
 from crw.session import orchestrator as orch
 from crw.workflow import state as state_mod
@@ -77,7 +78,7 @@ def test_valid_payload_becomes_a_decision(
 
     assert decision.intent == "review_fix"
     assert decision.rounds == 2
-    assert decision.rounds_mode == state_mod.ROUNDS_EXACT
+    assert decision.rounds_mode == rounds_mod.ROUNDS_EXACT
     assert decision.reply == "好的，再检查两轮。"
     assert decision.note == ""
     assert decision.raw["extra_field"] == {"keep": True}

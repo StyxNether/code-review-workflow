@@ -182,7 +182,8 @@ def test_fake_fix_covers_every_finding_id() -> None:
     assert [item["finding_id"] for item in fixes] == ["f-1", "f-2"]
 
 
-def test_fake_fix_output_carries_all_files_and_one_json_fence(tmp_path: Path) -> None:
+def test_fake_fix_writes_only_the_repaired_file(tmp_path: Path) -> None:
+    """假修复节点与真实节点同形态：改动写回版本目录，只交回一个 fixes 围栏（§4.2.2）。"""
     code = '"""示例模块。"""\n\n\ndef greet(name)\n    print(name)\n'
     other = '"""另一个模块。"""\n'
     version_dir = write_version(tmp_path, {"main.py": code, "util.py": other})
@@ -201,10 +202,11 @@ def test_fake_fix_output_carries_all_files_and_one_json_fence(tmp_path: Path) ->
 
     text = fakes.fake_fix(state)["fix_text"]
 
-    assert 'file="main.py"' not in text
-    assert text.count("```python file=main.py") == 1
-    assert text.count("```python file=util.py") == 1  # 未改动文件也原样给出
     assert text.count("```json") == 1
+    assert "```python" not in text  # 产物内容不进契约文本
+    directory = Path(version_dir)
+    assert (directory / "main.py").read_text(encoding="utf-8") != code
+    assert (directory / "util.py").read_text(encoding="utf-8") == other  # 未改动文件不动
     assert fix_payload(text)["fixes"][0]["status"] == "fixed"
 
 

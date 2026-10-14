@@ -10,8 +10,12 @@ runtime、engine、render、cli 四层共用同一套口径。
 
 - ``calls``：观测到的模型调用次数（含未回报 usage 的调用）；
 - ``with_usage``：回报了 token 数的调用次数——与 ``calls`` 不等即"有调用没记账"；
-- ``input_tokens`` / ``output_tokens``：输入 / 输出 token 累计（输出含思考部分）；
+- ``input_tokens`` / ``output_tokens``：输入 / 输出 token 累计。**输出的计费口径已含思考**
+  （实测 DeepSeek：``completion_tokens=200`` 而其中 ``reasoning_tokens=166``，可见正文只
+  有一句话）——``reasoning_tokens`` 是 ``output_tokens`` 的**分解**，不是加项；
 - ``reasoning_tokens``：思考（reasoning）token 累计；供应商不回报时为 0；
+- 正文 = ``output_tokens - reasoning_tokens``（见 :func:`body_tokens`），读数按这两列分列
+  呈现，否则"输出 6,042（思考 10,481）"这类写法会让人怀疑同一批 token 被计了两次。
 - ``cached_tokens``：前缀缓存命中的输入 token 累计；
 - ``cache_reported``：回报了缓存字段的调用次数；命中率只有它等于 ``with_usage`` 才可信。
 
@@ -184,6 +188,23 @@ def cache_hit_rate(record: Mapping[str, Any]) -> float | None:
     return (_as_int(record.get("cached_tokens")) or 0) / input_tokens
 
 
+#: 报告用量表的表头（与 :func:`cells` 返回的单元一一对应；表头放在本模块是因为列的口径
+#: 由记账数据决定，展示层不该各写一份）
+TABLE_HEADER: tuple[str, ...] = ("节点", "调用", "输入", "缓存命中", "输出", "其中正文", "其中思考")
+
+
+def body_tokens(record: Mapping[str, Any]) -> int:
+    """正文输出 token（= 输出合计 − 思考）。
+
+    供应商回报的 ``output_tokens`` 是**计费口径的合计**，``reasoning_tokens`` 是它的一部分
+    （实测 45 token 输入 → 输出 200、其中思考 166）。坏账（思考大于合计，手改过的记录可能
+    出现）按 0 处理：宁可少报正文，也不给出负数。
+    """
+    output = _as_int(record.get("output_tokens"), default=0) or 0
+    reasoning = _as_int(record.get("reasoning_tokens"), default=0) or 0
+    return max(0, output - reasoning)
+
+
 #: 思考 token 占输出达到该比例时，报告与回显附一句降本提示（实测 deepseek 思考挡位下常占七八成）
 THINKING_HINT_SHARE = 0.5
 
@@ -209,7 +230,8 @@ def hint(record: Mapping[str, Any]) -> str:
         return ""
     return (
         f"思考 token 占输出 {share:.0%}（推理文本按输出计费，输出单价高于输入）："
-        "如需降低输出用量，可用 --thinking off 或在 crw config 里调整该模型的思考挡位。"
+        "本产品默认已关闭思考，该模型的挡位是被显式打开的——"
+        "可用 --thinking off 临时关闭，或在 crw config 菜单 6 清空该模型的挡位。"
     )
 
 
@@ -233,7 +255,7 @@ def log_detail(record: Mapping[str, Any]) -> dict[str, int]:
 
 
 def cells(record: Mapping[str, Any]) -> list[str]:
-    """报告用量表的一行单元：``调用 / 输入 / 缓存命中 / 输出 / 其中思考``。
+    """报告用量表的一行单元（列序与 :data:`TABLE_HEADER` 对应）。
 
     "未回报"与"0"是两回事：未回报用量的调用不把 token 栏写成 0（读数的人会当成
     真的没花钱）；思考栏为 0 时写全角破折号——多数不支持思考的供应商根本没有这一项。
@@ -246,6 +268,7 @@ def cells(record: Mapping[str, Any]) -> list[str]:
         _num(record.get("input_tokens")) if reported else "未回报",
         f"{_num(record.get('cached_tokens'))}（{rate:.0%}）" if rate is not None else "未回报",
         _num(record.get("output_tokens")) if reported else "未回报",
+        _num(body_tokens(record)) if reported else "未回报",
         _num(reasoning) if reasoning else "—",
     ]
 
@@ -287,7 +310,10 @@ def format_line(record: Mapping[str, Any]) -> str:
     output = f"输出 {_num(record.get('output_tokens'))}"
     reasoning = _as_int(record.get("reasoning_tokens"), default=0) or 0
     if reasoning:
-        output += f"（思考 {_num(reasoning)}）"
+        # 分列写出正文与思考：合计才是计费口径，两者相加即回合计
+        output += f"（正文 {_num(body_tokens(record))} + 思考 {_num(reasoning)}）"
+    else:
+        output += "（未回报思考分解，按正文计）"
     parts = [f"输入 {_num(record.get('input_tokens'))}", output]
     rate = cache_hit_rate(record)
     parts.append(
@@ -327,8 +353,10 @@ def _as_int(value: Any, *, default: int | None = None) -> int | None:
 
 __all__ = [
     "FIELDS",
+    "TABLE_HEADER",
     "THINKING_HINT_SHARE",
     "TOKEN_FIELDS",
+    "body_tokens",
     "cache_hit_rate",
     "cells",
     "empty",

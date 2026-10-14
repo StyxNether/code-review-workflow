@@ -15,12 +15,13 @@ from fakes import (
     ai_text,
     clean_review_calls,
     file_fence,
-    fix_fence,
+    fix_contract,
     orchestrator_reply,
 )
 
 from crw import cli
 from crw import config as config_mod
+from crw import rounds as rounds_mod
 from crw.session import state as session_state
 from crw.workflow import records as records_mod
 from crw.workflow import state as state_mod
@@ -157,7 +158,7 @@ def test_resume_inherits_the_parent_rounds_mode(
         [
             ai_text(file_fence(CLEAN_CODE)),
             *clean_review_calls(),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=2),
         ]
     )
@@ -168,7 +169,7 @@ def test_resume_inherits_the_parent_rounds_mode(
     fake_chat_model.load(
         [
             *clean_review_calls(version=1),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=2),
         ]
     )
@@ -179,7 +180,7 @@ def test_resume_inherits_the_parent_rounds_mode(
     child = next(item for item in records_mod.list_runs() if item.run_id != parent.run_id)
     state = records_mod.read_state(child.path)
     assert state is not None
-    assert state["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert state["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert state["max_iterations_source"] == state_mod.SOURCE_PARENT
     capsys.readouterr()
 
@@ -203,7 +204,7 @@ def test_chat_command_runs_a_full_conversation(
             orchestrator_reply("review_fix", reply="好，先审查再修一轮。"),
             # review_fix 默认 exact + 1 轮：审查（干净）→ 修复 → 复审
             *clean_review_calls(version=2),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=3),
         ]
     )
@@ -501,9 +502,9 @@ def test_rounds_mode_alone_keeps_the_configured_default(
         [
             ai_text(file_fence(CLEAN_CODE)),
             *clean_review_calls(version=1),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=2),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=3),
         ]
     )
@@ -515,7 +516,7 @@ def test_rounds_mode_alone_keeps_the_configured_default(
     assert state is not None
     assert state["max_iterations"] == 2  # 配置默认，而不是 argparse 的 3
     assert state["max_iterations_source"] == state_mod.SOURCE_CONFIG
-    assert state["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert state["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert state["fix_rounds"] == 2 and state["review_round"] == 3
     capsys.readouterr()
 
@@ -608,7 +609,7 @@ def test_resume_inherits_the_mode_even_when_the_value_comes_from_the_cli(
         [
             ai_text(file_fence(CLEAN_CODE)),
             *clean_review_calls(version=1),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=2),
         ]
     )
@@ -619,7 +620,7 @@ def test_resume_inherits_the_mode_even_when_the_value_comes_from_the_cli(
     fake_chat_model.load(
         [
             *clean_review_calls(version=1),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=2),
         ]
     )
@@ -631,8 +632,17 @@ def test_resume_inherits_the_mode_even_when_the_value_comes_from_the_cli(
     assert state is not None
     assert state["max_iterations"] == 1
     assert state["max_iterations_source"] == state_mod.SOURCE_CLI
-    assert state["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert state["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert "不合法" not in capsys.readouterr().err
+
+
+def test_chat_does_not_accept_out(capsys: pytest.CaptureFixture[str]) -> None:
+    """会话不提供 ``--out``（导出是一次性运行的语义）：不注册即明确报参数错误。"""
+    with pytest.raises(SystemExit) as excinfo:
+        cli.build_parser().parse_args(["chat", "--out", "dist"])
+
+    assert excinfo.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
 def test_chat_does_not_accept_parallel_review(capsys: pytest.CaptureFixture[str]) -> None:

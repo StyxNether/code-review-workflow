@@ -83,6 +83,7 @@ src/crw/
     __init__.py    # 工具注册表与执行（"错误："结构化协议）
     fs.py          # list_dir / read_file
     exec_py.py     # run_python（限时强杀 / 截断 / 环境净化）
+  rounds.py        # 轮次与代码版本口径的纯派生计算（取值枚举 + 版本/轮次序号）
   llm.py           # ChatOpenAI 封装（重试映射 / 异常翻译）
   config.py        # 供应商配置（models.json / 预设 / 环境变量 / 连通自检）
   uninstall.py     # 卸载：分级确认后的清理（程序 / 垫片 → PATH → 登记的环境变量 → 用户数据）
@@ -92,7 +93,7 @@ tests/
 
 ### 3.1 分层与依赖方向
 
-- 依赖单向：`cli → session → workflow → agents → {llm, config, tools}`（会话模式）；一次性运行路径为 `cli → workflow → agents → {llm, config, tools}`。`render.py` 与 `session/` 仅被 cli 使用；编排节点经 `llm.py` 取模型（不新造调用栈）；任何下层不 import 上层。
+- 依赖单向：`cli → session → workflow → agents → {llm, config, tools}`（会话模式）；一次性运行路径为 `cli → workflow → agents → {llm, config, tools}`。`render.py` 与 `session/` 仅被 cli 使用；编排节点经 `llm.py` 取模型（不新造调用栈）；任何下层不 import 上层。agents 层可依赖 `rounds` / `usage` / `thinking` 等数据叶子层（纯数据、不 import 任何 crw 模块，故不构成向上依赖）。
 - 框架类型边界：LangGraph 图/状态类型不越出 `workflow/`（engine 对外暴露纯数据结构）；LangChain 消息/流对象不越出 `agents/runtime.py`（对上层只给字符串与普通数据）。
 - 状态载体（两层）：**运行态**——`StateGraph` 执行上下文是单轮运行状态的**唯一载体**（由框架托管）；**会话态**——跨轮存活的会话状态（轮次链、当前设置、各 Agent 记忆索引）由 `session/state.py` 定义、会话层持有并落盘，engine 不感知会话态。下述"不维护第二份内存正本"专指运行态。engine 只做生命周期——构建初始状态、驱动图执行、把节点边界状态导出为快照（state.json）、落日志、生成报告与退出码。
 - 节点协议：节点为纯函数 `node(state) -> dict`（契约型节点可带 `retry_feedback: str | None = None`）——只读所需字段、只返回要更新的字段；禁止落盘、禁止直接打印/写日志（过程输出经 runtime 回调转成事件与渲染输入）；契约校验、重试与 `clean` 判定由 workflow 层的包装完成（agents 只负责产出），条件路由为只读 state 的纯函数。节点产出的原始文本经**暂存键**交回包装层（encode → `code_text`、review → `review_text`、fix → `fix_text`）：暂存键不在状态 schema 内，由包装层消费后不进入运行记录；阶段摘要由引擎按产物与契约结论自算（抽取 / 落盘见 §4.2.1）。

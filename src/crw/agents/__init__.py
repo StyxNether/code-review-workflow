@@ -6,8 +6,8 @@
     nodes = build_nodes(runtime, roots=(workspace,), no_exec=False)
 
 每个节点的工具集按 Design §4.2 的表固定：编码无工具（纯生成）；审查可列目录 / 读文件 /
-运行核实；修复只用读文件与运行核实（无需再列目录）。``--no-exec`` 在工具注册表组装层
-生效（不注册 ``run_python``），不做提示词层假设。
+运行核实；修复读文件、**只写改动的文件**（``write_file``，上下文根 = 本轮产出的版本目录）
+与运行核实。``--no-exec`` 在工具注册表组装层生效（不注册 ``run_python``），不做提示词层假设。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from ..tools import (
     build_registry,
 )
 from .encoder import build_encode_node
-from .fixer import build_fix_node
+from .fixer import FIX_TOOL_NAMES, build_fix_node
 from .reviewer import EVIDENCE_KEY, build_review_node, review_once
 from .runtime import (
     MAX_TOOL_ROUNDS,
@@ -37,13 +37,13 @@ from .runtime import (
     history_from_state,
 )
 
-#: 各节点的工具集（Design §4.2 的"工具"列）
+#: 各节点的工具集（Design §4.2 的"工具"列；修复节点的上下文根是本轮产出的版本目录）
 NODE_TOOL_NAMES: Mapping[str, tuple[str, ...]] = {
     "encode": (),
     "review": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
     "review_correctness": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
     "review_security": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
-    "fix": (READ_FILE_TOOL, EXEC_TOOL_NAME),
+    "fix": FIX_TOOL_NAMES,
 }
 
 #: 并行双视角审查的节点名 → 视角（与 workflow/graph.py 的节点名映射由测试锁定一致性）
@@ -93,7 +93,8 @@ def build_nodes(
 
     Args:
         runtime: 单任务运行时（由引擎装配，带事件与增量回调）。
-        roots: 上下文根（工作流运行 = 运行工作区）。
+        roots: 上下文根（工作流运行 = 运行工作区）；修复节点例外——它的根是本轮产出的
+            版本目录，由节点在每轮调用时按状态自取（Design §4.2.2）。
         no_exec: 关闭执行（工具注册表不注册 ``run_python``）。
         parallel_review: 并行双视角形态：两个审查节点共用同一 runtime 与工具集，只有
             系统提示词与任务说明按视角分派；汇合节点由 workflow 层补齐（本层不 import 上层）。
@@ -101,16 +102,17 @@ def build_nodes(
     Returns:
         该形态下除汇合节点以外的全部节点；既有的单视角键（``review``）在并行形态下不出现。
     """
-    names = ["encode", "review", "fix"]
+    names = ["encode", "review"]
     if parallel_review:
-        names = ["encode", *PARALLEL_REVIEW_NODES, "fix"]
+        names = ["encode", *PARALLEL_REVIEW_NODES]
     registries = {
         name: build_registry(roots, names=NODE_TOOL_NAMES[name], allow_exec=not no_exec)
         for name in names
     }
     nodes: dict[str, NodeFn] = {
         "encode": build_encode_node(runtime, registries["encode"]),
-        "fix": build_fix_node(runtime, registries["fix"]),
+        # 修复节点按轮自建注册表：上下文根是本轮产出的版本目录（引擎复制后才确定，§4.2.2）
+        "fix": build_fix_node(runtime, no_exec=no_exec),
     }
     if parallel_review:
         for name, view in PARALLEL_REVIEW_NODES.items():

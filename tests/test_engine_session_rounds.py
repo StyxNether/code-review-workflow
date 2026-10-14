@@ -12,6 +12,7 @@ from typing import Any
 
 from fakes import SCRIPTED_NODES, fake_encode
 
+from crw import rounds as rounds_mod
 from crw.workflow import engine as engine_mod
 from crw.workflow import records as records_mod
 from crw.workflow import state as state_mod
@@ -52,7 +53,7 @@ def test_start_version_names_the_first_version_and_advances_fixes(tmp_path: Path
     assert (workspace / "code_v1").exists() is False
     state = result.state
     assert state["version_base"] == 3
-    assert state_mod.code_version(state) == 3
+    assert rounds_mod.code_version(state) == 3
     assert "code_v3" in str(state["current_version_dir"])
     report = (result.run_dir / "report.md").read_text(encoding="utf-8")
     assert "第 1 轮审查（基于 `code_v3/`）" in report
@@ -102,7 +103,7 @@ def test_exact_mode_runs_every_round_and_ends_with_a_review(tmp_path: Path) -> N
         engine_mod.RunRequest(
             requirement="写一个计算器",
             max_iterations=2,
-            rounds_mode=state_mod.ROUNDS_EXACT,
+            rounds_mode=rounds_mod.ROUNDS_EXACT,
         )
     )
 
@@ -132,7 +133,7 @@ def test_exact_mode_with_residual_reports_it(tmp_path: Path) -> None:
         engine_mod.RunRequest(
             requirement="写一个计算器",
             max_iterations=1,
-            rounds_mode=state_mod.ROUNDS_EXACT,
+            rounds_mode=rounds_mod.ROUNDS_EXACT,
         )
     )
 

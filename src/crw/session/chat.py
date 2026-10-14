@@ -28,6 +28,7 @@ from typing import Any
 from .. import agents as agents_mod
 from .. import config as config_mod
 from .. import render
+from .. import rounds as rounds_mod
 from .. import tools as tools_mod
 from ..workflow import engine as engine_mod
 from ..workflow import records as records_mod
@@ -256,7 +257,7 @@ def _start_session(
     rounds = initial_rounds or RoundSettings(
         max_iterations=config_mod.DEFAULT_ROUNDS_DEFAULT,
         max_iterations_source=state_mod.SOURCE_DEFAULT,
-        rounds_mode=state_mod.ROUNDS_UP_TO,
+        rounds_mode=rounds_mod.ROUNDS_UP_TO,
     )
     descriptor: dict[str, Any] = {}
     if file_input is not None:
@@ -496,6 +497,9 @@ def _resolve_rounds(
     消息没给模式、且当前设置仍是默认的 ``up-to`` 时，本轮按 ``exact`` 执行（未给轮次则按
     1 轮：审查 → 修复 → 复审）。用户明确说了"没问题就不用改"（模型给出 ``up-to``）时照办。
 
+    **review 的意图级默认**：``review`` = 只审查不改，未显式给轮次时本轮按 0 轮执行
+    （首审即收尾，不进入修复），否则会话的默认轮次会把"只看不改"变成"接着修"。
+
     Returns:
         ``(设置, 标注)``；标注非空时表示轮次被夹取过、或本轮按 review_fix 的默认模式执行
         （进终端与会话档案）。
@@ -504,7 +508,7 @@ def _resolve_rounds(
     base = RoundSettings(
         max_iterations=int(current.get("max_iterations") or config_mod.DEFAULT_ROUNDS_DEFAULT),
         max_iterations_source=str(current.get("max_iterations_source") or state_mod.SOURCE_DEFAULT),
-        rounds_mode=str(current.get("rounds_mode") or state_mod.ROUNDS_UP_TO),
+        rounds_mode=str(current.get("rounds_mode") or rounds_mod.ROUNDS_UP_TO),
     )
     pinned = overrides.max_iterations if overrides is not None else None
     note = ""
@@ -524,7 +528,7 @@ def _resolve_rounds(
     review_fix_default = (
         decision.rounds_mode is None
         and decision.intent == orch_mod.INTENT_REVIEW_FIX
-        and effective_mode != state_mod.ROUNDS_EXACT
+        and effective_mode != rounds_mod.ROUNDS_EXACT
     )
     if review_fix_default:
         if decision.rounds is None and pinned is None:
@@ -534,10 +538,19 @@ def _resolve_rounds(
             item for item in (note, f"本轮按「审查→修复」默认跑满 {rounds} 轮{detail}") if item
         )
     mode = (
-        state_mod.ROUNDS_EXACT
+        rounds_mod.ROUNDS_EXACT
         if review_fix_default
         else (pinned_mode or decision.rounds_mode or base.rounds_mode)
     )
+    # review 的意图级语义（Design §5.4："只审查不改"等价 rounds=0）：会话里默认的轮次
+    # 设置不能把"只看不改"变成"接着修"。同一句话里明确给了轮次、或命令行钉住了轮次时，
+    # 以那句话/那个参数为准（优先级链不变）。
+    if decision.intent == orch_mod.INTENT_REVIEW and decision.rounds is None and pinned is None:
+        if rounds != 0:
+            note = "；".join(
+                item for item in (note, "本轮按「只审查不改」执行，不进入修复") if item
+            )
+        rounds, source = 0, state_mod.SOURCE_REQUIREMENT
     return RoundSettings(
         max_iterations=rounds, max_iterations_source=source, rounds_mode=mode
     ), note
@@ -989,7 +1002,7 @@ def _print_session_header(
     io.say(
         f"[轮次] 上限 {settings.get('max_iterations', '（未记录）')}"
         f"（来源：{engine_mod.source_label(settings.get('max_iterations_source'))}）；"
-        f"模式 {settings.get('rounds_mode', state_mod.ROUNDS_UP_TO)}；"
+        f"模式 {settings.get('rounds_mode', rounds_mod.ROUNDS_UP_TO)}；"
         f"消息里可说「最多 N 轮 / 跑满 N 轮」（夹取上限 {limit}）"
     )
     rounds = [item for item in state.get("rounds") or [] if isinstance(item, Mapping)]

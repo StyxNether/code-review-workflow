@@ -25,9 +25,10 @@ Handler = Callable[..., str]
 #: 工具名常量（提示词、节点装配与测试按名引用）
 LIST_DIR_TOOL = "list_dir"
 READ_FILE_TOOL = "read_file"
+WRITE_FILE_TOOL = "write_file"
 EXEC_TOOL_NAME = "run_python"
 #: 全部工具名（注册表默认装配集）
-ALL_TOOL_NAMES: tuple[str, ...] = (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME)
+ALL_TOOL_NAMES: tuple[str, ...] = (LIST_DIR_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, EXEC_TOOL_NAME)
 
 _MAX_ARGS_PREVIEW = 160
 
@@ -162,6 +163,25 @@ def build_registry(
                 "required": ["path"],
             },
             handler=partial(fs.read_file, roots),
+        )
+    if names is None or WRITE_FILE_TOOL in names:
+        registry.register(
+            name=WRITE_FILE_TOOL,
+            description=(
+                "把**整个文件的完整内容**写入上下文根内的指定文件（已存在则整份覆盖，"
+                "不存在则新建，父目录自动创建）。只写你实际改动的文件；未改动的文件不要重写。"
+                "单次写入上限 10 MB。相对路径相对上下文根解析；绝对路径、~、隐藏文件、"
+                "越界路径与数据目录内的路径一律被拒绝；内容是纯文本，不要放 Markdown 围栏。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "相对上下文根的文件路径"},
+                    "content": {"type": "string", "description": "文件的完整文本内容"},
+                },
+                "required": ["path", "content"],
+            },
+            handler=partial(fs.write_file, roots),
         )
     if allow_exec and (names is None or EXEC_TOOL_NAME in names):
         registry.register(

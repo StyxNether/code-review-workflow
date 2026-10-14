@@ -359,7 +359,8 @@ def test_run_with_requirement_prints_conclusion_and_persists_record(
     assert summary.residual_severe == 0
     state = records.read_state(summary.path)
     assert state is not None
-    assert state["model"] == "DeepSeek/deepseek-flash"  # 真实模型标识（Design §4.3）
+    # 真实模型标识含生效挡位（产品默认已关闭思考，默认值也要看得见，Design §8.3 的回显口径）
+    assert state["model"] == "DeepSeek/deepseek-flash（思考：off）"
 
 
 def test_run_records_tool_events_in_the_log(
@@ -871,6 +872,26 @@ def test_review_file_prints_conclusion_and_never_creates_a_run(
     assert "【严重】" in captured.out
     assert "正在审查" in captured.err
     assert records.list_runs() == []
+
+
+def test_review_interrupt_reports_readably_and_exits_2(
+    configured_provider: Callable[[], dict[str, object]],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``crw review`` 被 Ctrl+C 中断：stderr 一行可读提示 + 退出码 2（Design §8.1）。"""
+    configured_provider()
+
+    def _interrupted(*args: object, **kwargs: object) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("crw.cli.agents_mod.review_once", _interrupted)
+
+    assert main(["review", str(sample_path("syntax_error.py"))]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""  # 半截结论不进 stdout
+    assert "已中断" in captured.err
 
 
 def test_review_json_mode_reports_severe_with_exit_code_1(
@@ -1516,8 +1537,8 @@ def test_run_report_has_the_usage_table_with_a_total_row(
 
     report = (records.find_run_dir(run_id) / "report.md").read_text(encoding="utf-8")
     assert "## Token 用量" in report
-    assert "| 节点 | 调用 | 输入 | 缓存命中 | 输出 | 其中思考 |" in report
-    assert "| **合计** | 3 | 2,800 | 1,024（37%） | 410 | 120 |" in report
+    assert "| 节点 | 调用 | 输入 | 缓存命中 | 输出 | 其中正文 | 其中思考 |" in report
+    assert "| **合计** | 3 | 2,800 | 1,024（37%） | 410 | 290 | 120 |" in report
 
 
 def test_show_prints_the_usage_line(
@@ -1531,7 +1552,10 @@ def test_show_prints_the_usage_line(
     assert main(["show", run_id]) == 0
 
     text = capsys.readouterr().out
-    assert "[用量] 输入 2,800 · 输出 410（思考 120） · 缓存命中 1,024（37%） · 3 次调用" in text
+    assert (
+        "[用量] 输入 2,800 · 输出 410（正文 290 + 思考 120） · 缓存命中 1,024（37%） · 3 次调用"
+        in text
+    )
 
 
 def test_show_recovers_usage_from_the_log_when_state_is_broken(
@@ -1610,7 +1634,10 @@ def test_review_command_reports_a_usage_line(
     assert main(["review", str(sample_path("divide_by_zero.py"))]) == 0
 
     err = capsys.readouterr().err
-    assert "[用量] 输入 1,500 · 输出 200 · 缓存命中 1,024（68%） · 1 次调用" in err
+    assert (
+        "[用量] 输入 1,500 · 输出 200（未回报思考分解，按正文计） · 缓存命中 1,024（68%） · 1 次调用"
+        in err
+    )
 
 
 def test_report_and_show_add_the_thinking_cost_hint(
@@ -1693,4 +1720,4 @@ def test_usage_table_escapes_a_poisoned_node_name(
     rows = [line for line in report.splitlines() if "evil" in line]
     assert len(rows) == 1
     assert "evil\\|node" in rows[0]
-    assert rows[0].count(" | ") == 5  # 仍是 6 列：名字里的竖线被转义，不产生新列
+    assert rows[0].count(" | ") == 6  # 仍是 7 列：名字里的竖线被转义，不产生新列

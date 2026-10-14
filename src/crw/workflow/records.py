@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import rounds as rounds_mod
 from ..config import data_dir
 from . import contracts
 from . import state as state_mod
@@ -323,7 +324,7 @@ def read_rounds(run_path: Path) -> list[RoundReport]:
         rounds.append(
             RoundReport(
                 round_number=round_number,
-                version_label=f"{state_mod.code_version_dir_name(version_number)}/",
+                version_label=f"{rounds_mod.code_version_dir_name(version_number)}/",
                 files=[str(item) for item in files] if isinstance(files, list) else [],
                 review=review,
                 fixes=fixes,

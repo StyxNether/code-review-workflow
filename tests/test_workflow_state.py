@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from crw import rounds as rounds_mod
 from crw.workflow import state as state_mod
 
 
@@ -76,14 +77,14 @@ def test_review_round_and_code_version_align_at_each_review_boundary(
     """审查边界上（review_round == fix_rounds）本轮审查序号 == 当前代码版本号（Design §4.4）。"""
     state = make_state(fix_rounds=fix_rounds, review_round=fix_rounds)
 
-    assert state_mod.code_version(state) == expected_version
-    assert state_mod.round_number_for_review(state) == expected_version
-    assert state_mod.round_number_for_fix(state) == expected_version
+    assert rounds_mod.code_version(state) == expected_version
+    assert rounds_mod.round_number_for_review(state) == expected_version
+    assert rounds_mod.round_number_for_fix(state) == expected_version
 
 
 def test_artifact_names_follow_the_directory_contract() -> None:
     """产物命名与 Design §4.5 的目录契约一致（版本 = 目录 + manifest，Design §4.2.2）。"""
-    assert state_mod.code_version_dir_name(2) == "code_v2"
+    assert rounds_mod.code_version_dir_name(2) == "code_v2"
     assert state_mod.review_file_name(3) == "review_3.json"
     assert state_mod.fixes_file_name(3) == "fixes_3.json"
 
@@ -106,7 +107,7 @@ def test_snapshot_fills_defaults_for_missing_fields() -> None:
     assert snapshot["status"] == state_mod.STATUS_RUNNING
     assert snapshot["findings"] == []
     assert snapshot["max_iterations_source"] == state_mod.SOURCE_DEFAULT
-    assert snapshot["rounds_mode"] == state_mod.ROUNDS_UP_TO
+    assert snapshot["rounds_mode"] == rounds_mod.ROUNDS_UP_TO
 
 
 def test_snapshot_coerces_paths_and_nested_values() -> None:

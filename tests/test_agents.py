@@ -10,9 +10,9 @@ import pytest
 
 from crw import agents as agents_mod
 from crw import llm
+from crw import rounds as rounds_mod
 from crw import usage as usage_mod
 from crw.tools import EXEC_TOOL_NAME, build_registry
-from crw.workflow import state as state_mod
 
 SYSTEM_PROMPT = "你是审查员。"
 
@@ -376,31 +376,53 @@ class TestNodeAssembly:
 
         assert "findings 必须为数组" in str(last_prompt(model, 0))
 
-    def test_fix_node_stages_the_model_text(self, workspace: Path) -> None:
+    def test_fix_node_writes_only_the_changed_files(self, workspace: Path) -> None:
+        """修复节点用 ``write_file`` 落盘：只写改动的文件，未改动的原样保留（Design §4.2.2）。
+
+        上下文根 = 本轮产出的版本目录，所以模型给的路径不带 ``code_vN/`` 前缀；节点只交回
+        fixes 围栏（产物内容不再走围栏），版本完整性由引擎按磁盘内容校验。
+        """
+        version = workspace / "code_v2"
+        version.mkdir()
+        (version / "main.py").write_text("print(1)\n", encoding="utf-8")
+        (version / "helper.py").write_text("X = 1\n", encoding="utf-8")
         model = fakes.ScriptedChatModel(
             responses=[
+                fakes.ai_tool_call("write_file", path="main.py", content="print(2)\n"),
                 fakes.ai_text(
-                    fakes.fix_fence(
-                        {"main.py": "print(2)"},
-                        [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
+                    fakes.fix_contract(
+                        [{"finding_id": "f-1", "status": "fixed", "note": "已改为打印 2。"}]
                     )
-                )
+                ),
             ]
         )
         fix = agents_mod.build_nodes(make_runtime(model), roots=[workspace])["fix"]
 
         output = fix(
             {
-                "current_version_dir": str(workspace / "code_v1"),
-                "version_files": ["main.py"],
+                "current_version_dir": str(version),
+                "version_files": ["helper.py", "main.py"],
                 "findings": [
-                    {"id": "f-1", "severity": "严重", "location": "main.py:1", "issue": "x"}
+                    {"id": "f-1", "severity": "严重", "location": "main.py:1", "issue": "输出错了"}
                 ],
                 "fix_rounds": 0,
             }
         )
 
+        assert (version / "main.py").read_text(encoding="utf-8") == "print(2)\n"
+        assert (version / "helper.py").read_text(encoding="utf-8") == "X = 1\n"
         assert "```json" in output["fix_text"] and "f-1" in output["fix_text"]
+        # 写入根是版本目录：模型无需再"整份重贴"未改动的文件
+        assert "不要重写" in str(model.requests[0][0].content)
+        assert "write_file" in model.bound_tools[0]
+
+    def test_fix_node_without_a_target_dir_fails_readably(self, workspace: Path) -> None:
+        """缺目标版本目录属装配缺陷：显式失败，不在一个不存在的根上"假装修复"。"""
+        model = fakes.ScriptedChatModel(responses=[])
+        fix = agents_mod.build_nodes(make_runtime(model), roots=[workspace])["fix"]
+
+        with pytest.raises(ValueError, match="缺少目标版本目录"):
+            fix({"current_version_dir": "", "version_files": [], "findings": []})
 
     def test_no_exec_is_visible_to_the_nodes(self, workspace: Path) -> None:
         """``--no-exec`` 时节点看到的是不含 run_python 的工具集（提示词口径随之切换）。"""
@@ -524,8 +546,8 @@ def test_state_helpers_used_by_the_nodes() -> None:
     """节点读的轮次 / 版本口径与状态层同源（避免两处各算一份）。"""
     state = {"review_round": 2, "fix_rounds": 1}
 
-    assert state_mod.code_version_dir_name(state_mod.code_version(state)) == "code_v2"
-    assert state_mod.round_number_for_review(state) == 3
+    assert rounds_mod.code_version_dir_name(rounds_mod.code_version(state)) == "code_v2"
+    assert rounds_mod.round_number_for_review(state) == 3
 
 
 class TestToolMarkupGuard:
@@ -670,25 +692,27 @@ def test_parallel_tool_calls_in_one_message_are_counted(workspace: Path) -> None
     assert result.tool_events == 2
 
 
-def test_fix_task_prompt_lists_relative_paths_for_the_fences() -> None:
-    """修复清单用版本内相对路径（= file= 声明口径），读取路径的版本前缀只在步骤说明里。
+def test_fix_task_prompt_scopes_paths_to_the_version_dir() -> None:
+    """修复任务的上下文根就是本轮产出的版本目录：清单与 write_file 都用不带前缀的相对路径。
 
-    真实演示暴露：清单带 code_v1/ 前缀而围栏要求不带前缀，模型照清单产出带前缀的路径，
-    覆盖检查判缺全体文件。
+    旧形态在这里踩过真实的坑——清单带 ``code_v1/`` 前缀而产出要求不带前缀，模型照清单写
+    带前缀的路径、覆盖检查判缺全体文件；根换成版本目录后两种口径合一。
     """
     from crw.agents import prompts
 
     prompt = prompts.fix_task_prompt(
-        version_label="code_v2",
+        version_label="code_v1",
+        out_label="code_v2",
         files=["main.py", "todos.py"],
-        version=2,
         findings=[fakes.finding(location="main.py:1")],
         allow_exec=True,
     )
 
     assert "- main.py" in prompt and "- todos.py" in prompt
-    assert "code_v2/main.py" in prompt  # 读取路径带前缀（步骤说明里给出）
-    assert "不要带版本目录前缀" in prompt
+    assert "code_v1/ 已复制为 code_v2/" in prompt  # 来源与产出去向都写明
+    assert "本轮的版本目录 code_v2/（上下文根" in prompt
+    assert "只把你改动的文件写回去" in prompt
+    assert "未改动的文件不要写" in prompt
 
 
 def test_drain_notices_for_only_takes_the_named_node(workspace: Path) -> None:
@@ -887,15 +911,17 @@ def test_reviewer_prompt_constrains_verification_scripts_and_monologue() -> None
 
 
 def test_fixer_prompt_limits_repeated_inline_self_verification() -> None:
-    """修复提示词：整版本内联自验一次就够（内联的候选代码同样按输出计费）。"""
+    """修复提示词：只写改动文件、自验一次就够（重复贴版本与反复重跑都按输出计费）。"""
     from crw.agents import prompts
 
     assert "只自验一次、只验改动涉及的部分" in prompts.FIXER_SYSTEM_PROMPT
+    assert "只写你实际改动的文件" in prompts.FIXER_SYSTEM_PROMPT
+    assert "不要输出代码围栏" in prompts.FIXER_SYSTEM_PROMPT
     task = prompts.fix_task_prompt(
-        version_label="code_v2",
+        version_label="code_v1",
+        out_label="code_v2",
         files=["main.py"],
-        version=2,
         findings=[fakes.finding()],
         allow_exec=True,
     )
-    assert "一次就够，不要逐文件反复整份内联重跑" in task
+    assert "一次就够，不要逐文件反复重跑" in task

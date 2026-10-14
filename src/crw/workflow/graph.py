@@ -32,6 +32,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from .. import rounds as rounds_mod
 from . import contracts
 from . import state as state_mod
 from .state import RunState
@@ -190,7 +191,7 @@ def route_after_review(state: Mapping[str, Any]) -> str:
     """
     if _state_int(state, "fix_rounds") >= _state_int(state, "max_iterations"):
         return END
-    if state.get("rounds_mode") == state_mod.ROUNDS_EXACT:
+    if state.get("rounds_mode") == rounds_mod.ROUNDS_EXACT:
         return "fix"
     if state.get("clean"):
         return END

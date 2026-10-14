@@ -13,9 +13,13 @@ import pytest
 from support import read_sample, sample_path
 
 from crw import config as config_mod
+from crw import rounds as rounds_mod
 from crw.workflow import contracts, records
 from crw.workflow import engine as engine_mod
 from crw.workflow import state as state_mod
+
+# 修复写盘用例的入口文件内容（模块级常量，避免用例里重复贴字面量）
+ENTRY_CODE = '"""入口。"""\n\nprint(1)\n'
 
 
 def file_request(name: str, **kwargs: object) -> engine_mod.RunRequest:
@@ -49,26 +53,26 @@ def scripted_review(*responses: object) -> Callable[..., dict[str, str]]:
 
 
 def scripted_fix(code: str, fixes: Sequence[Mapping[str, Any]]) -> Callable[..., dict[str, str]]:
-    """返回固定代码与 fixes 清单的修复节点（输出版本内全部文件，首文件替换为给定代码）。"""
+    """写盘形态的修复节点：把给定代码写回本轮版本目录的首个文件，只交回 fixes 围栏。
+
+    与真实修复节点同形态（Design §4.2.2）：产物走文件系统，不进契约文本。
+    """
 
     def node(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
-        raw = str(state.get("current_version_dir") or "")
-        # 空值直接走兜底：Path("") 等价于当前目录，会把仓库整棵树当版本读
-        directory = Path(raw) if raw.strip() else None
-        files: dict[str, str] = {}
-        if directory is not None and directory.is_dir():
-            for item in sorted(directory.rglob("*")):
-                if item.is_file() and item.name != "manifest.json":
-                    files[item.relative_to(directory).as_posix()] = item.read_text(encoding="utf-8")
-        if not files:
-            files = {"main.py": ""}
-        first = min(files)
-        files[first] = code
-        payload = {"fixes": list(fixes)}
-        fences = "\n\n".join(
-            f"```python file={name}\n{content}\n```" for name, content in sorted(files.items())
+        directory = Path(str(state.get("current_version_dir") or ""))
+        names = (
+            [
+                item.relative_to(directory).as_posix()
+                for item in sorted(directory.rglob("*"))
+                if item.is_file() and item.name != "manifest.json"
+            ]
+            if directory.is_dir()
+            else []
         )
-        return {"fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```"}
+        destination = directory / (names[0] if names else "main.py")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(code, encoding="utf-8")
+        return {"fix_text": fakes.fix_contract(fixes)}
 
     return node
 
@@ -442,6 +446,162 @@ def test_severe_only_residual_names_the_severe_findings(
     )
 
     assert "仍有 1 项【严重】残留" in report_text(result)
+
+
+# ---- 修复写盘形态（write_file 只写改动文件，Design §4.2.2 / §5.2）----
+
+
+def test_fix_that_claims_a_change_but_writes_nothing_is_retried_then_fails(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """处置声称 fixed 却没写盘：按契约违规重试一次，仍无改动 → 节点失败（退出码 2）。
+
+    这是写盘形态特有的漏洞——产物不在契约文本里，"嘴上说修了"必须能被引擎抓到。
+    """
+    calls = {"n": 0}
+
+    def lazy_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        calls["n"] += 1
+        return {
+            "fix_text": fakes.fix_contract(
+                [{"finding_id": "f-1", "status": "fixed", "note": "已修（其实没写盘）"}]
+            )
+        }
+
+    nodes = {"review": scripted_review([severe_finding()]), "fix": lazy_fix}
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=1)
+    )
+
+    assert result.exit_code == 2
+    assert calls["n"] == 2  # 一次正常 + 一次契约重试
+    assert "请用 write_file 写入改动后的文件" in str(result.error_message)
+    assert any(
+        "请用 write_file 写入改动后的文件" in str(event.get("detail"))
+        for event in read_events(result)
+    )
+
+
+def test_fix_that_empties_a_version_file_is_rejected_by_name(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """把文件写成空内容是"改坏"，不是"改完"：违规文本点名是哪个文件。"""
+
+    def breaking_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        directory = Path(str(state["current_version_dir"]))
+        (directory / "main.py").write_text("", encoding="utf-8")
+        return {
+            "fix_text": fakes.fix_contract(
+                [{"finding_id": "f-1", "status": "fixed", "note": "清空了"}]
+            )
+        }
+
+    nodes = {"review": scripted_review([severe_finding()]), "fix": breaking_fix}
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=1)
+    )
+
+    assert result.exit_code == 2
+    assert "以下文件被写成空内容：main.py" in str(result.error_message)
+
+
+def test_fix_over_the_size_limit_is_rejected(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """量级上限对写盘结果同样生效：单文件超限按契约违规收尾（Design §4.2.2）。"""
+
+    def huge_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        directory = Path(str(state["current_version_dir"]))
+        (directory / "main.py").write_text("x" * (257 * 1024), encoding="utf-8")
+        return {
+            "fix_text": fakes.fix_contract(
+                [{"finding_id": "f-1", "status": "fixed", "note": "超长"}]
+            )
+        }
+
+    nodes = {"review": scripted_review([severe_finding()]), "fix": huge_fix}
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器", max_iterations=1)
+    )
+
+    assert result.exit_code == 2
+    assert "超过单文件上限" in str(result.error_message)
+
+
+def test_fix_keeps_untouched_files_byte_for_byte(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """只写改动文件：未改动的文件字节级保持原样，且仍在重算后的清单里。"""
+
+    def touch_main(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        directory = Path(str(state["current_version_dir"]))
+        (directory / "main.py").write_text(ENTRY_CODE, encoding="utf-8")
+        return {
+            "fix_text": fakes.fix_contract(
+                [{"finding_id": "f-1", "status": "fixed", "note": "改了入口"}]
+            )
+        }
+
+    nodes = {
+        "encode": two_file_encode,
+        "review": scripted_review([severe_finding(location="main.py:1")], []),
+        "fix": touch_main,
+    }
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写两个文件")
+    )
+
+    assert result.exit_code == 0
+    workspace = result.run_dir / "workspace"
+    before = (workspace / "code_v1" / "legacy.py").read_bytes()
+    after = (workspace / "code_v2" / "legacy.py").read_bytes()
+    assert before == after  # 未改动的文件一个字节都没变
+    state = read_state(result)
+    assert state["version_files"] == ["legacy.py", "main.py"]
+    manifest = json.loads((workspace / "code_v2" / "manifest.json").read_text(encoding="utf-8"))
+    assert [item["path"] for item in manifest["files"]] == ["legacy.py", "main.py"]
+
+
+def test_fix_retry_starts_from_a_restored_version_dir(
+    fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
+) -> None:
+    """契约重试从"上一版本的完整副本"起步：上一次写坏的文件不得留在本轮产物里。
+
+    写盘形态的失败模式与围栏形态不同——产物不在契约文本里，重试时若不复位目录，
+    上一轮写坏的内容会被这一轮的"合格"结论一起带走。
+    """
+    calls = {"n": 0}
+
+    def messy_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        calls["n"] += 1
+        directory = Path(str(state["current_version_dir"]))
+        if calls["n"] == 1:
+            (directory / "main.py").write_text("", encoding="utf-8")  # 写坏：空内容
+            return {"fix_text": fakes.fix_contract([])}  # 且漏掉 findings 的处置
+        return {
+            "fix_text": fakes.fix_contract(
+                [{"finding_id": "f-1", "status": "skipped", "note": "该结论不成立"}]
+            )
+        }
+
+    nodes = {"review": scripted_review([severe_finding()], []), "fix": messy_fix}
+
+    result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
+        engine_mod.RunRequest(requirement="写一个计算器")
+    )
+
+    assert result.exit_code == 0
+    assert calls["n"] == 2
+    workspace = result.run_dir / "workspace"
+    broken = (workspace / "code_v2" / "main.py").read_text(encoding="utf-8")
+    assert broken == (workspace / "code_v1" / "main.py").read_text(encoding="utf-8")
+    assert broken.strip()  # 复位后不是上一次写下的空文件
+    fix_entry = next(entry for entry in read_state(result)["history"] if entry["node"] == "fix")
+    assert "本轮未产生改动" in fix_entry["summary"]
 
 
 def test_contract_violation_retries_once_with_feedback(
@@ -871,7 +1031,7 @@ def test_run_request_records_labels_for_future_milestones(
             parent_run_id="r-20261011-0001",
             session_id="s-20261012-0001",
             round_index=2,
-            rounds_mode=state_mod.ROUNDS_UP_TO,
+            rounds_mode=rounds_mod.ROUNDS_UP_TO,
         )
     )
 
@@ -880,7 +1040,7 @@ def test_run_request_records_labels_for_future_milestones(
     assert state["parent_run_id"] == "r-20261011-0001"
     assert state["session_id"] == "s-20261012-0001"
     assert state["round_index"] == 2
-    assert state["rounds_mode"] == state_mod.ROUNDS_UP_TO
+    assert state["rounds_mode"] == rounds_mod.ROUNDS_UP_TO
 
 
 def test_extra_fences_are_ignored_but_recorded(
@@ -889,6 +1049,8 @@ def test_extra_fences_are_ignored_but_recorded(
     """Design §4.2.1：修复输出的多余围栏忽略并记 log（写进阶段摘要即进 log.jsonl）。"""
 
     def chatty_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
+        directory = Path(str(state["current_version_dir"]))
+        (directory / "main.py").write_text("print(1)\n", encoding="utf-8")
         fixes_body = json.dumps(
             {"fixes": [{"finding_id": "f-1", "status": "fixed", "note": "已修"}]},
             ensure_ascii=False,
@@ -911,9 +1073,9 @@ def test_extra_fences_are_ignored_but_recorded(
     assert result.exit_code == 0
     state = read_state(result)
     fix_entry = next(entry for entry in state["history"] if entry["node"] == "fix")
-    assert "已忽略 2 个多余围栏" in fix_entry["summary"]
+    assert "已忽略 3 个多余围栏" in fix_entry["summary"]
     assert any(
-        "已忽略 2 个多余围栏" in str(event.get("detail"))
+        "已忽略 3 个多余围栏" in str(event.get("detail"))
         for event in read_events(result)
         if event.get("event") == "end"
     )
@@ -1239,15 +1401,14 @@ def two_file_encode(state: Mapping[str, Any]) -> dict[str, str]:
 
 
 def deleting_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
-    """修复节点：只给出 main.py，并提出删除 legacy.py（Design §4.2.2 的"申请-确认"）。"""
-    files = fakes.read_version_files(state)
-    keep = {name: content for name, content in files.items() if name != "legacy.py"}
+    """修复节点：改动写回 main.py，并提出删除 legacy.py（Design §4.2.2 的"申请-确认"）。"""
+    directory = Path(str(state["current_version_dir"]))
+    (directory / "main.py").write_text('"""入口。"""\n\nprint(1)\n', encoding="utf-8")
     payload = {
         "fixes": [{"finding_id": "f-1", "status": "fixed", "note": "删除冗余模块。"}],
         "deleted": ["legacy.py"],
     }
-    fences = "\n\n".join(f"```python file={name}\n{content}\n```" for name, content in keep.items())
-    return {"fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"}
+    return {"fix_text": f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"}
 
 
 def _deletion_run(
@@ -1382,19 +1543,13 @@ def test_deleting_an_absent_file_keeps_running(
         state: Mapping[str, Any], retry_feedback: str | None = None
     ) -> dict[str, str]:
         directory = Path(str(state["current_version_dir"]))
-        (directory / "legacy.py").unlink()  # 模拟磁盘上的文件已不在
-        files = fakes.read_version_files(state)
-        keep = {name: content for name, content in files.items() if name != "legacy.py"}
+        (directory / "legacy.py").unlink()  # 模拟磁盘与记录脱节：文件已不在
+        (directory / "main.py").write_text('"""入口。"""\n\nprint(1)\n', encoding="utf-8")
         payload = {
             "fixes": [{"finding_id": "f-1", "status": "fixed", "note": "清理冗余模块。"}],
             "deleted": ["legacy.py"],
         }
-        fences = "\n\n".join(
-            f"```python file={name}\n{content}\n```" for name, content in keep.items()
-        )
-        return {
-            "fix_text": f"{fences}\n\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"
-        }
+        return {"fix_text": f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"}
 
     nodes = {
         "encode": two_file_encode,

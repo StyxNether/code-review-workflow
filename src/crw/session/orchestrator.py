@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import rounds as rounds_mod
 from ..agents import AgentRuntime, ToolRegistry
 from ..workflow import engine as engine_mod
 from ..workflow import state as state_mod
@@ -231,7 +232,7 @@ def _validate(payload: Any, *, rounds_limit: int) -> Decision | str:
         return "ask 必须给出非空的 reply（要问用户什么 / 答什么）"
     rounds, note = _clamp_rounds(payload.get("rounds"), rounds_limit)
     mode = payload.get("rounds_mode")
-    if mode not in (state_mod.ROUNDS_UP_TO, state_mod.ROUNDS_EXACT):
+    if mode not in (rounds_mod.ROUNDS_UP_TO, rounds_mod.ROUNDS_EXACT):
         mode = None
     return Decision(
         intent=intent,

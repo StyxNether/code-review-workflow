@@ -18,8 +18,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from .. import rounds as rounds_mod
 from ..tools import EXEC_TOOL_NAME, ToolRegistry
-from ..workflow import state as state_mod
 from . import prompts
 from .runtime import REVIEW_EVIDENCE_KEY, AgentRuntime, history_from_state
 
@@ -63,14 +63,14 @@ def build_review_node(
     ) -> Mapping[str, Any]:
         if retry_feedback is None:
             evidence["value"] = False  # 新一轮审查：重新判定执行证据
-        version = state_mod.code_version(state)
+        version = rounds_mod.code_version(state)
         result = runtime.run(
             node=name,
             system_prompt=prompts.reviewer_system_prompt(view),
             user_prompt=prompts.review_task_prompt(
-                version_label=state_mod.code_version_dir_name(version),
+                version_label=rounds_mod.code_version_dir_name(version),
                 files=_files_of(state),
-                review_round=state_mod.round_number_for_review(state),
+                review_round=rounds_mod.round_number_for_review(state),
                 code_version=version,
                 allow_exec=EXEC_TOOL_NAME in registry.names(),
                 retry_feedback=retry_feedback,

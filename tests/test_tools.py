@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 from crw import config
-from crw.tools import build_registry, exec_py, fs
+from crw.tools import ALL_TOOL_NAMES, WRITE_FILE_TOOL, build_registry, exec_py, fs
 
 
 @pytest.fixture
@@ -213,6 +214,189 @@ class TestSplitLines:
         assert fs.split_lines("") == []
 
 
+def _raise_os_error(*args: object, **kwargs: object) -> None:
+    """顶替 ``os.replace``：模拟替换阶段的文件系统故障。"""
+    raise OSError("模拟替换失败")
+
+
+def _temporary_files(directory: Path) -> list[str]:
+    """目录树里残留的临时文件名——原子写失败后必须为空（不得留下半写内容）。"""
+    return sorted(item.name for item in directory.rglob("*.tmp"))
+
+
+class TestWriteFile:
+    """修复节点的写盘入口：落盘边界 = 上下文根，且不产生半写文件（Design §4.2.2 / §8.4）。"""
+
+    def test_writes_content_and_reports_lines_and_bytes(self, root: Path) -> None:
+        """返回文本要报出路径、行数与落盘字节数（摘要形态不限，数字必须对得上磁盘）。"""
+        result = fs.write_file([root], "main.py", "a = 1\nb = 2\nc = 3")
+
+        written = (root / "main.py").read_bytes()
+        assert written == b"a = 1\nb = 2\nc = 3\n"
+        assert not result.startswith(fs.ERROR_PREFIX)
+        assert "main.py" in result
+        assert "3" in result  # 三行
+        assert "18" in result  # 15 个可见字符 + 两个内部换行 + 补上的结尾换行
+
+    def test_byte_count_is_utf8_bytes_not_characters(self, root: Path) -> None:
+        """字节数按 UTF-8 算：4 个汉字是 12 字节再加补上的结尾换行。"""
+        result = fs.write_file([root], "a.py", "中文内容")
+
+        assert (root / "a.py").read_bytes() == "中文内容\n".encode()
+        assert "13" in result and "4" not in result
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            ("print(1)", b"print(1)\n"),
+            ("print(2)\n", b"print(2)\n"),
+            ("print(3)\n\n", b"print(3)\n\n"),
+        ],
+    )
+    def test_trailing_newline_is_added_exactly_once(
+        self, root: Path, content: str, expected: bytes
+    ) -> None:
+        """缺结尾换行补一个、已有则不重复补——与版本落盘的归一化同口径，逐字节比较才有意义。"""
+        fs.write_file([root], "a.py", content)
+
+        assert (root / "a.py").read_bytes() == expected
+
+    def test_new_nested_path_creates_parent_directories(self, root: Path, tmp_path: Path) -> None:
+        """版本内的新文件可以落在子目录里；父目录只建在上下文根之内。"""
+        result = fs.write_file([root], "pkg/sub/mod.py", "x = 1")
+
+        assert not result.startswith(fs.ERROR_PREFIX)
+        assert (root / "pkg" / "sub" / "mod.py").read_text(encoding="utf-8") == "x = 1\n"
+        assert [item.name for item in tmp_path.iterdir()] == ["workspace"]
+
+    def test_existing_file_is_replaced_wholesale(self, root: Path) -> None:
+        fs.write_file([root], "a.py", "print('这一行应当整份消失')\n")
+
+        result = fs.write_file([root], "a.py", "x = 1")
+
+        assert not result.startswith(fs.ERROR_PREFIX)
+        assert (root / "a.py").read_bytes() == b"x = 1\n"
+
+    def test_two_roots_confine_the_write_to_the_owner_root(
+        self, root: Path, tmp_path: Path
+    ) -> None:
+        """多上下文根时写入落在其中的一个根内，绝不落在根之外（修复节点的根即版本目录）。"""
+        other = tmp_path / "other"
+        other.mkdir()
+
+        result = fs.write_file([root, other], "a.py", "print(1)")
+
+        assert not result.startswith(fs.ERROR_PREFIX)
+        assert (root / "a.py").is_file()
+        assert list(other.iterdir()) == []
+
+    def test_absolute_path_is_rejected(self, root: Path, tmp_path: Path) -> None:
+        outside = tmp_path / "outside.py"
+
+        result = fs.write_file([root], str(outside), "print(1)")
+
+        assert result.startswith(fs.ERROR_PREFIX)
+        assert "不接受绝对路径" in result
+        assert not outside.exists()
+
+    @pytest.mark.parametrize("raw", ["../escape.py", "pkg/../../escape.py", "..", "~/notes.txt"])
+    def test_paths_escaping_the_root_are_rejected(
+        self, root: Path, tmp_path: Path, raw: str
+    ) -> None:
+        result = fs.write_file([root], raw, "print(1)")
+
+        assert result.startswith(fs.ERROR_PREFIX)
+        assert list(root.iterdir()) == []
+        assert not (tmp_path / "escape.py").exists()
+        assert not (tmp_path / "notes.txt").exists()
+
+    @pytest.mark.parametrize("raw", [".env", "pkg/.hidden", ".git/config"])
+    def test_hidden_targets_are_rejected(self, root: Path, raw: str) -> None:
+        """拒绝名单与读取同口径：凭证类隐藏文件不得被模型写进上下文根。"""
+        result = fs.write_file([root], raw, "SECRET=1")
+
+        assert result.startswith(fs.ERROR_PREFIX)
+        assert "隐藏" in result
+        assert list(root.iterdir()) == []
+
+    def test_data_directory_target_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """数据目录（配置与运行记录）内的路径不可写：模型不得改写 key 文件或运行记录。"""
+        data_home = tmp_path / "crw-data"
+        data_home.mkdir()
+        monkeypatch.setenv(config.HOME_ENV, str(data_home))
+
+        result = fs.write_file([tmp_path], "crw-data/models.json", '{"api_key": "x"}')
+
+        assert result.startswith(fs.ERROR_PREFIX)
+        assert "数据目录" in result
+        assert not (data_home / "models.json").exists()
+
+    def test_directory_target_is_rejected(self, root: Path) -> None:
+        (root / "pkg").mkdir()
+
+        result = fs.write_file([root], "pkg", "print(1)")
+
+        assert "路径是目录" in result
+        assert list((root / "pkg").iterdir()) == []
+
+    @pytest.mark.parametrize("content", [123, None, ["print(1)"], b"bytes"])
+    def test_non_string_content_is_rejected(self, root: Path, content: object) -> None:
+        result = fs.write_file([root], "a.py", content)
+
+        assert "content 必须是字符串" in result
+        assert list(root.iterdir()) == []
+
+    @pytest.mark.parametrize("path", ["", "   ", 12, None])
+    def test_missing_or_non_string_path_is_rejected(self, root: Path, path: object) -> None:
+        result = fs.write_file([root], path, "print(1)")
+
+        assert "path 必须是非空字符串" in result
+        assert list(root.iterdir()) == []
+
+    def test_oversized_content_is_rejected_before_writing(
+        self, monkeypatch: pytest.MonkeyPatch, root: Path
+    ) -> None:
+        """写入的有界性由工具层自己保证（不依赖上层契约）：超限既不落盘也不留临时文件。"""
+        monkeypatch.setattr(fs, "MAX_WRITE_BYTES", 64)
+
+        result = fs.write_file([root], "a.py", "x" * 100)
+
+        assert "超过单次写入上限" in result
+        assert not (root / "a.py").exists()
+        assert _temporary_files(root) == []
+
+    def test_failed_replace_keeps_the_previous_file_and_leaves_no_temp(
+        self, monkeypatch: pytest.MonkeyPatch, root: Path
+    ) -> None:
+        """原子写的承诺：替换失败时旧内容原样保留、临时文件被清掉，失败以结构化文本回传。"""
+        (root / "a.py").write_text("old\n", encoding="utf-8")
+        monkeypatch.setattr(os, "replace", _raise_os_error)
+
+        result = fs.write_file([root], "a.py", "new content\n")
+
+        assert result.startswith(fs.ERROR_PREFIX)
+        assert (root / "a.py").read_text(encoding="utf-8") == "old\n"
+        assert _temporary_files(root) == []
+
+    def test_interrupted_write_propagates_and_leaves_no_temp_file(
+        self, monkeypatch: pytest.MonkeyPatch, root: Path
+    ) -> None:
+        """落盘原子性对中断同样成立：异常上抛（不伪装成写入成功）且不留半写临时文件。"""
+
+        def _interrupt(*args: object, **kwargs: object) -> None:
+            raise KeyboardInterrupt("模拟中断")
+
+        monkeypatch.setattr(os, "replace", _interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            fs.write_file([root], "a.py", "print(1)")
+
+        assert not (root / "a.py").exists()
+        assert _temporary_files(root) == []
+
+
 class TestRunPython:
     def test_code_and_path_are_mutually_exclusive(self, root: Path) -> None:
         assert "二选一" in exec_py.run_python([root])
@@ -327,14 +511,31 @@ class TestEnvSanitisation:
 
 
 class TestRegistry:
-    def test_default_registry_has_the_three_tools(self, root: Path) -> None:
-        assert build_registry([root]).names() == ["list_dir", "read_file", "run_python"]
+    def test_default_registry_has_the_four_tools(self, root: Path) -> None:
+        """默认装配含 write_file：修复节点只写改动的文件（Design §4.2.2 的写盘形态）。"""
+        assert build_registry([root]).names() == [
+            "list_dir",
+            "read_file",
+            "write_file",
+            "run_python",
+        ]
+        assert build_registry([root]).names() == list(ALL_TOOL_NAMES)
+
+    def test_write_file_schema_requires_path_and_content(self, root: Path) -> None:
+        schema = next(
+            item
+            for item in build_registry([root]).schemas()
+            if item["function"]["name"] == WRITE_FILE_TOOL
+        )
+
+        assert schema["function"]["parameters"]["required"] == ["path", "content"]
+        assert set(schema["function"]["parameters"]["properties"]) == {"path", "content"}
 
     def test_no_exec_drops_the_execution_tool(self, root: Path) -> None:
-        """``--no-exec`` 的唯一闸口在注册表组装层（Design §8.1）。"""
+        """``--no-exec`` 的唯一闸口在注册表组装层（Design §8.1）：只关执行，不动写盘。"""
         names = build_registry([root], allow_exec=False).names()
 
-        assert names == ["list_dir", "read_file"]
+        assert names == ["list_dir", "read_file", "write_file"]
         assert all(
             "run_python" not in schema["function"]["name"]
             for schema in build_registry([root], allow_exec=False).schemas()
@@ -346,6 +547,7 @@ class TestRegistry:
             "read_file",
             "run_python",
         ]
+        assert build_registry([root], names=(WRITE_FILE_TOOL,)).names() == ["write_file"]
 
     def test_dispatch_runs_a_tool(self, root: Path) -> None:
         (root / "code_v1.py").write_text("print(1)\n", encoding="utf-8")
@@ -353,6 +555,31 @@ class TestRegistry:
         result = build_registry([root]).dispatch("read_file", json.dumps({"path": "code_v1.py"}))
 
         assert "1 | print(1)" in result
+
+    def test_dispatch_writes_through_the_registered_handler(self, root: Path) -> None:
+        """模型走的正是注册表入口：write_file 经 dispatch 落盘并回摘要。"""
+        registry = build_registry([root])
+
+        result = registry.dispatch(
+            "write_file", json.dumps({"path": "pkg/mod.py", "content": "VALUE = 42"})
+        )
+
+        assert not result.startswith(fs.ERROR_PREFIX)
+        assert "pkg/mod.py" in result
+        assert (root / "pkg" / "mod.py").read_bytes() == b"VALUE = 42\n"
+
+    def test_dispatch_reports_bad_write_arguments_readably(self, root: Path) -> None:
+        """缺参数 / 非法 JSON / 越界路径都以 ``错误：`` 文本回传，不抛出（Design §8.4）。"""
+        registry = build_registry([root])
+
+        assert "执行失败" in registry.dispatch("write_file", "{}")
+        assert "content" in registry.dispatch("write_file", json.dumps({"path": "a.py"}))
+        assert "不是合法 JSON" in registry.dispatch("write_file", "{oops")
+        assert "必须是 JSON 对象" in registry.dispatch("write_file", '["a.py", "print(1)"]')
+        assert registry.dispatch(
+            "write_file", json.dumps({"path": "../escape.py", "content": "print(1)"})
+        ).startswith(fs.ERROR_PREFIX)
+        assert list(root.iterdir()) == []
 
     def test_dispatch_reports_unknown_tool_readably(self, root: Path) -> None:
         result = build_registry([root]).dispatch("deploy", "{}")

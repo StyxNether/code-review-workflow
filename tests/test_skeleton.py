@@ -18,6 +18,7 @@ MODULES = (
     "crw.config",
     "crw.thinking",
     "crw.usage",
+    "crw.rounds",
     "crw.workflow",
     "crw.workflow.graph",
     "crw.workflow.state",

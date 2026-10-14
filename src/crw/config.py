@@ -66,7 +66,12 @@ class ProviderPreset:
     env_var: str
 
 
-# 思考挡位预填说明（2026-10-14 查证各供应商官网；四项通道差异已由用户裁决，同日落地）：
+# 思考挡位预填说明（挡位清单 2026-10-14 查证各供应商官网；**默认挡位改为"关闭"由用户
+# 2026-10-14 裁决**——关键点是"关闭"必须**显式发送参数**：不发参数在 DeepSeek 侧等于
+# "思考开、effort high"，所以预设把 selected 预填到各供应商的关闭通道上，而不是留空。
+# 用户后来在菜单 6 手选过的条目（models.json 里有 selected）一律优先于这里的默认值。
+# 2026-10-14 那次预填是我们替用户填的、不是逐个手选的，因此本次调整不违背"显式配置优先"。）
+# 原查证说明（2026-10-14 查证各供应商官网；四项通道差异已由用户裁决，同日落地）：
 # - DeepSeek：thinking.type=enabled/disabled 与 reasoning_effort=none/low/high/max（V4 系档位
 #   为 low/high/max，medium 未列入文档 → 不预填），off 走 thinking.type、none 走 effort=none；
 # - Kimi：k2.6 支持 thinking.type=disabled，开启用 thinking.type=enabled（内置 on）→ 预填
@@ -78,9 +83,14 @@ class ProviderPreset:
 #   enabled / enable-off 与内置映射一致（关闭对偶为用户裁决 2026-10-14 新增）→ 预填两者；
 # - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 报错，官方口径），
 #   思考恒开（默认交错思考）→ 用户裁决"接受不可关闭"，**不预填**（无可用配置项，保持字符串条目）。
-_THINKING_DEEPSEEK = {"levels": ["off", "none", "low", "high", "max"]}
-_THINKING_OPENAI = {"levels": ["none", "low", "medium", "high"]}
-_THINKING_QWEN = {"levels": ["enabled", "enable-off"]}
+#   裁决同时要求"恒开型默认 low"，但那要以"官网 + 锁定版本实测确认该供应商接受
+#   reasoning_effort=low"为前提；未实测就不发送任何参数（延续"查不到就不猜"的规矩），
+#   并在 crw config 回显里如实说明"该模型思考不可关闭，成本不可控"。
+_THINKING_DEEPSEEK = {"levels": ["off", "none", "low", "high", "max"], "selected": "off"}
+_THINKING_OPENAI = {"levels": ["none", "low", "medium", "high"], "selected": "none"}
+_THINKING_QWEN = {"levels": ["enabled", "enable-off"], "selected": "enable-off"}
+_KIMI_K3 = {"levels": ["low", "high"]}  # 无关闭通道（只有 reasoning_effort），默认不发送
+_KIMI_K26 = {"levels": ["off", "on"], "selected": "off"}
 
 PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset(
@@ -96,8 +106,8 @@ PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
         "Kimi (Moonshot)",
         "https://api.moonshot.cn/v1",
         (
-            {"name": "kimi-k3", "thinking": {"levels": ["low", "high"]}},
-            {"name": "kimi-k2.6", "thinking": {"levels": ["off", "on"]}},
+            {"name": "kimi-k3", "thinking": _KIMI_K3},
+            {"name": "kimi-k2.6", "thinking": _KIMI_K26},
         ),
         "CRW_MOONSHOT_API_KEY",
     ),
@@ -415,6 +425,29 @@ def legacy_env_var(name: str) -> str:
     return _LEGACY_PREFIX + stem.removeprefix(_KEY_PREFIX)
 
 
+def preset_default_thinking(provider: str | None, model: str) -> str | None:
+    """预设里该模型的默认思考挡位：``models.json`` 没写 ``selected`` 时的产品默认（§8.3）。
+
+    产品默认是**关闭思考**，而"关闭"必须显式发送参数（不发参数在 DeepSeek 侧等于"思考开、
+    effort high"），所以默认值来自预设的 ``selected``，而不是"什么都不发"。
+    返回 ``None`` 表示该模型没有可用的关闭通道（恒开型或未查证），于是不发送任何思考参数——
+    延续"查不到就不猜、不预填"的规矩。``provider`` 为 ``None`` 时按模型名在各预设里查
+    （环境变量回退路径没有供应商名）。
+    """
+    for preset in PROVIDER_PRESETS:
+        if provider is not None and preset.name != provider:
+            continue
+        for item in preset.models:
+            if not isinstance(item, dict) or item.get("name") != model:
+                continue
+            thinking = item.get("thinking")
+            if isinstance(thinking, dict):
+                selected = thinking.get("selected")
+                return selected if isinstance(selected, str) and selected else None
+            return None
+    return None
+
+
 def resolve_provider_api_key(name: str, entry_api_key: str | None) -> str | None:
     """供应商 key 回退链：条目 api_key → ``CRW_*`` → ``CRA_*`` → ``SE_CodeAgent``。
 
@@ -708,7 +741,10 @@ def _resolve_provider(
         )
     model_name = model if model is not None else names[0]
     thinking_payload = model_thinking_config(models, model_name)
-    thinking = thinking_mod.selected_level(thinking_payload) if thinking_payload else None
+    # 条目里显式配过的挡位优先；没配过的落到预设的"关闭"默认值上（产品默认=不发散思考）
+    thinking = (
+        thinking_mod.selected_level(thinking_payload) if thinking_payload else None
+    ) or preset_default_thinking(provider, model_name)
     api_key = resolve_provider_api_key(provider, entry.get("api_key"))
     if not api_key:
         raise ConfigError(
@@ -763,11 +799,13 @@ def resolve(*, model: str | None = None, provider: str | None = None) -> Resolve
     api_key = get_api_key()
     if not api_key:
         return None
+    model_name = model or get_model()
     return ResolvedModel(
-        model=model or get_model(),
+        model=model_name,
         base_url=get_base_url(),
         api_key=api_key,
         provider=None,
+        thinking=preset_default_thinking(None, model_name),
     )
 
 

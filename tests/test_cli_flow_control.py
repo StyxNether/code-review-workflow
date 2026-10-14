@@ -15,6 +15,7 @@ import pytest
 from support import sample_path
 
 from crw import config as config_mod
+from crw import rounds as rounds_mod
 from crw.cli import main
 from crw.workflow import graph as graph_mod
 from crw.workflow import records
@@ -48,7 +49,7 @@ def write_parent_record(
         "fix_rounds": 1,
         "max_iterations": max_iterations,
         "max_iterations_source": state_mod.SOURCE_CLI,
-        "rounds_mode": state_mod.ROUNDS_UP_TO,
+        "rounds_mode": rounds_mod.ROUNDS_UP_TO,
         "parallel_review": parallel_review,
         "session_id": None,
         "round_index": None,
@@ -157,6 +158,31 @@ def test_resume_of_a_pre_severe_only_record_judges_strictly(
     state = records.read_state(child.path)
     assert state is not None
     assert state["severe_only"] is False
+
+
+def test_resume_can_end_at_the_round_limit_with_exit_code_one(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """续跑的"达限残留"路径（退出码 1）在命令面可达，而不只靠 run 侧同函数推定。"""
+    write_parent_record(max_iterations=1)
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_tool_call("read_file", path="code_v1/main.py"),
+            fakes.ai_text(
+                fakes.review_fence(
+                    [fakes.finding(location="main.py:1")], "仍有除零风险。", files=["main.py"]
+                )
+            ),
+        ]
+    )
+
+    assert main(["resume", "r-20261012-0001", "--max-iter", "0"]) == 1
+
+    captured = capsys.readouterr()
+    assert "达修复轮次上限" in captured.out
 
 
 def test_resume_without_a_code_version_is_readable(

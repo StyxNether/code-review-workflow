@@ -1,15 +1,19 @@
-"""文件类工具：list_dir 与 read_file；路径以上下文根解析，越界一律拒绝。
+"""文件类工具：list_dir / read_file / write_file；路径以上下文根解析，越界一律拒绝。
 
 所有 handler 返回字符串（错误也是字符串，数据封装，由注册表统一交给模型）：
 - 相对路径以**上下文根**解析（运行工作区；`crw review` 独立执行时为审查目标所在目录）；
 - 规范化后越出根（含 ``..``）、绝对路径、``~`` 展开一律结构化拒绝（Design §8.4）；
-- 隐藏文件（任一路径成分以 ``.`` 开头）与数据目录内路径拒绝读取——防凭证类文件
+- 隐藏文件（任一路径成分以 ``.`` 开头）与数据目录内路径拒绝读写——防凭证类文件
   进入模型上下文与运行日志；
-- 行号口径（1-based、右对齐竖线分隔）与审查 prompt 的代码附行号方式一致。
+- 行号口径（1-based、右对齐竖线分隔）与审查 prompt 的代码附行号方式一致；
+- ``write_file`` 自带原子写（临时文件 + ``os.replace``）：本层不得 import workflow 层
+  （依赖方向 §3.1），因此不复用 ``workflow.records`` 的写盘原语。
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -19,6 +23,8 @@ from .. import config
 MAX_READ_LINES = 400
 #: 单文件读取上限：读取本身须有界（先判大小再读，防大文件进内存）
 MAX_READ_BYTES = 10 * 1024 * 1024
+#: 单文件写入上限：与读取同量级——写盘的有界性由工具层自己保证，不依赖上层契约
+MAX_WRITE_BYTES = 10 * 1024 * 1024
 #: 二进制嗅探采样窗口：文件头部含 null 字节即判为二进制
 TEXT_SNIFF_BYTES = 8192
 
@@ -104,9 +110,9 @@ def resolve_in_roots(roots: Sequence[Path], raw: str) -> tuple[Path | None, str 
     owner, target = next(((root, path) for root, path in options if path.exists()), options[0])
     relative = target.relative_to(owner)
     if any(part.startswith(".") for part in relative.parts):
-        return None, f"{ERROR_PREFIX}隐藏文件 / 隐藏目录不可读取：{raw!r}"
+        return None, f"{ERROR_PREFIX}隐藏文件 / 隐藏目录不可读写：{raw!r}"
     if _in_forbidden_data_dir(target, owner):
-        return None, f"{ERROR_PREFIX}数据目录（配置与运行记录）内的路径不可读取：{raw!r}"
+        return None, f"{ERROR_PREFIX}数据目录（配置与运行记录）内的路径不可读写：{raw!r}"
     return target, None
 
 
@@ -224,6 +230,74 @@ def read_file(
             "该文件换行很少，请改用 offset 无法细分的部分——建议对超大单行文件用其他方式处理）"
         )
     return output
+
+
+def write_file(roots: Sequence[Path], path: str, content: str) -> str:
+    """把文本写入上下文根内的文件（原子写）；返回写入摘要。
+
+    路径解析与拒绝名单同 ``read_file``（Design §8.4）：越界 / 绝对路径 / ``~`` / 隐藏文件
+    与数据目录一律拒绝——所以调用方给什么根就只能写进什么根。修复节点的根是本轮产出的
+    版本目录，写入因此天然限定在该目录之内（Design §4.2.2）。父目录不存在时按需创建
+    （版本内的新文件可以是子目录里的新条目）；已有文件整份覆盖。
+    """
+    if not isinstance(path, str) or not path.strip():
+        return f"{ERROR_PREFIX}path 必须是非空字符串（相对上下文根）"
+    if not isinstance(content, str):
+        return (
+            f"{ERROR_PREFIX}content 必须是字符串（文件的完整内容），收到：{type(content).__name__}"
+        )
+    target, error = resolve_in_roots(roots, path)
+    if error is not None:
+        return error
+    assert target is not None  # resolve_in_roots 的错误分支已返回
+    if target.is_dir():
+        return f"{ERROR_PREFIX}路径是目录，无法写入：{path!r}"
+    if target.name == "manifest.json":
+        # manifest 是引擎落盘时写的权威文件清单（Design §4.2.2）：写它既会被重算覆盖，
+        # 也给了"把文件藏出清单"的可乘之机，直接在入口拒掉并说明原因
+        return f"{ERROR_PREFIX}manifest.json 由引擎维护（版本的权威文件清单），不可写入"
+    if content and not content.endswith("\n"):
+        content += "\n"  # 与版本落盘的归一化口径一致（整版本逐字节比较才有意义）
+    try:
+        data = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # JSON 里的孤立代理字符（U+D800 那一类码位）能走到这里：编码失败也必须回传结构化
+        # 错误，不能让异常冲出 handler（注册表兜底会把归因推成"工具执行失败"）
+        return f"{ERROR_PREFIX}content 无法按 UTF-8 编码，请给出合法文本：{exc}"
+    if len(data) > MAX_WRITE_BYTES:
+        return (
+            f"{ERROR_PREFIX}{path!r} 约 {len(data) / 1048576:.1f} MB，超过单次写入上限"
+            f"（{MAX_WRITE_BYTES // 1048576} MB）。请缩小写入范围。"
+        )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(target, content)
+    except OSError as exc:
+        return f"{ERROR_PREFIX}写入 {path!r} 失败：{exc}"
+    return f"已写入 {path}（{len(split_lines(content))} 行，{len(data)} 字节）"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本（临时文件 + ``os.replace``；失败尽力清理临时文件）。
+
+    与 ``workflow.records`` 的实现同语义但**自带一份**：工具层不得向上 import（§3.1），
+    而"不产生半写文件"是 write_file 对自己落盘的承诺，不能依赖调用方谨慎。临时名带 pid：
+    并发（同一轮里两个写盘）不得互相踩同一个临时文件。
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                tmp.chmod(0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def looks_textual(path: Path) -> bool:
@@ -352,6 +426,7 @@ __all__ = [
     "IGNORED_DIRS",
     "MAX_READ_BYTES",
     "MAX_READ_LINES",
+    "MAX_WRITE_BYTES",
     "TEXT_SNIFF_BYTES",
     "file_line",
     "list_dir",
@@ -360,4 +435,5 @@ __all__ = [
     "resolve_in_roots",
     "resolve_roots",
     "split_lines",
+    "write_file",
 ]

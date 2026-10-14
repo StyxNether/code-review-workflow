@@ -58,10 +58,11 @@ class ReviewResult:
 
 @dataclass(frozen=True)
 class FixResult:
-    """一轮修复的校验后结果（多文件形态，Design §4.2.2）。"""
+    """一轮修复的校验后结果（写盘形态，Design §4.2.2 / M5a B 项）。
 
-    files: dict[str, str]
-    """路径（版本内相对路径，posix 风格）→ 文件内容；重复声明取最后一个。"""
+    修复节点用 ``write_file`` 只写改动的文件，产物内容因此**不经过本契约**——这里只
+    承载处置清单与删除申请；版本目录的实际文件集合由引擎按磁盘内容校验与重算。
+    """
 
     fixes: list[dict[str, Any]]
     unknown_ids: tuple[str, ...]
@@ -69,9 +70,6 @@ class FixResult:
 
     deleted: tuple[str, ...] = ()
     """修复 Agent **提出**删除的路径（执行前须用户确认，Design §4.2.2）。"""
-
-    duplicate_declarations: int = 0
-    """被忽略的重复 file= 声明数（同路径取最后一个，阶段摘要记"已忽略重复声明"）。"""
 
     extra_fences: int = 0
     """被忽略的多余围栏数（Design §4.2.1：其余围栏忽略并记 log）。"""
@@ -318,20 +316,7 @@ def collect_version_files(text: str, *, require_path: bool) -> tuple[dict[str, s
         files[path] = fence.content
     if not files and not errors:
         errors.append("未抽取出任何代码文件（每个文件需要一个 ```python file=… 围栏）")
-    total_bytes = sum(len(content.encode("utf-8")) for content in files.values())
-    oversize = [
-        path for path, content in files.items() if len(content.encode("utf-8")) > MAX_FILE_BYTES
-    ]
-    if oversize:
-        errors.append(
-            f"以下文件超过单文件上限（{MAX_FILE_BYTES // 1024} KB）：{', '.join(oversize)}"
-        )
-    if len(files) > MAX_VERSION_FILES:
-        errors.append(f"版本文件数超过上限（{MAX_VERSION_FILES} 个），实际 {len(files)} 个")
-    if total_bytes > MAX_VERSION_BYTES:
-        errors.append(
-            f"版本总大小超过上限（{MAX_VERSION_BYTES // 1024} KB），实际 {total_bytes // 1024} KB"
-        )
+    errors.extend(version_size_errors(files))
     if errors:
         raise ContractViolation(errors)
     extra_fences = max(0, len(scan_fences(text)) - len(fences))
@@ -344,26 +329,23 @@ def parse_fix_output(
     findings: Sequence[Mapping[str, Any]],
     current_files: Sequence[str],
 ) -> FixResult:
-    """抽取并校验修复产物：版本内全部文件的围栏 + fixes 清单（Design §4.2.2 / §5.2）。
+    """校验修复产出：fixes 处置清单与删除申请（Design §4.2.2 / §5.2 的写盘形态）。
 
     fixes 必须覆盖上一轮 findings 的 id 全集（缺项即违规，交重试处理）；重复 id 取最后
-    一条；未知 id 忽略并在报告标注；``skipped`` 必须给出理由。围栏侧：**必须给出版本内的
-    全部文件**（声明了 ``deleted`` 的除外——删除未确认前版本完整性由"覆盖检查"保证）；
-    新增文件即版本内新条目。删除以 fixes 围栏里的 ``{"deleted": […]}`` **提出**，执行前
-    由引擎征得用户确认（Design §4.2.2）。
+    一条；未知 id 忽略并在报告标注；``skipped`` 必须给出理由。删除在同一围栏里以
+    ``{"deleted": […]}`` **提出**，声明路径必须在当前版本内，执行前由引擎征得用户确认。
+
+    **产物内容不在本契约里**：修复节点用 ``write_file`` 只写它改动的文件，版本目录的
+    实际文件集合由引擎按磁盘内容校验（缺文件 / 空文件 / 超量级 → 契约违规重试一次）。
 
     Args:
         text: 修复节点交回的原始文本。
         findings: 上一轮审查的 findings（契约 id 全集的来源）。
-        current_files: 当前版本的文件清单（覆盖检查与 deleted 校验的基准）。
+        current_files: 当前版本的文件清单（deleted 声明的校验基准）。
 
     Returns:
         :class:`FixResult`；契约非法时抛 :class:`ContractViolation`。
     """
-    files, duplicates, extra_fences = collect_version_files(text, require_path=True)
-    errors: list[str] = []
-    deleted = _parse_deleted_declaration(text, current_files, errors)
-
     json_blocks = extract_fence(text, JSON_LABELS)
     if not json_blocks:
         raise ContractViolation(["修复输出缺少 ```json 围栏（需要给出 fixes 清单）"])
@@ -373,11 +355,11 @@ def parse_fix_output(
         raise ContractViolation([f"修复输出的 ```json 围栏不是合法 JSON：{exc}"]) from exc
     if not isinstance(raw, dict):
         raise ContractViolation(["fixes 契约顶层必须是对象"])
-    extra_fences = max(0, extra_fences - 1)
+    # 修复产出只应有一个 json 围栏：其余围栏（含模型沿用旧形态贴出的代码围栏）忽略但留痕
+    extra_fences = max(0, len(scan_fences(text)) - 1)
 
-    raw_fixes = raw.get("fixes")
-    if not isinstance(raw_fixes, list):
-        raise ContractViolation(["fixes 必须为数组"])
+    errors: list[str] = []
+    deleted = _deleted_paths(raw, current_files, errors)
 
     known: list[str] = []
     for index, item in enumerate(findings, 1):
@@ -386,8 +368,12 @@ def parse_fix_output(
             errors.append(f"上一轮 findings[{index}] 缺少可用 id（记录可能被手改），无法做逐条对应")
             continue
         known.append(finding_id)
-    if errors:
-        raise ContractViolation(errors)
+
+    raw_fixes = raw.get("fixes")
+    if not isinstance(raw_fixes, list):
+        errors.append("fixes 必须为数组")
+        if errors:
+            raise ContractViolation(errors)
     latest: dict[str, dict[str, Any]] = {}
     unknown: list[str] = []
     for index, item in enumerate(raw_fixes, 1):
@@ -414,51 +400,34 @@ def parse_fix_output(
             errors.append(f"fixes[{index}] 标记 skipped 但未给出理由（note）")
             continue
         if finding_id not in known:
-            unknown.append(finding_id)
+            if finding_id not in unknown:  # 同一未知 id 重复出现只记一条
+                unknown.append(finding_id)
             continue
         latest[finding_id] = {"finding_id": finding_id, "status": status_value, "note": note}
 
     missing = [finding_id for finding_id in known if finding_id not in latest]
     if missing:
         errors.append(f"fixes 未覆盖全部 findings：缺少 {', '.join(missing)}")
-
-    # 版本完整性：当前版本文件（声明删除的除外）必须全部给出——只给改动文件会让版本
-    # 不完整，与按文件审查 / 逐字节比较 / resume 从版本目录出发的语义冲突（Design §4.2.2）
-    absent = sorted(set(current_files) - set(deleted) - set(files))
-    if absent:
-        errors.append(f"修复必须给出版本内的全部文件（声明删除的除外），缺少：{', '.join(absent)}")
     if errors:
         raise ContractViolation(errors)
 
-    ordered = {path: files[path] for path in sorted(files)}
     fixes = [latest[finding_id] for finding_id in known if finding_id in latest]
     return FixResult(
-        files=ordered,
         fixes=fixes,
         unknown_ids=tuple(unknown),
         deleted=tuple(deleted),
-        duplicate_declarations=duplicates,
         extra_fences=extra_fences,
     )
 
 
-def _parse_deleted_declaration(
-    text: str, current_files: Sequence[str], errors: list[str]
+def _deleted_paths(
+    raw: Mapping[str, Any], current_files: Sequence[str], errors: list[str]
 ) -> list[str]:
-    """解析 fixes JSON 围栏里的 ``{"deleted": […]}`` 删除声明（Design §4.2.2）。
+    """解析 fixes 围栏里的 ``{"deleted": […]}`` 删除声明（Design §4.2.2）。
 
-    deleted 与 fixes 同围栏；独立成函数是为了把声明侧的错误并入同一份错误清单（重试
-    一次就能拿到全部问题，少一轮往返）。声明路径必须都在当前版本内；重复路径去重保序。
+    声明路径必须都在当前版本内；重复路径去重保序。错误并入调用方的同一份清单，
+    重试一次就能拿到全部问题，少一轮往返。
     """
-    json_blocks = extract_fence(text, JSON_LABELS)
-    if not json_blocks:
-        return []
-    try:
-        raw = json.loads(json_blocks[0])
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(raw, dict):
-        return []
     declared = raw.get("deleted")
     if declared is None:
         return []
@@ -479,6 +448,29 @@ def _parse_deleted_declaration(
         if path not in result:
             result.append(path)
     return result
+
+
+def version_size_errors(files: Mapping[str, str]) -> list[str]:
+    """版本量级上限（Design §4.2.2：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB）。
+
+    编码围栏产出与修复节点的写盘结果共用这一把尺子：两条产出路径的超限语义必须一致。
+    """
+    errors: list[str] = []
+    oversize = [
+        path for path, content in files.items() if len(content.encode("utf-8")) > MAX_FILE_BYTES
+    ]
+    if oversize:
+        errors.append(
+            f"以下文件超过单文件上限（{MAX_FILE_BYTES // 1024} KB）：{', '.join(oversize)}"
+        )
+    if len(files) > MAX_VERSION_FILES:
+        errors.append(f"版本文件数超过上限（{MAX_VERSION_FILES} 个），实际 {len(files)} 个")
+    total_bytes = sum(len(content.encode("utf-8")) for content in files.values())
+    if total_bytes > MAX_VERSION_BYTES:
+        errors.append(
+            f"版本总大小超过上限（{MAX_VERSION_BYTES // 1024} KB），实际 {total_bytes // 1024} KB"
+        )
+    return errors
 
 
 def judge_clean(findings: Sequence[Mapping[str, Any]], *, severe_only: bool = False) -> bool:

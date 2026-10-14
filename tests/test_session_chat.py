@@ -19,12 +19,14 @@ from fakes import (
     clean_review_calls,
     dirty_review_calls,
     file_fence,
-    fix_fence,
+    fix_contract,
+    fix_turn,
     orchestrator_reply,
     review_fence,
 )
 
 from crw import config as config_mod
+from crw import rounds as rounds_mod
 from crw.session import chat as chat_mod
 from crw.session import memory as memory_mod
 from crw.session import state as session_state
@@ -108,7 +110,7 @@ class _Session:
             or chat_mod.RoundSettings(
                 max_iterations=config_mod.DEFAULT_ROUNDS_DEFAULT,
                 max_iterations_source=state_mod.SOURCE_DEFAULT,
-                rounds_mode=state_mod.ROUNDS_UP_TO,
+                rounds_mode=rounds_mod.ROUNDS_UP_TO,
             ),
             overrides=overrides,
             file_input=file_input,
@@ -278,11 +280,9 @@ def test_review_fix_intent_runs_the_loop_and_advances_versions(
             *clean_review_calls(),
             orchestrator_reply("review_fix", reply="好，再检查一轮。"),
             *dirty_review_calls(version=2),
-            ai_text(
-                fix_fence(
-                    {"main.py": FIXED_CODE},
-                    [{"finding_id": "f-1", "status": "fixed", "note": "已补除数校验。"}],
-                )
+            *fix_turn(
+                {"main.py": FIXED_CODE},
+                [{"finding_id": "f-1", "status": "fixed", "note": "已补除数校验。"}],
             ),
             *clean_review_calls(version=3),
         ]
@@ -367,7 +367,7 @@ def test_exact_mode_runs_the_full_rounds_even_when_clean(
             orchestrator_reply("code", rounds=1, rounds_mode="exact", reply="好，跑满一轮。"),
             ai_text(file_fence(CLEAN_CODE)),
             *clean_review_calls(),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [], deleted=[])),
+            ai_text(fix_contract([], deleted=[])),
             *clean_review_calls(version=2),
         ]
     )
@@ -376,7 +376,7 @@ def test_exact_mode_runs_the_full_rounds_even_when_clean(
 
     assert code == 0
     state = _round_state(1)
-    assert state["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert state["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert state["max_iterations"] == 1
     assert state["max_iterations_source"] == state_mod.SOURCE_REQUIREMENT
     assert state["review_round"] == 2  # n+1 次审查
@@ -492,11 +492,9 @@ def test_resume_restores_memory_versions_and_settings(
             *clean_review_calls(),
             orchestrator_reply("review_fix", reply="好，接着看。"),
             *dirty_review_calls(version=2),
-            ai_text(
-                fix_fence(
-                    {"main.py": FIXED_CODE},
-                    [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
-                )
+            *fix_turn(
+                {"main.py": FIXED_CODE},
+                [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
             ),
             *clean_review_calls(version=3),
         ]
@@ -549,11 +547,9 @@ def test_memory_appends_structured_summaries_without_code(
             *clean_review_calls(),
             orchestrator_reply("review_fix", reply="好，接着看。"),
             *dirty_review_calls(version=2),
-            ai_text(
-                fix_fence(
-                    {"main.py": FIXED_CODE},
-                    [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
-                )
+            *fix_turn(
+                {"main.py": FIXED_CODE},
+                [{"finding_id": "f-1", "status": "fixed", "note": "已修复。"}],
             ),
             *clean_review_calls(version=3),
         ]
@@ -744,7 +740,7 @@ def test_review_fix_without_explicit_rounds_fixes_even_when_clean(
             *clean_review_calls(),
             orchestrator_reply("review_fix", reply="好，我先审查，再修一轮。"),
             *clean_review_calls(version=2),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=3),
         ]
     )
@@ -753,7 +749,7 @@ def test_review_fix_without_explicit_rounds_fixes_even_when_clean(
 
     assert code == 0
     second = _round_state(2)
-    assert second["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert second["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert second["max_iterations"] == 1
     assert second["max_iterations_source"] == state_mod.SOURCE_REQUIREMENT
     assert second["review_round"] == 2  # 审查 → 修复 → 复审
@@ -787,7 +783,7 @@ def test_review_fix_respects_an_explicit_up_to_mode(
 
     assert code == 0
     second = _round_state(2)
-    assert second["rounds_mode"] == state_mod.ROUNDS_UP_TO
+    assert second["rounds_mode"] == rounds_mod.ROUNDS_UP_TO
     assert second["fix_rounds"] == 0
     assert "本轮按「审查→修复」默认跑满" not in out
 
@@ -803,9 +799,9 @@ def test_review_fix_with_explicit_rounds_runs_them_all(
             *clean_review_calls(),
             orchestrator_reply("review_fix", rounds=2, reply="好，修 2 轮。"),
             *clean_review_calls(version=2),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=3),
-            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            ai_text(fix_contract([])),
             *clean_review_calls(version=4),
         ]
     )
@@ -814,7 +810,7 @@ def test_review_fix_with_explicit_rounds_runs_them_all(
 
     assert code == 0
     second = _round_state(2)
-    assert second["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert second["rounds_mode"] == rounds_mod.ROUNDS_EXACT
     assert second["max_iterations"] == 2
     assert second["review_round"] == 3
     assert second["fix_rounds"] == 2
@@ -846,11 +842,9 @@ def test_moderate_findings_still_drive_a_fix_round_in_a_session(
             orchestrator_reply("code", reply="好的，我来实现。"),
             ai_text(file_fence(CLEAN_CODE)),
             *_moderate_review_calls(),
-            ai_text(
-                fix_fence(
-                    {"main.py": FIXED_CODE},
-                    [{"finding_id": "f-1", "status": "fixed", "note": "已补可读错误"}],
-                )
+            *fix_turn(
+                {"main.py": FIXED_CODE},
+                [{"finding_id": "f-1", "status": "fixed", "note": "已补可读错误"}],
             ),
             *_moderate_review_calls(version=2),
         ]
@@ -885,6 +879,68 @@ def test_severe_only_option_reaches_the_round_and_the_archive(
     assert "仅【严重】阻塞（--severe-only 放宽）" in out
     assert _round_state(1)["severe_only"] is True
     assert _archive()["settings"]["severe_only"] is True
+
+
+def test_review_intent_does_not_enter_the_fix_loop(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """「只审查不改」= 0 轮修复（Design §5.4）：首审有阻塞问题也不动代码。
+
+    会话的默认轮次设置（内置 3）不能把这一句变成"接着修"——与 M4 试用反馈修掉的
+    review_fix 早退是同一类缺陷的反方向。
+    """
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *clean_review_calls(),
+            orchestrator_reply("review", reply="只看不改。"),
+            *dirty_review_calls(version=2),
+        ]
+    )
+
+    code, out = session.run(["写一个加法计算器", "只检查这一版，别改"])
+
+    assert code == 1  # 达限残留：本轮没有修复机会
+    second = _round_state(2)
+    assert second["max_iterations"] == 0
+    assert second["max_iterations_source"] == state_mod.SOURCE_REQUIREMENT
+    assert (second["review_round"], second["fix_rounds"]) == (1, 0)
+    assert "本轮按「只审查不改」执行" in out
+    workspace = _session_dir() / "rounds" / "round-2" / "workspace"
+    assert not (workspace / "code_v3").exists()  # 没有新版本产出
+
+
+def test_review_intent_keeps_rounds_pinned_on_the_command_line(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """命令行钉住轮次时以参数为准（优先级链不变）：这时「只审查」仍会跑那一轮修复。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *clean_review_calls(),
+            orchestrator_reply("review", reply="只看不改。"),
+            *dirty_review_calls(version=2),
+            *fix_turn(
+                {"main.py": FIXED_CODE},
+                [{"finding_id": "f-1", "status": "fixed", "note": "已补除数校验。"}],
+            ),
+            *clean_review_calls(version=3),
+        ]
+    )
+
+    code, out = session.run(
+        ["写一个加法计算器", "只检查这一版"],
+        overrides=chat_mod.RoundOverrides(max_iterations=1),
+    )
+
+    assert code == 0
+    second = _round_state(2)
+    assert second["max_iterations"] == 1
+    assert second["max_iterations_source"] == state_mod.SOURCE_CLI
+    assert (second["review_round"], second["fix_rounds"]) == (2, 1)
+    assert "本轮按「只审查不改」执行" not in out
 
 
 def test_session_header_states_the_clean_judgement(

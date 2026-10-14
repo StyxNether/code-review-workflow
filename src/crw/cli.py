@@ -24,6 +24,7 @@ from typing import Any
 from . import agents as agents_mod
 from . import config as config_mod
 from . import render
+from . import rounds as rounds_mod
 from . import thinking as thinking_mod
 from . import tools as tools_mod
 from . import uninstall as uninstall_mod
@@ -118,7 +119,10 @@ def _add_model_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_workflow_options(
-    parser: argparse.ArgumentParser, *, include_parallel_review: bool = True
+    parser: argparse.ArgumentParser,
+    *,
+    include_parallel_review: bool = True,
+    include_out: bool = True,
 ) -> None:
     """添加 run / resume / chat 共用的工作流选项（resume 不提供 -f）。"""
     parser.add_argument(
@@ -135,7 +139,7 @@ def _add_workflow_options(
     parser.add_argument(
         "--rounds-mode",
         dest="rounds_mode",
-        choices=[state_mod.ROUNDS_UP_TO, state_mod.ROUNDS_EXACT],
+        choices=[rounds_mod.ROUNDS_UP_TO, rounds_mod.ROUNDS_EXACT],
         default=None,
         metavar="{up-to,exact}",
         help=("轮次语义：up-to = 干净即早退（默认）；exact = 跑满指定轮次，结尾恒为一次审查"),
@@ -153,7 +157,8 @@ def _add_workflow_options(
             help="并行双视角审查（正确性 + 安全性同轮并行，汇合去重；审查调用量约翻倍）",
         )
     _add_model_options(parser)
-    parser.add_argument("--out", metavar="目录", help="将最终代码与报告复制到指定目录")
+    if include_out:
+        parser.add_argument("--out", metavar="目录", help="将最终代码与报告复制到指定目录")
     parser.add_argument("--no-stream", action="store_true", help="关闭流式渲染，整体输出")
     parser.set_defaults(max_iter_source=None)
 
@@ -207,9 +212,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", dest="resume", metavar="会话号", help="恢复既有会话（与 -f 二选一）"
     )
     chat_parser.set_defaults(_subparser=chat_parser)
-    # 会话内暂不提供 --parallel-review（Design §12.3 的评估项）：不注册即明确报参数错误，
-    # 而不是"解析了却静默不生效"
-    _add_workflow_options(chat_parser, include_parallel_review=False)
+    # 会话内暂不提供 --parallel-review（Design §12.3 的评估项）与 --out（会话每轮的产物已在
+    # 会话目录里，导出属于一次性运行的语义）：不注册即明确报参数错误，而不是"解析了却不生效"
+    _add_workflow_options(chat_parser, include_parallel_review=False, include_out=False)
 
     subparsers.add_parser("sessions", help="列出会话（会话号 / 时间 / 轮次数 / 最后状态）")
 
@@ -394,7 +399,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         source_text=source_text,
         max_iterations=rounds,
         max_iterations_source=source,
-        rounds_mode=args.rounds_mode or state_mod.ROUNDS_UP_TO,
+        rounds_mode=args.rounds_mode or rounds_mod.ROUNDS_UP_TO,
         severe_only=bool(args.severe_only),
         no_exec=bool(args.no_exec),
         parallel_review=bool(args.parallel_review),
@@ -572,7 +577,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         max_iterations_source=(
             state_mod.SOURCE_CONFIG if configured is not None else state_mod.SOURCE_DEFAULT
         ),
-        rounds_mode=args.rounds_mode or state_mod.ROUNDS_UP_TO,
+        rounds_mode=args.rounds_mode or rounds_mod.ROUNDS_UP_TO,
     )
     io = session_chat_mod.ChatIO(
         ask=render.ask_user,
@@ -653,10 +658,10 @@ def _rounds_for_resume(
     inherited_mode = str(parent_state.get("rounds_mode") or "")
     if args.rounds_mode:
         mode = args.rounds_mode
-    elif inherited_mode in (state_mod.ROUNDS_UP_TO, state_mod.ROUNDS_EXACT):
+    elif inherited_mode in (rounds_mod.ROUNDS_UP_TO, rounds_mod.ROUNDS_EXACT):
         mode = inherited_mode
     else:
-        mode = state_mod.ROUNDS_UP_TO
+        mode = rounds_mod.ROUNDS_UP_TO
     return rounds, source, mode
 
 
@@ -928,6 +933,14 @@ def _cmd_review(args: argparse.Namespace) -> int:
                 as_json=bool(args.as_json),
                 max_lines=render.REVIEW_PROMPT_MAX_LINES,
             )
+        except KeyboardInterrupt:
+            # 中断整批审查（Design §8.1）：已花掉的用量照样回显——钱花了就该看得见
+            print(
+                f"crw review：已中断（第 {position + 1} / {len(files)} 个文件），未产出结论。",
+                file=sys.stderr,
+            )
+            _report_review_usage(runtime)
+            return _EXIT_ERROR
         except Exception as exc:  # noqa: BLE001 — 单文件失败继续批量；最终退出码 2
             print(
                 f"[审查失败] {display_name}：{_mask_secrets(str(exc))}",
