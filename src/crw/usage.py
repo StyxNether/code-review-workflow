@@ -182,6 +182,35 @@ def cache_hit_rate(record: Mapping[str, Any]) -> float | None:
     return (_as_int(record.get("cached_tokens")) or 0) / input_tokens
 
 
+#: 思考 token 占输出达到该比例时，报告与回显附一句降本提示（实测 deepseek 思考挡位下常占七八成）
+THINKING_HINT_SHARE = 0.5
+
+
+def thinking_share(record: Mapping[str, Any]) -> float | None:
+    """思考 token 占输出的比例；输出未回报或为 0 时给 ``None``（不猜占比）。"""
+    if not _as_int(record.get("with_usage")):
+        return None
+    output = _as_int(record.get("output_tokens"), default=0) or 0
+    if output <= 0:
+        return None
+    return (_as_int(record.get("reasoning_tokens"), default=0) or 0) / output
+
+
+def hint(record: Mapping[str, Any]) -> str:
+    """降本提示：思考占比过半时给一句可操作的说明，否则空串。
+
+    推理文本按**输出**计费（输出单价高于输入），所以"输出占比高"这件事在数据上多半
+    就是思考挡位造成的——读数要顺带把这条因果讲清，用户才知道该调什么。
+    """
+    share = thinking_share(record)
+    if share is None or share < THINKING_HINT_SHARE:
+        return ""
+    return (
+        f"思考 token 占输出 {share:.0%}（推理文本按输出计费，输出单价高于输入）："
+        "如需降低输出用量，可用 --thinking off 或在 crw config 里调整该模型的思考挡位。"
+    )
+
+
 def log_detail(record: Mapping[str, Any]) -> dict[str, int]:
     """单次调用进 log.jsonl 的 detail（只带 token 数；未回报用量的调用为空对象）。
 

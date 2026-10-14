@@ -222,3 +222,29 @@ def test_field_names_are_stable() -> None:
         "cached_tokens",
         "cache_reported",
     )
+
+
+def test_thinking_share_and_hint_fire_only_when_dominant() -> None:
+    """思考占比过半才提示降本：低挡位/不思考的模型不该被唠叨。"""
+    heavy = usage.merge(
+        usage.from_usage_metadata(
+            {"input_tokens": 100, "output_tokens": 100, "output_token_details": {"reasoning": 71}}
+        ),
+        usage.empty(),
+    )
+    assert usage.thinking_share(heavy) == 0.71
+    assert "思考 token 占输出 71%" in usage.hint(heavy)
+    assert "--thinking off" in usage.hint(heavy)
+
+    light = usage.from_usage_metadata(
+        {"input_tokens": 100, "output_tokens": 100, "output_token_details": {"reasoning": 20}}
+    )
+    assert usage.hint(light) == ""
+
+
+def test_thinking_hint_needs_reported_output() -> None:
+    """输出未回报（或为 0）：不算占比、也不提示。"""
+    assert usage.thinking_share(usage.empty()) is None
+    assert usage.hint(usage.empty()) == ""
+    unknown = usage.from_usage_metadata(None)
+    assert usage.thinking_share(unknown) is None

@@ -1606,3 +1606,64 @@ def test_review_command_reports_a_usage_line(
 
     err = capsys.readouterr().err
     assert "[用量] 输入 1,500 · 输出 200 · 缓存命中 1,024（68%） · 1 次调用" in err
+
+
+def test_report_and_show_add_the_thinking_cost_hint(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """思考占输出过半时，报告与 crw show 都给一句可操作的降本提示。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_text(
+                fakes.file_fence(CLEAN_CODE),
+                usage=fakes.call_usage(
+                    input_tokens=500, output_tokens=400, cached_tokens=256, reasoning_tokens=300
+                ),
+            ),
+            fakes.ai_tool_call(
+                "read_file",
+                path="code_v1/main.py",
+                usage=fakes.call_usage(input_tokens=600, output_tokens=100, reasoning_tokens=60),
+            ),
+            fakes.ai_text(
+                fakes.review_fence([], "已读取完整文件，未发现阻塞问题。"),
+                usage=fakes.call_usage(input_tokens=700, output_tokens=300, reasoning_tokens=240),
+            ),
+        ]
+    )
+
+    assert main(["run", "写一个计算器"]) == 0
+
+    (summary,) = records.list_runs()
+    report = (summary.path / "report.md").read_text(encoding="utf-8")
+    assert "提示：思考 token 占输出 75%" in report
+    assert "--thinking off" in report
+
+    capsys.readouterr()
+    assert main(["show", summary.run_id]) == 0
+    assert "[提示] 思考 token 占输出 75%" in capsys.readouterr().out
+
+
+def test_review_command_hints_when_thinking_dominates_output(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``crw review`` 没有运行记录，降本提示因此也要出现在回显里。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_text(
+                "无阻塞问题。",
+                usage=fakes.call_usage(input_tokens=1000, output_tokens=500, reasoning_tokens=400),
+            )
+        ]
+    )
+
+    assert main(["review", str(sample_path("divide_by_zero.py"))]) == 0
+
+    err = capsys.readouterr().err
+    assert "[提示] 思考 token 占输出 80%" in err

@@ -1592,8 +1592,12 @@ def _usage_section(state: Mapping[str, Any]) -> list[str]:
     lines.append("| " + " | ".join(["**合计**", *usage_mod.cells(totals)]) + " |")
     lines.append("")
     note = usage_mod.note(totals)
+    hint = usage_mod.hint(totals)
     if note:
         lines.append(f"注：{note}。")
+    if hint:
+        lines.append(f"提示：{hint}")
+    if note or hint:
         lines.append("")
     return lines
 

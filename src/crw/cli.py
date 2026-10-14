@@ -993,6 +993,9 @@ def _report_review_usage(runtime: Any) -> None:
     if usage_mod.is_empty(record):
         return
     print(f"[用量] {usage_mod.format_line(record)}", file=sys.stderr)
+    hint = usage_mod.hint(record)
+    if hint:
+        print(f"[提示] {hint}", file=sys.stderr)
 
 
 # ---- crw config：供应商配置 / 连通性自检 ----

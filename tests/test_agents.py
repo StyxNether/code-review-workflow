@@ -865,3 +865,37 @@ def test_shrunk_message_list_is_not_rebilled(workspace: Path) -> None:
 
     record = runtime.drain_usage_for("review")
     assert record["calls"] == 3  # 一、二、四入账；"三"被漏记——少报花费好于多报花费
+
+
+def test_reviewer_prompt_constrains_verification_scripts_and_monologue() -> None:
+    """审查提示词里的降本约束：核实脚本小而准、围栏外最多两三句（防过程独白膨胀输出）。"""
+    from crw.agents import prompts
+
+    text = prompts.REVIEWER_SYSTEM_PROMPT
+    assert "核实脚本要**小而准**" in text
+    assert "不要把待审代码整份抄进" in text
+    assert "围栏之外**最多两三句**" in text
+    assert "我先读取文件" in text  # 明确点出被禁止的过程独白形态
+    task = prompts.review_task_prompt(
+        version_label="code_v1",
+        files=["main.py"],
+        review_round=1,
+        code_version=1,
+        allow_exec=True,
+    )
+    assert "最小输入与断言" in task
+
+
+def test_fixer_prompt_limits_repeated_inline_self_verification() -> None:
+    """修复提示词：整版本内联自验一次就够（内联的候选代码同样按输出计费）。"""
+    from crw.agents import prompts
+
+    assert "只自验一次、只验改动涉及的部分" in prompts.FIXER_SYSTEM_PROMPT
+    task = prompts.fix_task_prompt(
+        version_label="code_v2",
+        files=["main.py"],
+        version=2,
+        findings=[fakes.finding()],
+        allow_exec=True,
+    )
+    assert "一次就够，不要逐文件反复整份内联重跑" in task
