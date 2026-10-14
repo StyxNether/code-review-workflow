@@ -491,8 +491,13 @@ def _resolve_rounds(
     设置 / 配置默认取值。消息提取值越界**夹到上限并标注**（意图理解 ≠ 用户显式参数）；
     命令行越界由命令面按参数错误拦下（本函数收到的命令行值必已合法）。
 
+    **review_fix 的意图级默认**：用户要"审查之后修复"时不能被"审查干净"吞掉修复阶段——
+    消息没给模式、且当前设置仍是默认的 ``up-to`` 时，本轮按 ``exact`` 执行（未给轮次则按
+    1 轮：审查 → 修复 → 复审）。用户明确说了"没问题就不用改"（模型给出 ``up-to``）时照办。
+
     Returns:
-        ``(设置, 夹取标注)``；标注非空表示消息里的轮次被夹取过（进终端与会话档案）。
+        ``(设置, 标注)``；标注非空时表示轮次被夹取过、或本轮按 review_fix 的默认模式执行
+        （进终端与会话档案）。
     """
     current = state.get("settings") if isinstance(state.get("settings"), Mapping) else {}
     base = RoundSettings(
@@ -512,7 +517,26 @@ def _resolve_rounds(
     else:
         rounds, source = base.max_iterations, base.max_iterations_source
     pinned_mode = overrides.rounds_mode if overrides is not None else None
-    mode = pinned_mode or decision.rounds_mode or base.rounds_mode
+    effective_mode = pinned_mode or base.rounds_mode
+    # review_fix 的意图级默认：消息没说模式、且设置里仍是 up-to 时，按"跑满"执行
+    # （否则干净的审查会让修复阶段静默消失，与用户"审查后修复"的明确要求相悖）
+    review_fix_default = (
+        decision.rounds_mode is None
+        and decision.intent == orch_mod.INTENT_REVIEW_FIX
+        and effective_mode != state_mod.ROUNDS_EXACT
+    )
+    if review_fix_default:
+        if decision.rounds is None and pinned is None:
+            rounds, source = 1, state_mod.SOURCE_REQUIREMENT
+        detail = "（审查干净也会走一轮修复）" if rounds > 0 else ""
+        note = "；".join(
+            item for item in (note, f"本轮按「审查→修复」默认跑满 {rounds} 轮{detail}") if item
+        )
+    mode = (
+        state_mod.ROUNDS_EXACT
+        if review_fix_default
+        else (pinned_mode or decision.rounds_mode or base.rounds_mode)
+    )
     return RoundSettings(
         max_iterations=rounds, max_iterations_source=source, rounds_mode=mode
     ), note

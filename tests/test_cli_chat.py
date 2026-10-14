@@ -200,8 +200,11 @@ def test_chat_command_runs_a_full_conversation(
             orchestrator_reply("code", reply="好的，我来实现。"),
             ai_text(file_fence(CLEAN_CODE)),
             *clean_review_calls(),
-            orchestrator_reply("review_fix", reply="好，再检查一轮。"),
+            orchestrator_reply("review_fix", reply="好，先审查再修一轮。"),
+            # review_fix 默认 exact + 1 轮：审查（干净）→ 修复 → 复审
             *clean_review_calls(version=2),
+            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            *clean_review_calls(version=3),
         ]
     )
     _feed_input(monkeypatch, ["写一个加法计算器", "再检查一轮", "/exit"])
@@ -218,7 +221,8 @@ def test_chat_command_runs_a_full_conversation(
     assert "[会话] 结束：共 2 轮；最后状态：干净通过" in out
     archive = _only_session()
     assert [item["intent"] for item in archive["rounds"]] == ["code", "review_fix"]
-    assert archive["current_version"] == 2
+    assert archive["rounds"][1]["fix_rounds"] == 1  # review_fix 真的修了一轮
+    assert archive["current_version"] == 3
 
 
 def test_chat_exit_code_follows_the_last_round(

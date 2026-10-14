@@ -20,6 +20,16 @@ from .runtime import AgentRuntime, history_from_state
 NodeFn = Callable[..., Mapping[str, Any]]
 
 
+def _as_int(value: Any) -> int:
+    """状态里的整数字段（缺失 / 坏值按 0 处理）：只用于提示词里的轮次描述。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+    return value
+
+
 def build_fix_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
     """构造修复节点：``node(state[, retry_feedback]) -> {"fix_text": …}``。"""
 
@@ -38,6 +48,8 @@ def build_fix_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
                 allow_exec=EXEC_TOOL_NAME in registry.names(),
                 retry_feedback=retry_feedback,
                 polish=state.get("rounds_mode") == state_mod.ROUNDS_EXACT,
+                round_number=state_mod.round_number_for_fix(state),
+                rounds_total=_as_int(state.get("max_iterations")),
             ),
             registry=registry,
             history=history_from_state(state, "fixer"),

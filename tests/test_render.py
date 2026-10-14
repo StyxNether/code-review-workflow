@@ -989,3 +989,26 @@ def test_crlf_fence_markers_are_suppressed_too() -> None:
     text = err.getvalue()
     assert "秘而不宣" not in text
     assert "已收到 text 围栏" in text
+
+
+def test_ask_user_colors_the_prompt_only_for_terminals(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """交互提示在终端里是天蓝色（用户反馈 2026-10-14），非终端 / NO_COLOR 下退化为纯文本。"""
+    monkeypatch.setattr("builtins.input", lambda: "  3  ")
+
+    assert render.ask_user("你> ", color=True) == "3"
+    colored = capsys.readouterr().err
+    assert "\x1b[" in colored  # 强制定色：出现 ANSI 转义
+    assert "你> " in colored
+
+    assert render.ask_user("你> ", color=False) == "3"
+    plain = capsys.readouterr().err
+    assert "\x1b[" not in plain  # 关闭着色：纯文本（重定向 / 日志里不混转义码）
+    assert plain == "你> "
+
+
+def test_prompt_style_is_sky_blue() -> None:
+    """提示样式常量：天蓝色（改样式时这条用例会提醒"用户要的是天蓝"）。"""
+    assert render.PROMPT_STYLE == "sky_blue1"

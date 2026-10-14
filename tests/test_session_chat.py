@@ -381,12 +381,11 @@ def test_exact_mode_runs_the_full_rounds_even_when_clean(
     assert state["max_iterations_source"] == state_mod.SOURCE_REQUIREMENT
     assert state["review_round"] == 2  # n+1 次审查
     assert state["fix_rounds"] == 1  # n 轮修复（首审已干净仍继续）
-    # 干净轮次的修复是"复核改进"轮：任务提示词说明本轮是跑满轮次下的复核
-    assert any(
-        "会话要求跑满 1 轮" in str(item.content)
-        for request in fake_chat_model.requests
-        for item in request
+    # 干净轮次的修复是"复核改进"轮：任务提示词说明本轮是跑满轮次下的第几轮修复
+    polish_request = "\n".join(
+        str(item.content) for request in fake_chat_model.requests for item in request
     )
+    assert "本轮要求跑满 1 轮修复（exact 模式），这是第 1 轮" in polish_request
     assert "模式 exact" in out
 
 
@@ -728,3 +727,94 @@ def test_second_code_round_modifies_the_previous_version(
         for item in request
     )
     assert "代码版本 code_v2/（1 个文件）" in out
+
+
+def test_review_fix_without_explicit_rounds_fixes_even_when_clean(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """试用反馈（2026-10-14）：用户要"审查后修复"时，干净的首审不能吞掉修复阶段。
+
+    review_fix 未由消息指定模式、且会话仍是默认 up-to 时，本轮按 exact + 1 轮执行：
+    审查 → （复核/修复一轮）→ 复审，轮次用法为 审查 2 轮 / 修复 1 轮。
+    """
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *clean_review_calls(),
+            orchestrator_reply("review_fix", reply="好，我先审查，再修一轮。"),
+            *clean_review_calls(version=2),
+            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            *clean_review_calls(version=3),
+        ]
+    )
+
+    code, out = session.run(["写一个加法计算器", "审查后修复一轮"])
+
+    assert code == 0
+    second = _round_state(2)
+    assert second["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert second["max_iterations"] == 1
+    assert second["max_iterations_source"] == state_mod.SOURCE_REQUIREMENT
+    assert second["review_round"] == 2  # 审查 → 修复 → 复审
+    assert second["fix_rounds"] == 1  # 干净的首审也走了一轮修复
+    assert "本轮按「审查→修复」默认跑满 1 轮" in out
+    assert "模式 exact" in out
+    # 干净轮的修复任务明确说"第几轮 / 跑满几轮"（不写错成代码版本号）
+    joined = "\n".join(
+        str(item.content) for request in fake_chat_model.requests for item in request
+    )
+    assert "本轮要求跑满 1 轮修复（exact 模式），这是第 1 轮" in joined
+
+
+def test_review_fix_respects_an_explicit_up_to_mode(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """用户明确说"没问题就不用改"（模型给 up-to）时照办：干净的审查不再触发修复。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *clean_review_calls(),
+            orchestrator_reply(
+                "review_fix", rounds_mode="up-to", reply="好，我看一眼，有问题再改。"
+            ),
+            *clean_review_calls(version=2),
+        ]
+    )
+
+    code, out = session.run(["写一个加法计算器", "再检查一下，没问题就不用改"])
+
+    assert code == 0
+    second = _round_state(2)
+    assert second["rounds_mode"] == state_mod.ROUNDS_UP_TO
+    assert second["fix_rounds"] == 0
+    assert "本轮按「审查→修复」默认跑满" not in out
+
+
+def test_review_fix_with_explicit_rounds_runs_them_all(
+    session: _Session, fake_chat_model: ScriptedChatModel
+) -> None:
+    """消息给了轮次（"修 2 轮"）、未给模式时同样按 exact 跑满：审查 3 轮 / 修复 2 轮。"""
+    fake_chat_model.load(
+        [
+            orchestrator_reply("code", reply="好的，我来实现。"),
+            ai_text(file_fence(CLEAN_CODE)),
+            *clean_review_calls(),
+            orchestrator_reply("review_fix", rounds=2, reply="好，修 2 轮。"),
+            *clean_review_calls(version=2),
+            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            *clean_review_calls(version=3),
+            ai_text(fix_fence({"main.py": CLEAN_CODE}, [])),
+            *clean_review_calls(version=4),
+        ]
+    )
+
+    code, _out = session.run(["写一个加法计算器", "审查后修 2 轮"])
+
+    assert code == 0
+    second = _round_state(2)
+    assert second["rounds_mode"] == state_mod.ROUNDS_EXACT
+    assert second["max_iterations"] == 2
+    assert second["review_round"] == 3
+    assert second["fix_rounds"] == 2

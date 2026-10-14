@@ -78,6 +78,10 @@ _EXTRA_NODE_LABELS: dict[str, str] = {"orchestrator": "编排"}
 #: 并行双视角的分支节点：正文一律按节点缓存后整块输出（见 :meth:`RunRenderer.on_delta`）
 _PARALLEL_BRANCH_NODES = frozenset({"review_correctness", "review_security"})
 
+#: 交互提示（"你>" 等）的样式：天蓝色，便于在流式输出里一眼找到输入位置；
+#: 非终端 / NO_COLOR 时 rich 自动退化纯文本（管道、重定向与测试里不会出现转义码）
+PROMPT_STYLE = "sky_blue1"
+
 
 def display_width(text: str) -> int:
     """终端显示宽度：东亚宽/全角字符计 2，组合字符计 0（列表对齐用）。"""
@@ -94,15 +98,18 @@ def pad(text: str, width: int) -> str:
     return text + " " * max(0, width - display_width(text))
 
 
-def ask_user(prompt: str) -> str | None:
+def ask_user(prompt: str, *, color: bool | None = None) -> str | None:
     """交互输入统一封装：回车返回空串；Ctrl+C / EOF / 输入流不可用按取消处理（返回 ``None``）。
 
-    提示语写 stderr，stdout 只留结论与详情（Design §8.4）；stdin 被捕获（pytest）或被整体
-    关闭时 CPython 抛 ``OSError`` / ``RuntimeError``（lost sys.stdin），与 EOF 同义——按
-    "取消"处理而不是让命令以 traceback 退出。
+    提示语写 stderr（Design §8.4），并按 :data:`PROMPT_STYLE`（天蓝）着色——终端里一眼能
+    找到输入位置；``color=None`` 时按输出流是否终端自动判定（管道 / ``NO_COLOR`` 下为纯文本，
+    重定向保存的日志里不会混入转义码）。stdin 被捕获（pytest）或被整体关闭时 CPython 抛
+    ``OSError`` / ``RuntimeError``（lost sys.stdin），与 EOF 同义——按"取消"处理而不是让
+    命令以 traceback 退出。
     """
     try:
-        print(prompt, end="", file=sys.stderr, flush=True)
+        console_for(sys.stderr, color).print(prompt, end="", style=PROMPT_STYLE)
+        sys.stderr.flush()
         return input().strip()
     except (EOFError, KeyboardInterrupt, OSError, RuntimeError):
         return None

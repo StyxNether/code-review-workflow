@@ -324,6 +324,8 @@ def fix_task_prompt(
     allow_exec: bool,
     retry_feedback: str | None = None,
     polish: bool = False,
+    round_number: int = 1,
+    rounds_total: int = 0,
 ) -> str:
     """修复任务：版本文件清单、本轮问题清单与输出契约（逐条处置 + 完整版本产出）。
 
@@ -331,15 +333,17 @@ def fix_task_prompt(
     前缀、围栏要求不带前缀"的自相矛盾——真实演示曾因此让模型产出带前缀的路径、覆盖检查
     判缺全体文件）；读取路径的版本目录前缀在步骤说明里单独给出。
 
-    ``polish``：``rounds_mode=exact`` 下审查已干净但仍要跑满轮次时的"复核改进"轮
-    （Design §4.4，无问题可修但轮次未跑满）——此时改说复核目标，否则"请修复问题 +
-    （本轮没有问题）"自相矛盾，模型只能空转。
+    ``polish``：``rounds_mode=exact``（或会话里"审查之后要修"）下审查已干净但仍要走修复
+    时的"复核改进"轮（Design §4.4 / §5.4）：此时改说复核目标（``round_number`` /
+    ``rounds_total`` 给出"第几轮修复 / 本轮要跑满几轮"），否则"请修复问题 +（本轮没有
+    问题）"自相矛盾，模型只能空转。
     """
     listing = "\n".join(f"- {name}" for name in files)
     opening = (
-        f"本轮审查未发现阻塞问题，但会话要求跑满 {version} 轮（exact 模式）：请复核"
-        f"工作区版本 {version_label}/（当前代码版本 v{version}）的实现，做你能确信的小步"
-        "改进与加固（可读性、边界处理、注释），不要为改而改。"
+        f"本轮审查未发现阻塞问题，但本轮要求跑满 {rounds_total or 1} 轮修复（exact 模式），"
+        f"这是第 {round_number} 轮：请复核工作区版本 {version_label}/"
+        f"（当前代码版本 v{version}）的实现，做你能确信的小步改进与加固"
+        "（可读性、边界处理、注释），不要为改而改。"
         if polish and not findings
         else f"请修复工作区版本 {version_label}/（当前代码版本 v{version}）中审查发现的问题。"
     )
