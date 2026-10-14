@@ -32,14 +32,18 @@ def make_state(**overrides: object) -> dict[str, object]:
 def test_new_state_fills_every_persisted_field() -> None:
     """初始状态字段与 Design §4.3 的持久化列表一一对应（不多不少）。
 
-    例外：并行双视角审查的分支 key（``findings_<视角>``）是图执行期的中间态，由汇合节点
-    消费后以 ``findings`` 承载权威结论，故声明在 schema 内但**不进**运行记录。
+    例外（声明在 schema 内但**不进**运行记录）：并行双视角审查的分支 key
+    （``findings_<视角>``）由汇合节点消费后以 ``findings`` 承载权威结论；
+    ``prior_files`` / ``agent_memory`` 是会话轮次的编码上下文与三 Agent 记忆
+    （Design §4.7），只在图执行内可见。
     """
     state = make_state()
 
     assert set(state) - set(state_mod.PERSISTED_FIELDS) == {
         "findings_correctness",
         "findings_security",
+        "prior_files",
+        "agent_memory",
     }
     assert set(state_mod.PERSISTED_FIELDS) <= set(state)
     assert state["status"] == state_mod.STATUS_RUNNING
@@ -164,3 +168,16 @@ def test_summarize_input_truncates_long_requirement() -> None:
 def test_persisted_fields_and_defaults_stay_in_sync() -> None:
     """持久化字段表与默认值表必须键同序同：漏同步只会在快照取值时以 KeyError 暴露。"""
     assert list(state_mod.PERSISTED_FIELDS) == list(state_mod._DEFAULTS)
+
+
+def test_summarize_input_labels_version_dirs_only_inside_a_workspace() -> None:
+    """只有"运行工作区里的版本目录"才写"版本目录："；恰好叫 code_v1 的普通文件仍写"文件："。"""
+    from pathlib import Path
+
+    inside = state_mod.summarize_input(
+        {"kind": "file", "source_path": str(Path("/home/u/.crw/runs/r-1/workspace/code_v2"))}
+    )
+    assert inside == "版本目录：r-1/code_v2"
+
+    plain_file = state_mod.summarize_input({"kind": "file", "source_path": "tmp/code_v1"})
+    assert plain_file == "文件：code_v1"

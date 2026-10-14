@@ -27,7 +27,15 @@ from ..tools import (
 from .encoder import build_encode_node
 from .fixer import build_fix_node
 from .reviewer import EVIDENCE_KEY, build_review_node, review_once
-from .runtime import MAX_TOOL_ROUNDS, AgentRuntime, DeltaSink, EventSink, NodeFn, TaskResult
+from .runtime import (
+    MAX_TOOL_ROUNDS,
+    AgentRuntime,
+    DeltaSink,
+    EventSink,
+    NodeFn,
+    TaskResult,
+    history_from_state,
+)
 
 #: 各节点的工具集（Design §4.2 的"工具"列）
 NODE_TOOL_NAMES: Mapping[str, tuple[str, ...]] = {
@@ -143,5 +151,6 @@ __all__ = [
     "build_nodes",
     "build_review_runtime",
     "build_runtime",
+    "history_from_state",
     "review_once",
 ]

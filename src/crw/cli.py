@@ -27,6 +27,8 @@ from . import render
 from . import thinking as thinking_mod
 from . import tools as tools_mod
 from . import uninstall as uninstall_mod
+from .session import chat as session_chat_mod
+from .session import state as session_state_mod
 from .workflow import contracts as contracts_mod
 from .workflow import engine as engine_mod
 from .workflow import graph as graph_mod
@@ -114,8 +116,10 @@ def _add_model_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
-    """添加 run / resume 共用的工作流选项（resume 不提供 -f）。"""
+def _add_workflow_options(
+    parser: argparse.ArgumentParser, *, include_parallel_review: bool = True
+) -> None:
+    """添加 run / resume / chat 共用的工作流选项（resume 不提供 -f）。"""
     parser.add_argument(
         "--max-iter",
         type=_max_iter_rounds,
@@ -125,15 +129,26 @@ def _add_workflow_options(parser: argparse.ArgumentParser) -> None:
         help=f"修复轮次上限（默认 {engine_mod.DEFAULT_MAX_ITERATIONS}，"
         f"可取值 0–{_MAX_ITER_LIMIT}；0 = 只审不修）",
     )
+    # 轮次语义与轮次数值是两件事：本选项**不**并入 max_iter_source（只给模式时数值仍走
+    # "消息提取 > 会话设置 > 配置默认"，Design §4.4）
+    parser.add_argument(
+        "--rounds-mode",
+        dest="rounds_mode",
+        choices=[state_mod.ROUNDS_UP_TO, state_mod.ROUNDS_EXACT],
+        default=None,
+        metavar="{up-to,exact}",
+        help=("轮次语义：up-to = 干净即早退（默认）；exact = 跑满指定轮次，结尾恒为一次审查"),
+    )
     parser.add_argument(
         "--strict", action="store_true", help="干净判定加严：无【严重】且无【一般】"
     )
-    parser.add_argument(
-        "--parallel-review",
-        dest="parallel_review",
-        action="store_true",
-        help="并行双视角审查（正确性 + 安全性同轮并行，汇合去重；审查调用量约翻倍）",
-    )
+    if include_parallel_review:
+        parser.add_argument(
+            "--parallel-review",
+            dest="parallel_review",
+            action="store_true",
+            help="并行双视角审查（正确性 + 安全性同轮并行，汇合去重；审查调用量约翻倍）",
+        )
     _add_model_options(parser)
     parser.add_argument("--out", metavar="目录", help="将最终代码与报告复制到指定目录")
     parser.add_argument("--no-stream", action="store_true", help="关闭流式渲染，整体输出")
@@ -172,7 +187,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(_subparser=run_parser)
     _add_workflow_options(run_parser)
 
-    subparsers.add_parser("runs", help="列出运行记录")
+    subparsers.add_parser("runs", help="列出运行记录（含会话轮次，多一列「会话」）")
+
+    chat_parser = subparsers.add_parser(
+        "chat", help="会话模式：与编排节点多轮对话，驱动三 Agent 工作流"
+    )
+    chat_inputs = chat_parser.add_mutually_exclusive_group()
+    chat_inputs.add_argument(
+        "-f",
+        "--file",
+        dest="file",
+        metavar="文件",
+        help="以既有代码文件开始会话（与 --resume 二选一）",
+    )
+    chat_inputs.add_argument(
+        "--resume", dest="resume", metavar="会话号", help="恢复既有会话（与 -f 二选一）"
+    )
+    chat_parser.set_defaults(_subparser=chat_parser)
+    # 会话内暂不提供 --parallel-review（Design §12.3 的评估项）：不注册即明确报参数错误，
+    # 而不是"解析了却静默不生效"
+    _add_workflow_options(chat_parser, include_parallel_review=False)
+
+    subparsers.add_parser("sessions", help="列出会话（会话号 / 时间 / 轮次数 / 最后状态）")
 
     show_parser = subparsers.add_parser("show", help="展示运行详情")
     show_parser.add_argument("run_id", nargs="?", metavar="运行号", help="省略时列出记录供选择")
@@ -232,13 +268,11 @@ def _validate_input_contract(parser: argparse.ArgumentParser, args: argparse.Nam
 
 
 _MAX_ERROR_CHARS = 400
-# 左侧非字母数字断言：避免把 task-analysis 这类普通连字符词误判为密钥形态。
-_SECRET_PATTERN = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{8,}")
 
 
 def _mask_secrets(text: str) -> str:
-    """遮蔽 ``sk-`` 形态的密钥（错误通道统一口径：终端输出常被重定向保存）。"""
-    return _SECRET_PATTERN.sub("sk-***", text)
+    """遮蔽 ``sk-`` 形态的密钥（实现只在渲染层一处：遮蔽口径漂移是安全问题，不是重复问题）。"""
+    return render.mask_secrets(text)
 
 
 def _report_failure(command: str | None, exc: Exception) -> int:
@@ -333,7 +367,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     """运行工作流：解析模型 → 装配请求 → 驱动引擎 → 渲染结论（Design §8.1）。
 
     ``-f`` 输入由命令面读取（Design §8.4），工作区内落盘交给引擎；``--out`` 在收尾后把
-    最终代码与报告复制出去（Design §4.5）。
+    最终代码与报告复制出去（Design §4.5）。轮次取值优先级见 §4.4：命令行 > 配置默认 > 内置。
     """
     requirement = (args.requirement or "").strip() or None
     source_path: Path | None = None
@@ -346,12 +380,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     resolved = _resolve_model(args.model, args.provider, "run", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
+    try:
+        rounds, source = _rounds_for_run(args)
+    except config_mod.ConfigError as exc:
+        print(f"crw run：配置错误 — {exc}", file=sys.stderr)
+        return _EXIT_ERROR
     request = engine_mod.RunRequest(
         requirement=requirement,
         source_path=source_path,
         source_text=source_text,
-        max_iterations=args.max_iter,
-        max_iterations_source=args.max_iter_source or state_mod.SOURCE_DEFAULT,
+        max_iterations=rounds,
+        max_iterations_source=source,
+        rounds_mode=args.rounds_mode or state_mod.ROUNDS_UP_TO,
         strict=bool(args.strict),
         no_exec=bool(args.no_exec),
         parallel_review=bool(args.parallel_review),
@@ -366,6 +406,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.out:
         _export_outputs(result, Path(args.out))
     return result.exit_code
+
+
+def _rounds_for_run(args: argparse.Namespace) -> tuple[int, str]:
+    """``crw run`` 的轮次取值（Design §4.4）：命令行显式 > 配置默认 > 内置 3。
+
+    配置默认来自 ``~/.crw/settings.json`` 的 ``rounds.default``（未配置时记"内置默认"来源）；
+    配置损坏抛 :class:`crw.config.ConfigError`，由调用方按配置错误退出 2。
+    """
+    if args.max_iter_source:
+        return int(args.max_iter), state_mod.SOURCE_CLI
+    return _configured_rounds_fallback()
+
+
+def _configured_rounds_fallback() -> tuple[int, str]:
+    """配置默认轮次与其来源标签（一次读取 settings.json）：显式配置记 ``config``，否则记内置 ``default``。"""
+    default, _limit, configured = config_mod.rounds_config()
+    if configured is not None:
+        return configured, state_mod.SOURCE_CONFIG
+    return default, state_mod.SOURCE_DEFAULT
 
 
 def _export_outputs(result: engine_mod.RunResult, out_dir: Path) -> None:
@@ -475,28 +534,127 @@ def _deletion_confirmer() -> engine_mod.DeletionConfirmer | None:
     return confirm
 
 
+# ---- crw chat / crw sessions：会话模式（Design §4.7 / §5.4 / §8.1）----
+
+
+def _cmd_chat(args: argparse.Namespace) -> int:
+    """会话模式：装配会话 IO 与模型，交给 session 层的主循环（Design §8.1）。
+
+    命令面的职责只有三件：解析 ``-f`` 起始文件、按优先级链算好**初始轮次设置**、
+    把真实终端 IO 与渲染器装进 :class:`crw.session.chat.ChatIO`；会话的时序全在 session 层。
+    """
+    resolved = _resolve_model(args.model, args.provider, "chat", thinking=args.thinking)
+    if resolved is None:
+        return _EXIT_ERROR
+    file_input: tuple[Path, str] | None = None
+    if args.file:
+        path = Path(args.file)
+        text, error_code = _read_input_file(path)
+        if text is None:
+            return error_code
+        file_input = (path, text)
+    try:
+        seed_rounds, limit, configured = config_mod.rounds_config()
+    except config_mod.ConfigError as exc:
+        print(f"crw chat：配置错误 — {exc}", file=sys.stderr)
+        print("请手工修复该文件，或删除后重试（将重建默认设置）。", file=sys.stderr)
+        return _EXIT_ERROR
+    # 命令行覆盖按字段生效：只给 --rounds-mode 时不钉住轮次数值（Design §4.4）
+    overrides = session_chat_mod.RoundOverrides(
+        max_iterations=int(args.max_iter) if args.max_iter_source else None,
+        rounds_mode=args.rounds_mode,
+    )
+    initial = session_chat_mod.RoundSettings(
+        max_iterations=seed_rounds,
+        max_iterations_source=(
+            state_mod.SOURCE_CONFIG if configured is not None else state_mod.SOURCE_DEFAULT
+        ),
+        rounds_mode=args.rounds_mode or state_mod.ROUNDS_UP_TO,
+    )
+    io = session_chat_mod.ChatIO(
+        ask=render.ask_user,
+        say=lambda line="": print(line),
+        warn=lambda line: print(line, file=sys.stderr),
+        renderer=lambda: render.RunRenderer(stream=not args.no_stream),
+    )
+    return session_chat_mod.run_chat(
+        io=io,
+        resolved=resolved,
+        clock=engine_mod.local_now,
+        rounds_limit=limit,
+        initial_rounds=initial,
+        overrides=overrides,
+        file_input=file_input,
+        resume_session_id=args.resume,
+        strict=bool(args.strict),
+        no_exec=bool(args.no_exec),
+        confirm_deletions=_deletion_confirmer(),
+    )
+
+
+def _cmd_sessions(args: argparse.Namespace) -> int:
+    """列出会话（会话号 / 时间 / 轮次数 / 最后状态，Design §8.1）。"""
+    render.render_sessions(session_state_mod.list_sessions())
+    return _EXIT_OK
+
+
 def _cmd_runs(args: argparse.Namespace) -> int:
     """列出运行记录（运行号 / 时间 / 输入摘要 / 状态 / 修复轮数 / 残留严重数）。"""
     render.render_runs(records_mod.list_runs())
     return _EXIT_OK
 
 
-def _inherited_rounds(parent_state: Mapping[str, Any], parent_run_id: str) -> int:
-    """续跑继承的轮次上限：与命令行同一套校验（0–10、ASCII 十进制）。
+def _inherited_rounds(parent_state: Mapping[str, Any], parent_run_id: str) -> int | None:
+    """续跑继承的轮次上限；父运行未记录返回 ``None``。
 
-    继承路径不得绕过上限：``state.json`` 可能被手改成 999，而该上限正是"防止误填大值造成
-    无界循环与无界调用费用"的硬闸（Design §4.4）。值非法时退回内置默认并如实提示。
+    校验上限用**代码内绝对天花板**（``config.ROUNDS_LIMIT_CEILING`` = 20，Design §8.3）而不是
+    命令行的 0–10 硬闸：父运行的轮次可能来自配置默认或会话内消息提取（那些路径的上限是
+    settings 的 ``rounds.limit``，可达 20），用 10 校验会把合法记录判为非法。护栏仍在：
+    ``state.json`` 被手改成 999 会被拒并如实提示，退回配置默认。
     """
     raw = parent_state.get("max_iterations")
-    try:
-        return _max_iter_rounds(str(raw))
-    except argparse.ArgumentTypeError:
-        print(
-            f"crw resume：父运行 {parent_run_id} 的轮次上限（{raw!r}）不合法，"
-            f"已改用内置默认 {engine_mod.DEFAULT_MAX_ITERATIONS} 轮。",
-            file=sys.stderr,
-        )
-        return engine_mod.DEFAULT_MAX_ITERATIONS
+    if raw is None:
+        return None
+    text = str(raw)
+    if text.isascii() and text.isdecimal() and 0 <= int(text) <= config_mod.ROUNDS_LIMIT_CEILING:
+        return int(text)
+    print(
+        f"crw resume：父运行 {parent_run_id} 的轮次上限（{raw!r}）不合法"
+        f"（应为 0–{config_mod.ROUNDS_LIMIT_CEILING} 的整数），已改用配置默认。",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _rounds_for_resume(
+    args: argparse.Namespace, parent_state: Mapping[str, Any], run_id: str
+) -> tuple[int, str, str]:
+    """``crw resume`` 的轮次取值（Design §4.4）：命令行显式 > 继承父运行 > 配置默认 > 内置。
+
+    ``--strict`` 与审查形态（``--parallel-review``）一并继承父运行——续跑是"接着修"，
+    换判定标准或换审查方式会让结论不可比；``--no-exec`` 例外（它不进状态快照）。
+    父运行的轮次数值只在未被命令行显式覆盖时才解析：否则那句"不合法 / 已回退"的提示
+    描述的是一个并未发生的回退。
+    """
+    inherited: int | None = None
+    if args.max_iter_source:
+        rounds, source = int(args.max_iter), state_mod.SOURCE_CLI
+    else:
+        inherited = _inherited_rounds(parent_state, run_id)
+        if inherited is not None:
+            rounds, source = inherited, state_mod.SOURCE_PARENT
+        else:
+            rounds, source = _configured_rounds_fallback()
+    # 轮次语义独立继承：即使命令行显式给了轮次数值，未给 --rounds-mode 时仍继承父运行的
+    # 模式与审查形态——续跑是"接着修"，换判定标准会让结论不可比（Design §4.4）
+    inherited_mode = str(parent_state.get("rounds_mode") or "")
+    if args.rounds_mode:
+        mode = args.rounds_mode
+    elif inherited_mode in (state_mod.ROUNDS_UP_TO, state_mod.ROUNDS_EXACT):
+        mode = inherited_mode
+    else:
+        mode = state_mod.ROUNDS_UP_TO
+    return rounds, source, mode
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -581,12 +739,17 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     resolved = _resolve_model(args.model, args.provider, "resume", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
-    # 轮次取值来源：命令行显式 > 父运行继承（配置默认 ~/.crw/settings.json 随 M4 落地）
-    inherited_rounds = _inherited_rounds(parent_state, args.run_id)
+    # 轮次取值来源：命令行显式 > 父运行继承 > 配置默认 > 内置（Design §4.4）
+    try:
+        rounds, rounds_source, rounds_mode = _rounds_for_resume(args, parent_state, args.run_id)
+    except config_mod.ConfigError as exc:
+        print(f"crw resume：配置错误 — {exc}", file=sys.stderr)
+        return _EXIT_ERROR
     request = engine_mod.RunRequest(
         source_dir=version_dir,
-        max_iterations=args.max_iter if args.max_iter_source else inherited_rounds,
-        max_iterations_source=args.max_iter_source or state_mod.SOURCE_PARENT,
+        max_iterations=rounds,
+        max_iterations_source=rounds_source,
+        rounds_mode=rounds_mode,
         strict=bool(args.strict) or bool(parent_state.get("strict")),
         no_exec=bool(args.no_exec),
         parallel_review=bool(args.parallel_review) or bool(parent_state.get("parallel_review")),
@@ -1413,8 +1576,93 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
         )
 
 
+def _print_rounds_settings() -> None:
+    """当前运行默认值（轮次）概览；读取失败按配置错误提示（不中断菜单）。"""
+    try:
+        default, limit = config_mod.rounds_settings()
+    except config_mod.ConfigError as exc:
+        _say_error(f"运行默认值读取失败：{exc}")
+        return
+    _say(
+        f"轮次默认：{default}（命令行与会话消息都未指定时使用）；"
+        f"轮次上限：{limit}（会话内消息提取值的夹取上限，天花板 {config_mod.ROUNDS_LIMIT_CEILING}）"
+    )
+
+
+def _parse_settings_int(raw: str) -> int | None:
+    """解析设置项的整数输入（ASCII 十进制，0–天花板）；非法给可读提示并返回 ``None``。
+
+    范围在此就地拦下（而不是等写入时由校验层报错）：提示贴着用户刚输入的那一项，
+    菜单里不会出现"走到最后一步才被拒"的落差。
+    """
+    text = raw.strip()
+    if not text.isascii() or not text.isdecimal() or int(text) > config_mod.ROUNDS_LIMIT_CEILING:
+        _say_error(f"需要 0–{config_mod.ROUNDS_LIMIT_CEILING} 的整数，收到 {raw!r}")
+        return None
+    return int(text)
+
+
+def _save_rounds(default: int, limit: int) -> None:
+    """保存轮次设置（写 settings.json，与 models.json 分开）；违规由校验层给出原因。"""
+    try:
+        config_mod.save_settings({"rounds": {"default": default, "limit": limit}})
+    except (config_mod.ConfigError, OSError) as exc:
+        _say_error(f"写入失败：{exc}")
+        return
+    _say(f"已保存：默认修复轮次 {default}，轮次上限 {limit}（{config_mod.settings_path()}）")
+
+
+def _config_set_rounds_default() -> None:
+    """菜单 7：默认修复轮次（命令行与会话消息都未指定时使用，Design §4.4）。"""
+    try:
+        default, limit = config_mod.rounds_settings()
+    except config_mod.ConfigError as exc:
+        _say_error(f"运行默认值读取失败：{exc}")
+        return
+    raw = _ask(f"默认修复轮次（当前 {default}；须满足 0 ≤ 值 ≤ 上限 {limit}；回车保留）：")
+    if raw is None:
+        _say("已取消。")
+        return
+    if not raw.strip():
+        _say("未改动。")
+        return
+    value = _parse_settings_int(raw)
+    if value is None:
+        return
+    if value > limit:
+        _say_error(f"默认修复轮次不能超过当前上限 {limit}（可先用菜单 8) 抬高上限）。")
+        return
+    _save_rounds(value, limit)
+
+
+def _config_set_rounds_limit() -> None:
+    """菜单 8：轮次上限（会话内消息提取值的夹取上限，天花板 20，Design §8.3）。"""
+    try:
+        default, limit = config_mod.rounds_settings()
+    except config_mod.ConfigError as exc:
+        _say_error(f"运行默认值读取失败：{exc}")
+        return
+    raw = _ask(
+        f"轮次上限（当前 {limit}；须满足默认 {default} ≤ 值 ≤ "
+        f"{config_mod.ROUNDS_LIMIT_CEILING}；回车保留）："
+    )
+    if raw is None:
+        _say("已取消。")
+        return
+    if not raw.strip():
+        _say("未改动。")
+        return
+    value = _parse_settings_int(raw)
+    if value is None:
+        return
+    if value < default:
+        _say_error(f"轮次上限不能低于当前默认 {default}（可先用菜单 7) 调低默认）。")
+        return
+    _save_rounds(default, value)
+
+
 def _run_config_interactive() -> int:
-    """``crw config``：交互式配置（增删供应商 / 模型、设默认、改 key）。"""
+    """``crw config``：交互式配置（增删供应商 / 模型、设默认、改 key、思考挡位、轮次）。"""
     try:
         data = config_mod.load_raw()
     except config_mod.ConfigError as exc:
@@ -1424,11 +1672,13 @@ def _run_config_interactive() -> int:
     session = _ConfigSession(data)
     _say(f"crw 配置（{config_mod.config_path()}）")
     _print_providers(data)
+    _print_rounds_settings()
     _maybe_import_legacy_config(session)
     while True:
         _say(
             "\n菜单：1) 添加/更新供应商  2) 删除供应商  3) 管理供应商模型"
-            "  4) 设置默认模型  5) 修改供应商 key  6) 模型思考挡位  0) 退出"
+            "  4) 设置默认模型  5) 修改供应商 key  6) 模型思考挡位"
+            "  7) 默认修复轮次  8) 轮次上限  0) 退出"
         )
         choice = _ask("选择：")
         if choice is None:
@@ -1446,6 +1696,10 @@ def _run_config_interactive() -> int:
             _config_update_key(session)
         elif choice == "6":
             _config_manage_thinking(session)
+        elif choice == "7":
+            _config_set_rounds_default()
+        elif choice == "8":
+            _config_set_rounds_limit()
         elif choice == "0":
             _say("退出配置。")
             return _EXIT_OK
@@ -1492,6 +1746,8 @@ def _cmd_config(args: argparse.Namespace) -> int:
 
 _HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "run": _cmd_run,
+    "chat": _cmd_chat,
+    "sessions": _cmd_sessions,
     "runs": _cmd_runs,
     "show": _cmd_show,
     "resume": _cmd_resume,

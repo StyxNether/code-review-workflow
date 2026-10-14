@@ -152,7 +152,7 @@ class RunRequest:
     source_path: Path | None = None
     source_text: str | None = None
     source_dir: Path | None = None
-    """既有版本目录（resume：复制父运行版本目录为新运行的 ``code_v1/``，Design §4.2.2）。"""
+    """既有版本目录（resume / 会话审查轮次：复制为新运行的起始版本目录，Design §4.2.2）。"""
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_iterations_source: str = state_mod.SOURCE_DEFAULT
     rounds_mode: str = state_mod.ROUNDS_UP_TO
@@ -170,28 +170,36 @@ class RunRequest:
     parent_run_id: str | None = None
     session_id: str | None = None
     round_index: int | None = None
+    start_version: int = 1
+    """本次运行的起始版本号（会话轮次跨轮连续递增，Design §4.7）；一次性运行恒为 1。"""
+    prior_files: Mapping[str, str] | None = None
+    """既有实现的文件内容（会话轮次的编码上下文）：引擎放进状态瞬态键 ``prior_files``，
+    编码节点把它内联进任务提示词（"按新需求修改"的依据，Design §4.7）。"""
+    agent_memory: Mapping[str, Sequence[Mapping[str, str]]] | None = None
+    """三 Agent 各自的会话记忆（``agent → [{"role", "text"}]``）：引擎放进状态瞬态键
+    ``agent_memory``，各节点把它作为历史消息交给运行时（Design §4.7 的追加式记忆）。"""
 
     def input_descriptor(self) -> state_mod.InputDescriptor:
         """本次运行的输入描述（Design §4.3 的 ``input`` 字段）。
 
-        ``-f`` 记原文件路径；resume 记父运行的版本目录路径（"原文件 → 工作区"的映射
-        口径随之变为"原版本目录 → ``code_v1/``"）。
+        有需求文本时以它为准（会话轮次"在既有版本上按新需求继续开发"即此形态：既要走
+        编码起步，又要记下既有代码的来源）；否则 ``-f`` 记原文件路径、续跑记父运行的
+        版本目录路径（"原文件 → 工作区"的映射口径随之变为"原版本目录 → 起始版本目录"）。
         """
-        if self.source_path is not None:
+        source = self.source_path if self.source_path is not None else self.source_dir
+        if self.requirement:
             return state_mod.InputDescriptor(
-                kind=state_mod.INPUT_FILE, source_path=str(self.source_path)
+                kind=state_mod.INPUT_REQUIREMENT,
+                requirement=self.requirement,
+                **({"source_path": str(source)} if source is not None else {}),
             )
-        if self.source_dir is not None:
-            return state_mod.InputDescriptor(
-                kind=state_mod.INPUT_FILE, source_path=str(self.source_dir)
-            )
+        if source is not None:
+            return state_mod.InputDescriptor(kind=state_mod.INPUT_FILE, source_path=str(source))
         if self.source_text is not None:
             # 程序化调用可能只给文本（CLI 侧恒给 source_path）：它仍会被物化为
             # code_v1/main.py，输入描述必须与物化结果同口径（kind=file）
             return state_mod.InputDescriptor(kind=state_mod.INPUT_FILE)
-        return state_mod.InputDescriptor(
-            kind=state_mod.INPUT_REQUIREMENT, requirement=self.requirement or ""
-        )
+        return state_mod.InputDescriptor(kind=state_mod.INPUT_REQUIREMENT, requirement="")
 
     @property
     def model_label(self) -> str:
@@ -268,6 +276,8 @@ class WorkflowEngine:
         run_id_factory: RunIdFactory | None = None,
         observer: RunObserver | None = None,
         confirm_deletions: DeletionConfirmer | None = None,
+        run_parent: Path | None = None,
+        run_dir: Path | None = None,
     ) -> None:
         self._nodes = dict(nodes) if nodes else None
         self._runtime_factory = runtime_factory
@@ -276,6 +286,8 @@ class WorkflowEngine:
         self._run_id_factory = run_id_factory or self._default_run_id_factory
         self._observer: RunObserver = observer or _NullObserver()
         self._confirm_deletions = confirm_deletions
+        self._run_parent = run_parent
+        self._run_dir_override = run_dir
         self._run_dir: Path | None = None
         self._workspace: Path | None = None
         self._log_path: Path | None = None
@@ -355,7 +367,19 @@ class WorkflowEngine:
             parent_run_id=request.parent_run_id,
             session_id=request.session_id,
             round_index=request.round_index,
+            version_base=request.start_version,
         )
+        # 会话轮次的编码上下文与三 Agent 记忆：瞬态键（不进运行记录），只在本轮图执行内可见
+        if request.prior_files:
+            initial["prior_files"] = dict(request.prior_files)
+        if request.agent_memory:
+            # 形态不符的条目直接丢弃（与 runtime.history_from_state 同一口径）：
+            # 记忆是增强项，坏数据不该把本轮运行变成失败
+            initial["agent_memory"] = {
+                str(agent): [dict(item) for item in lines if isinstance(item, Mapping)]
+                for agent, lines in request.agent_memory.items()
+                if isinstance(lines, Sequence) and not isinstance(lines, (str, bytes))
+            }
         try:
             self._materialize_input_version(request, initial)
             # 快照取在物化之后：物化会就地写入 current_version_dir / version_files，
@@ -568,14 +592,19 @@ class WorkflowEngine:
     def _produce_encode(
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """编码节点：抽取 1..n 个文件 → 落盘 ``workspace/code_v1/``（Design §4.2.2）。"""
+        """编码节点：抽取 1..n 个文件 → 落盘起始版本目录（Design §4.2.2）。
+
+        目录号取 ``code_version(state)``：一次性运行为 ``code_v1/``；会话轮次沿用跨轮
+        连续递增的起始版本号（第 2 轮的编码产物从上一轮结束后的下一号起，Design §4.7）。
+        """
         output = _call_node(fn, state, retry_feedback=None)
         try:
             files, duplicates, _ = self._extract_version_files(output)
         except ContractViolation as exc:
             output = self._retry("encode", 1, fn, state, str(exc))
             files, duplicates, _ = self._extract_version_files(output)
-        version_dir = self._write_version(1, files)
+        version = state_mod.code_version(state)
+        version_dir = self._write_version(version, files)
         total_lines = sum(len(content.splitlines()) for content in files.values())
         summary = f"生成 {version_dir.name}/（{len(files)} 个文件，共 {total_lines} 行）"
         if duplicates:
@@ -940,14 +969,19 @@ class WorkflowEngine:
         return self._finalize(state, _EXIT_ERROR)
 
     def _handle_interrupt(self, latest: Mapping[str, Any]) -> RunResult:
-        """中断收尾（Design §4.6）：interrupt 事件 → 原子写 state.json → 退出码 2。
+        """中断收尾（Design §4.6 / §8.2）：interrupt 事件 → 原子写 state.json → 退出码 2。
 
+        会话轮次的状态写 ``interrupted``（§8.2 的会话轮次口径：中断的本轮可被会话识别为
+        "被打断"而不是"运行失败"）；一次性运行按 §4.6 保持 ``failed`` + ``error.node=interrupt``。
         第二次 Ctrl+C 放弃写盘（"尽力"语义），仍按中断结论返回退出码 2。
         """
         state = dict(latest)
+        session_round = self._request is not None and self._request.session_id is not None
         state.update(
             {
-                "status": state_mod.STATUS_FAILED,
+                "status": (
+                    state_mod.STATUS_INTERRUPTED if session_round else state_mod.STATUS_FAILED
+                ),
                 "error": {"node": "interrupt", "message": "运行被用户中断（Ctrl+C）。"},
                 "finished_at": self._clock(),
             }
@@ -1048,7 +1082,10 @@ class WorkflowEngine:
         if not parent or not records.is_valid_run_id(parent):
             return None
         try:
-            parent_state = records.read_state(records.run_dir(parent))
+            parent_dir = records.find_run_dir(parent)
+            if parent_dir is None:
+                return None
+            parent_state = records.read_state(parent_dir)
             if not isinstance(parent_state, Mapping):
                 return None
             findings = parent_state.get("findings")
@@ -1067,20 +1104,43 @@ class WorkflowEngine:
     # ---- 基础设施 ----
 
     def _materialize_input_version(self, request: RunRequest, initial: RunState) -> None:
-        """把运行输入物化为初始版本目录 ``code_v1/``（``-f`` 单文件包成目录，resume 复制父版本）。
+        """把运行输入物化为起始版本目录（``-f`` 单文件包成目录，续跑 / 会话轮次复制既有版本）。
 
-        需求文本输入没有初始版本（编码节点产出 ``code_v1/``），此处不动作。
+        目录名取 ``request.start_version``（Design §4.7 的跨轮连续递增）：会话第 2 轮从
+        上一轮的版本号继续，报告里的"第几版"在会话内始终指向同一份代码。
+        需求文本输入没有初始版本（编码节点产出起始版本目录），此处不动作。
+
+        **同时给出需求与既有来源**（``source_dir`` / ``source_text``）时**不物化**：该组合
+        下入口路由走编码起步（需求优先，见 :meth:`RunRequest.input_descriptor`），既有代码
+        只作编码上下文（``prior_files`` 内联进任务提示词）——物化会把一份"不在新版本清单里"
+        的旧文件留在起始版本目录里，反而制造误读。命令面（会话的"改需求"轮次）本来就按
+        "不物化 + ``prior_files``"走，这里让程序化调用取得同一语义。
         """
+        if request.requirement and (
+            request.source_dir is not None or request.source_text is not None
+        ):
+            if not initial.get("prior_files"):
+                initial["prior_files"] = self._read_prior_source(request)
+            return
         if request.source_dir is not None:
-            files = self._read_version_files(request.source_dir)
+            files = read_version_files(request.source_dir)
         elif request.source_text is not None:
             name = request.source_path.name if request.source_path is not None else "main.py"
             files = {name: _normalize_code(request.source_text)}
         else:
             return
-        version_dir = self._write_version(1, files)
+        version_dir = self._write_version(
+            state_mod.normalize_version_base(request.start_version), files
+        )
         initial["current_version_dir"] = str(version_dir)
         initial["version_files"] = sorted(files)
+
+    def _read_prior_source(self, request: RunRequest) -> dict[str, str]:
+        """既有来源（版本目录或文本）的读取口径：与物化共用同一套读出规则。"""
+        if request.source_dir is not None:
+            return read_version_files(request.source_dir)
+        name = request.source_path.name if request.source_path is not None else "main.py"
+        return {name: _normalize_code(request.source_text or "")}
 
     def _write_version(self, version: int, files: Mapping[str, str]) -> Path:
         """落盘一个版本目录：全部文件（原子写）→ ``manifest.json``，返回目录路径。
@@ -1108,34 +1168,8 @@ class WorkflowEngine:
         return version_dir
 
     def _read_version_files(self, directory: Path) -> dict[str, str]:
-        """读出版本目录的代码文件：以 ``manifest.json`` 清单为准（Design §4.2.2）。
-
-        manifest 是引擎落盘时写的权威清单；按它读而不是全目录递归，才能把"审查 / 修复
-        Agent 执行代码时落进版本目录的副产物"（`__pycache__`、被测程序自己写出的
-        数据文件等，真实演示暴露）挡在版本内容之外——否则 resume 复制、指纹比较与
-        修复覆盖检查都会把副产物当版本文件。缺 manifest（旧目录 / 手工介入）时退回
-        全目录读取，并排除字节码与隐藏 / 临时文件。
-        """
-        manifest_files = _manifest_file_names(directory)
-        names = sorted(manifest_files) if manifest_files is not None else None
-        if names is None:
-            names = [
-                path.relative_to(directory).as_posix()
-                for path in sorted(directory.rglob("*"))
-                if path.is_file()
-                and path.name != "manifest.json"
-                and not path.name.startswith(".")
-                and not path.name.endswith(".tmp")
-                and path.suffix != ".pyc"
-                and "__pycache__" not in path.relative_to(directory).parts
-            ]
-        files: dict[str, str] = {}
-        for name in names:
-            try:
-                files[name] = (directory / name).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                raise PersistenceError(f"版本文件 {name} 读取失败：{exc}") from exc
-        return files
+        """读出版本目录的代码文件（委托模块级 :func:`read_version_files`）。"""
+        return read_version_files(directory)
 
     def _previous_fingerprint(self, state: Mapping[str, Any]) -> dict[str, str]:
         """上一版本的 ``路径 → sha256`` 指纹（"本轮未产生改动"的比较基准）。
@@ -1147,7 +1181,7 @@ class WorkflowEngine:
         if not previous_dir.is_dir():
             return {}
         try:
-            return _fingerprint(self._read_version_files(previous_dir))
+            return _fingerprint(read_version_files(previous_dir))
         except PersistenceError:
             return {}
 
@@ -1163,22 +1197,28 @@ class WorkflowEngine:
         return records.new_run_id(day=day)
 
     def _create_run(self) -> tuple[str, Path]:
-        """创建运行目录；编号碰撞（并发 / 注入固定编号）时重新生成。
+        """创建运行目录并返回 ``(运行号, 运行目录)``。
 
-        只有"该运行号目录已存在"才算碰撞；父路径不可创建（如数据目录位置被文件占用）
-        属目录创建失败，直接给可读原因，不伪装成重试。
+        - 默认：``~/.crw/runs/<运行号>/``（编号碰撞时重新生成；并发 / 注入固定编号都可能撞）。
+        - ``run_parent``：换个父目录（会话轮次在会话目录下的 ``rounds/`` 里新开记录）。
+        - ``run_dir``：由调用方指定目录（会话轮次用 ``round-<i>/`` 命名，运行号只进
+          ``state.json``）；目录已存在即报可读错误，不覆盖既有轮次记录。
         """
+        if self._run_dir_override is not None:
+            run_id = self._run_id_factory()
+            return run_id, records.create_run_dir_at(self._run_dir_override)
+        parent = self._run_parent
         last_error: Exception | None = None
         for _ in range(5):
             run_id = self._run_id_factory()
             try:
-                return run_id, records.create_run_dir(run_id)
+                return run_id, records.create_run_dir(run_id, parent=parent)
             except FileExistsError as exc:
-                if records.run_dir(run_id).is_dir():
+                if records.run_dir(run_id, parent=parent).is_dir():
                     last_error = exc
                     continue
                 raise RunRecordError(
-                    f"无法创建运行目录（{records.run_dir(run_id)}）：{exc}"
+                    f"无法创建运行目录（{records.run_dir(run_id, parent=parent)}）：{exc}"
                 ) from exc
         raise RunRecordError(f"运行号连续碰撞，无法创建运行目录：{last_error}")
 
@@ -1275,20 +1315,29 @@ class WorkflowEngine:
     def _start_detail(self, request: RunRequest) -> str:
         """运行开始事件的 detail：输入摘要 + 轮次上限与来源（log 预览与渲染头行共用）。
 
-        ``-f`` 输入额外标注"原文件名 → 工作区名"映射（Design §4.5 的报告口径）；续跑与并行
-        审查各加一句，使终端头行与日志能一眼看出这一轮是怎么起的。
+        ``-f`` 输入额外标注"原文件名 → 工作区名"映射（Design §4.5 的报告口径）；续跑、
+        会话轮次与并行审查各加一句，使终端头行与日志能一眼看出这一轮是怎么起的。
         """
         descriptor = request.input_descriptor()
+        start_label = state_mod.code_version_dir_name(
+            state_mod.normalize_version_base(request.start_version)
+        )
         if descriptor.get("kind") == state_mod.INPUT_FILE:
             source = str(descriptor.get("source_path") or "")
             if request.source_dir is not None:
-                summary = f"父运行版本目录：{source} → {state_mod.code_version_dir_name(1)}/"
+                summary = f"父运行版本目录：{source} → {start_label}/"
             else:
-                summary = (
-                    f"文件：{source} → {state_mod.code_version_dir_name(1)}/{Path(source).name}"
-                )
+                summary = f"文件：{source} → {start_label}/{Path(source).name}"
         else:
             summary = state_mod.summarize_input(descriptor, limit=80)
+            source = str(descriptor.get("source_path") or "")
+            if source:
+                # 会话轮次：需求驱动编码起步、既有代码来自上一版本或用户文件（Design §4.7）；
+                # 沿用输入摘要的公开口径，让"版本目录 / 文件"两种来源在头行上一眼可分
+                label = state_mod.summarize_input(
+                    {"kind": state_mod.INPUT_FILE, "source_path": source}, limit=120
+                )
+                summary = f"{summary}（基于 {label} 继续开发 → {start_label}/）"
         strict = "，--strict 已启用" if request.strict else ""
         parts = [
             (
@@ -1296,8 +1345,13 @@ class WorkflowEngine:
                 f"（来源：{source_label(request.max_iterations_source)}）{strict}"
             )
         ]
+        if request.rounds_mode == state_mod.ROUNDS_EXACT:
+            parts.append("轮次模式 exact（跑满指定轮次）")
         if request.parent_run_id:
             parts.append(f"续跑自 {request.parent_run_id}")
+        if request.session_id:
+            rounds = f"第 {request.round_index} 轮" if request.round_index else "本轮"
+            parts.append(f"会话 {request.session_id} 的{rounds}")
         if request.parallel_review:
             parts.append("并行双视角审查（正确性 + 安全性）")
         return "；".join(parts)
@@ -1427,13 +1481,10 @@ def build_report(
         input_descriptor.get("source_path") if isinstance(input_descriptor, Mapping) else None
     )
     mapped_name = Path(str(source_path)).name if source_path else ""
+    start_dir = state_mod.code_version_dir_name(_version_base_of(state))
     for path in artifacts:
         relative = _relative_display(path, run_dir)
-        if (
-            source_path
-            and mapped_name
-            and relative == f"workspace/{state_mod.code_version_dir_name(1)}/{mapped_name}"
-        ):
+        if source_path and mapped_name and relative == f"workspace/{start_dir}/{mapped_name}":
             lines.append(f"- `{relative}`（原文件 → 工作区：`{source_path}`）")
         else:
             lines.append(f"- `{relative}`")
@@ -1690,6 +1741,39 @@ def _normalize_code(code: str) -> str:
     return code.strip("\n") + "\n"
 
 
+def read_version_files(directory: Path) -> dict[str, str]:
+    """读出版本目录的代码文件：以 ``manifest.json`` 清单为准（Design §4.2.2）。
+
+    manifest 是引擎落盘时写的权威清单；按它读而不是全目录递归，才能把"审查 / 修复
+    Agent 执行代码时落进版本目录的副产物"（`__pycache__`、被测程序自己写出的
+    数据文件等，真实演示暴露）挡在版本内容之外——否则 resume 复制、指纹比较与
+    修复覆盖检查都会把副产物当版本文件。缺 manifest（旧目录 / 手工介入）时退回
+    全目录读取，并排除字节码与隐藏 / 临时文件。
+
+    会话层（命令面）读取既有版本内容时复用本函数：版本内容的唯一权威口径只在此处。
+    """
+    manifest_files = _manifest_file_names(directory)
+    names = sorted(manifest_files) if manifest_files is not None else None
+    if names is None:
+        names = [
+            path.relative_to(directory).as_posix()
+            for path in sorted(directory.rglob("*"))
+            if path.is_file()
+            and path.name != "manifest.json"
+            and not path.name.startswith(".")
+            and not path.name.endswith(".tmp")
+            and path.suffix != ".pyc"
+            and "__pycache__" not in path.relative_to(directory).parts
+        ]
+    files: dict[str, str] = {}
+    for name in names:
+        try:
+            files[name] = (directory / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PersistenceError(f"版本文件 {name} 读取失败：{exc}") from exc
+    return files
+
+
 def _manifest_file_names(directory: Path) -> list[str] | None:
     """读 manifest.json 的文件清单；缺失 / 损坏返回 ``None``（调用方退回全目录读取）。"""
     manifest_path = directory / "manifest.json"
@@ -1714,6 +1798,11 @@ def _version_files_of(state: Mapping[str, Any]) -> list[str]:
     if not isinstance(files, list):
         return []
     return [str(item) for item in files if isinstance(item, str) and item.strip()]
+
+
+def _version_base_of(state: Mapping[str, Any]) -> int:
+    """状态的起始版本号（展示与报告用）：坏值按 1 处理（口径见 state.normalize_version_base）。"""
+    return state_mod.normalize_version_base(state.get("version_base"))
 
 
 def _fingerprint(files: Mapping[str, str]) -> dict[str, str]:

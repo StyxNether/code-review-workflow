@@ -472,3 +472,91 @@ def test_log_preview_falls_back_for_unserialisable_details(tmp_path: Path) -> No
 
     line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert "{" in str(line["detail"]) and "}" in str(line["detail"])  # set 的 repr 形态
+
+
+# ---- 会话轮次记录：两处查找与降级引用（Design §4.7 / §8.2）----
+
+
+def _make_session_round(
+    session_id: str = "s-20261012-0001", round_name: str = "round-1", *, run_id: str = ""
+) -> Path:
+    """运行号由 ``round_name`` 确定性派生（不用 ``hash``：进程间随机化会让断言漂移）。"""
+    suffix = int(round_name.split("-")[1]) if "-" in round_name else 0
+    """手工造一条会话轮次记录（引擎在会话内写出的同构形态：round-<i>/ + state.json）。"""
+    path = records.sessions_root() / session_id / "rounds" / round_name
+    (path / "workspace").mkdir(parents=True)
+    state = {
+        "run_id": run_id or f"r-20261012-{suffix:04x}",
+        "session_id": session_id,
+        "round_index": int(round_name.split("-")[1]),
+        "status": state_mod.STATUS_SUCCESS,
+        "created_at": "2026-10-12T10:00:00+08:00",
+        "input": {"kind": "requirement", "requirement": "写一个计算器"},
+        "fix_rounds": 0,
+    }
+    (path / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_find_run_dir_searches_both_places() -> None:
+    """运行号在 runs/ 与会话轮次两处都查得到（会话侧按 state.json 的 run_id 匹配）。"""
+    direct = records.create_run_dir("r-20261012-0001")
+    round_path = _make_session_round(run_id="r-20261012-0002")
+
+    assert records.find_run_dir("r-20261012-0001") == direct
+    assert records.find_run_dir("r-20261012-0002") == round_path
+    assert records.find_run_dir("r-20261012-9999") is None
+    assert records.find_run_dir("../secret") is None
+
+
+def test_find_run_dir_supports_the_degraded_reference_form() -> None:
+    """state.json 不可读的会话轮次用 ``<会话号>/round-<i>`` 引用（列表的降级标识）。"""
+    path = _make_session_round()
+    (path / "state.json").unlink()
+
+    assert records.find_run_dir("s-20261012-0001/round-1") == path
+    assert records.find_run_dir("s-20261012-0001/round-9") is None
+    assert records.parse_session_round_ref("s-20261012-0001/round-2") == (
+        "s-20261012-0001",
+        "round-2",
+    )
+    assert records.parse_session_round_ref("r-20261012-0001") is None
+
+
+def test_list_runs_aggregates_session_rounds_and_degrades_them() -> None:
+    """runs 列表跨两处聚合；会话轮次的 state.json 不可读时用降级引用标识。"""
+    records.create_run_dir("r-20261012-0001")
+    good = _make_session_round(run_id="r-20261012-0002")
+    broken = _make_session_round(round_name="round-2", run_id="r-20261012-0003")
+    (broken / "state.json").write_text("{坏", encoding="utf-8")
+
+    summaries = {item.run_id: item for item in records.list_runs()}
+
+    assert set(summaries) == {"r-20261012-0001", "r-20261012-0002", "s-20261012-0001/round-2"}
+    assert summaries["r-20261012-0002"].session_id == "s-20261012-0001"
+    assert summaries["r-20261012-0002"].path == good
+    degraded = summaries["s-20261012-0001/round-2"]
+    assert degraded.session_id == "s-20261012-0001"
+    assert degraded.status == "unknown"  # 状态由日志也推不出来（Design §8.2 的降级派生）
+
+
+def test_load_detail_accepts_the_degraded_reference_form() -> None:
+    path = _make_session_round(round_name="round-3", run_id="r-20261012-0004")
+    (path / "state.json").write_text("{坏", encoding="utf-8")
+
+    detail = records.load_detail("s-20261012-0001/round-3")
+
+    assert detail.degraded is True
+    assert detail.summary.session_id == "s-20261012-0001"
+
+
+def test_create_run_dir_at_refuses_to_overwrite() -> None:
+    path = records.sessions_root() / "s-20261012-0001" / "rounds" / "round-1"
+
+    assert records.create_run_dir_at(path) == path
+    try:
+        records.create_run_dir_at(path)
+    except FileExistsError:
+        pass
+    else:  # pragma: no cover — 上面必须抛
+        raise AssertionError("既有轮次目录被覆盖了")

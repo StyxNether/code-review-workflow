@@ -1,7 +1,8 @@
 """Agent 运行时：LangChain ``create_agent`` 封装、工具轮次限制、错误协议与过程事件回调。
 
 **单任务节点语义**（Design §6.2 #5）：一次 :meth:`AgentRuntime.run` 只服务一个节点任务，
-运行时不持有跨轮对话正本——跨轮记忆属会话层（M4），工作流节点每轮都是独立请求。
+运行时不持有跨轮对话正本——跨轮记忆由会话层按 Agent 分别持有（Design §4.7 / D12），
+经 ``history`` 参数以历史消息形式进入本次请求，运行时不落盘、不解释其内容。
 
 LangChain / LangGraph 类型（消息、图对象、流事件）不越出本模块：对上层只返回
 :class:`TaskResult` 与字符串回调（Design §3.1）。
@@ -161,6 +162,47 @@ def _final_answer(final_state: Mapping[str, Any] | None) -> _Answer:
     return _Answer(text=text, message=message)
 
 
+def history_from_state(state: Mapping[str, Any], agent: str) -> list[dict[str, str]]:
+    """从运行状态的瞬态键取该 Agent 的会话记忆（Design §4.7）；缺失 / 形态不符返回空表。
+
+    记忆由会话层按 Agent 落盘并随 ``RunRequest`` 注入状态（引擎只做搬运，不解释内容）；
+    一次性运行没有该键，行为与 M3 一致。
+    """
+    memory = state.get("agent_memory")
+    if not isinstance(memory, Mapping):
+        return []
+    lines = memory.get(agent)
+    if not isinstance(lines, Sequence):
+        return []
+    history: list[dict[str, str]] = []
+    for item in lines:
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "")
+        text = item.get("text")
+        if role in ("user", "assistant") and isinstance(text, str) and text.strip():
+            history.append({"role": role, "text": text})
+    return history
+
+
+def _history_messages(history: Sequence[Mapping[str, str]]) -> list[BaseMessage]:
+    """会话记忆 → 历史消息：``user`` → HumanMessage、``assistant`` → AIMessage。
+
+    记忆是"该 Agent 自己的历史"（Design §4.7）：以消息序列而非拼接文本进入请求，
+    追加式前缀（系统提示词 + 历史）逐轮稳定，供应商的上下文缓存才能命中。
+    """
+    messages: list[BaseMessage] = []
+    for item in history:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        if str(item.get("role") or "") == "assistant":
+            messages.append(AIMessage(content=text))
+        else:
+            messages.append(HumanMessage(content=text))
+    return messages
+
+
 def _estimate_tokens(messages: Sequence[BaseMessage]) -> int:
     """字符数粗估（中英混合折中 × 1.2 安全余量）。
 
@@ -179,8 +221,8 @@ def _estimate_tokens(messages: Sequence[BaseMessage]) -> int:
 def _rounds_this_task(messages: Sequence[BaseMessage]) -> int:
     """本次任务的工具轮数：带 ``tool_calls`` 的 AI 消息记一轮。
 
-    单任务节点语义下没有历史消息，直接全量计数；保留函数名与口径以便扩展（会话层接入时
-    需按轮次边界过滤）。
+    会话记忆（历史消息）只有正文、不带 ``tool_calls``，因此全量计数天然只覆盖本次任务
+    的工具轮次（Design §4.6 的工具轮次上限按"任务"计数，不按会话累计）。
     """
     return sum(1 for message in messages if isinstance(message, AIMessage) and message.tool_calls)
 
@@ -365,14 +407,18 @@ class AgentRuntime:
         system_prompt: str,
         user_prompt: str,
         registry: ToolRegistry,
+        history: Sequence[Mapping[str, str]] = (),
     ) -> TaskResult:
-        """执行一次节点任务：单轮 user 输入 → 自主调用工具 → 返回最终正文。
+        """执行一次节点任务：历史消息 + 单轮 user 输入 → 自主调用工具 → 返回最终正文。
 
         Args:
             node: 节点名（``encode`` / ``review`` / ``fix``；用于事件与增量路由）。
             system_prompt: 该节点的系统提示词（常量，缓存前缀友好）。
             user_prompt: 本次任务的用户消息（含本轮上下文与输出契约）。
             registry: 该节点的工具注册表（``--no-exec`` 时其中不含 ``run_python``）。
+            history: 该 Agent 的会话记忆（``[{"role", "text"}]``，Design §4.7）：作为
+                **历史消息**放在本轮 user 之前——追加式记忆的前缀逐轮稳定，供应商的
+                上下文缓存因此可以命中已发送部分；空表（一次性运行）时行为与 M3 一致。
 
         Raises:
             LLMError: 模型调用失败（已翻译为可读中文，不含 SDK 类型）。
@@ -384,6 +430,7 @@ class AgentRuntime:
             # guardrail，只清当前变体会让残留在别处的触达记录被后续任务误报为本轮触达
             for item in self._guardrails.values():
                 item.notices.clear()
+        memory = _history_messages(history)
         tool_events = 0
         problem: str | None = None
         for attempt in range(1, _ANSWER_RETRY_ATTEMPTS + 1):
@@ -395,7 +442,10 @@ class AgentRuntime:
             )
             bridge.counter["ok"] = 0
             bridge.callbacks = (self._emit, node)
-            fed: list[BaseMessage] = [HumanMessage(content=_retry_prompt(user_prompt, problem))]
+            fed: list[BaseMessage] = [
+                *memory,
+                HumanMessage(content=_retry_prompt(user_prompt, problem)),
+            ]
             try:
                 final_state = self._drive(graph, fed, node)
             except Exception as exc:
@@ -547,4 +597,5 @@ __all__ = [
     "DeltaSink",
     "EventSink",
     "TaskResult",
+    "history_from_state",
 ]

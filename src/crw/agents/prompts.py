@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
+
+#: 会话轮次内联既有实现的总量上限（字符）：超出时省略较后的文件并如实标注。
+#: 版本契约上限为 1 MB，正常规模的实现远小于此；该上限只防"把超大版本整份塞进提示词"。
+PRIOR_FILES_MAX_CHARS = 200_000
 
 ENCODER_SYSTEM_PROMPT = """你是一位资深 Python 工程师。你的任务是按用户给出的需求写出一份\
 **可直接运行的 Python 实现**，可以是一个或多个文件。
@@ -44,8 +49,9 @@ REVIEWER_SYSTEM_PROMPT = """你是一位资深代码审查员，有多年跨语�
 你的职责是给出专业、可落地的问题清单，不重写代码、不做修复。
 
 # 工作方式
-- 先核实，再下结论：必须先用 read_file 读取待审查文件的真实内容，禁止评论没有读过的代码；\
-一次审查要覆盖版本内的**全部文件**，任务里会给出文件清单。
+- 先核实，再下结论：必须基于你已经读到的真实内容评论，禁止评论没有读过的代码——工作流内\
+先用 read_file 读取待审查文件；`crw review` 的文件内容已直接附在任务里（任务写明\
+「无需再调用工具读取」），此时以附件为准。一次审查要覆盖版本内的**全部文件**，任务里会给出文件清单。
 - 允许运行代码核实（run_python）：把确有疑问的行为跑一遍再下结论，比猜测更有价值；\
 运行失败或无法验证时，把该条结论的 uncertain 标为 true。
 - 相对路径基于上下文根解析（工作流节点执行时为运行工作区），越界路径会被拒绝；\
@@ -152,21 +158,95 @@ def reviewer_system_prompt(view: str | None = None) -> str:
 
 
 def encode_task_prompt(
-    *, requirement: str, version_label: str, retry_feedback: str | None = None
+    *,
+    requirement: str,
+    version_label: str,
+    retry_feedback: str | None = None,
+    prior_files: Mapping[str, str] | None = None,
+    prior_source: str = "",
 ) -> str:
-    """编码任务：需求文本 + 输出去向 + （重试时）上一轮的校验失败原因。"""
+    """编码任务：需求文本 + 输出去向 + （重试时）上一轮的校验失败原因。
+
+    ``prior_files`` 非空表示会话轮次的"在既有实现上继续开发"（Design §4.7）：把当前
+    版本的代码内联进任务（编码节点无工具，读不到工作区），并说明输出仍是**完整版本**
+    ——新版本由本次输出定义，未内联的文件不会自动保留。``prior_source`` 是既有实现的
+    来源路径（上一版本目录或用户提供的文件），用于把来源如实写进小节标题。
+    """
     lines = [
         "请按以下需求写出 Python 实现（一个或多个文件）。",
         "",
         "需求：",
         _clip(requirement, limit_lines=40),
         "",
-        (
-            f"输出会由系统保存为版本目录 {version_label}/（manifest 由系统生成，"
-            "不要自己输出）；每个文件一个 ```python file=<相对路径> 围栏。"
-        ),
     ]
+    prior = _prior_section(prior_files, version_label=version_label, source=prior_source)
+    if prior:
+        lines.extend(prior)
+        lines.append("")
+    lines.append(
+        f"输出会由系统保存为版本目录 {version_label}/（manifest 由系统生成，"
+        "不要自己输出）；每个文件一个 ```python file=<相对路径> 围栏。"
+    )
     return _with_retry(lines, retry_feedback)
+
+
+def _prior_section(
+    files: Mapping[str, str] | None, *, version_label: str, source: str = ""
+) -> list[str]:
+    """既有实现的内联小节（会话轮次的编码上下文，Design §4.7）。
+
+    围栏用按内容动态加长的裸围栏（内容含 ``` 时不提前闭合），路径写在小节标题里；
+    内联总量设上限：一旦超预算**从该文件起停止内联**（内联集合恒为排序后的前一段，
+    与省略清单严格互补），并如实标注——新版本由本次输出定义，未内联的文件不会自动
+    保留，这一点必须让模型看见而不是静默丢文件。
+    """
+    if not files:
+        return []
+    header = [
+        f"## 既有实现（{_prior_label(source, version_label=version_label)}，共 {len(files)} 个文件）",
+        ("请以上面的实现为基础，按**本次需求**修改 / 扩展；未涉及的部分保持原有行为与结构。"),
+        (
+            "本次输出仍是**完整版本**：与下方文件一一对应，每个文件一个 "
+            "```python file=<相对路径> 围栏（未改动的文件也要原样给出）。"
+        ),
+        "",
+    ]
+    body: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for path in sorted(files):
+        content = files[path]
+        if used + len(content) > PRIOR_FILES_MAX_CHARS:
+            omitted.extend(sorted(files)[len(body) :])
+            break
+        used += len(content)
+        fence = "`" * max(3, _longest_fence(content) + 1)
+        body.append(f"### {path}\n{fence}\n{content.rstrip()}\n{fence}")
+    if omitted:
+        body.append(
+            "（以下文件因篇幅未内联，它们**不在**上述实现里，也不会自动保留到新版本："
+            f"{', '.join(omitted)}）"
+        )
+    return [*header, *body]
+
+
+def _prior_label(source: str, *, version_label: str) -> str:
+    """既有实现的来源标签（如实写出来源性质，别把用户文件说成版本目录）。
+
+    ``source`` 是版本目录（``.../workspace/code_vN``）时写版本号；是普通文件时写文件名；
+    都没有时说明"本会话当前的实现将要生成到 ``version_label``"。
+    """
+    name = Path(str(source or "")).name
+    if re.fullmatch(r"code_v[0-9]+", name):
+        return f"来自版本 {name}/，本会话此前的产出"
+    if name:
+        return f"来自文件 {name}，请在此基础上修改"
+    return f"本会话当前实现（将产出到 {version_label}/）"
+
+
+def _longest_fence(text: str) -> int:
+    """文本中最长的连续反引号长度（内联围栏据此加长，避免被内容提前闭合）。"""
+    return max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)
 
 
 def review_task_prompt(
@@ -243,16 +323,28 @@ def fix_task_prompt(
     findings: Sequence[Mapping[str, Any]],
     allow_exec: bool,
     retry_feedback: str | None = None,
+    polish: bool = False,
 ) -> str:
     """修复任务：版本文件清单、本轮问题清单与输出契约（逐条处置 + 完整版本产出）。
 
     清单以**版本内相对路径**呈现：它同时是 ``file=`` 的声明口径（避免了"清单带版本目录
     前缀、围栏要求不带前缀"的自相矛盾——真实演示曾因此让模型产出带前缀的路径、覆盖检查
     判缺全体文件）；读取路径的版本目录前缀在步骤说明里单独给出。
+
+    ``polish``：``rounds_mode=exact`` 下审查已干净但仍要跑满轮次时的"复核改进"轮
+    （Design §4.4，无问题可修但轮次未跑满）——此时改说复核目标，否则"请修复问题 +
+    （本轮没有问题）"自相矛盾，模型只能空转。
     """
     listing = "\n".join(f"- {name}" for name in files)
+    opening = (
+        f"本轮审查未发现阻塞问题，但会话要求跑满 {version} 轮（exact 模式）：请复核"
+        f"工作区版本 {version_label}/（当前代码版本 v{version}）的实现，做你能确信的小步"
+        "改进与加固（可读性、边界处理、注释），不要为改而改。"
+        if polish and not findings
+        else f"请修复工作区版本 {version_label}/（当前代码版本 v{version}）中审查发现的问题。"
+    )
     lines = [
-        f"请修复工作区版本 {version_label}/（当前代码版本 v{version}）中审查发现的问题。",
+        opening,
         "",
         f"版本内共 {len(files)} 个文件（``file=`` 用这些相对路径声明）：",
         listing,

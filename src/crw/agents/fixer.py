@@ -14,7 +14,7 @@ from typing import Any
 from ..tools import EXEC_TOOL_NAME, ToolRegistry
 from ..workflow import state as state_mod
 from . import prompts
-from .runtime import AgentRuntime
+from .runtime import AgentRuntime, history_from_state
 
 #: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
 NodeFn = Callable[..., Mapping[str, Any]]
@@ -37,8 +37,10 @@ def build_fix_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:
                 findings=findings,
                 allow_exec=EXEC_TOOL_NAME in registry.names(),
                 retry_feedback=retry_feedback,
+                polish=state.get("rounds_mode") == state_mod.ROUNDS_EXACT,
             ),
             registry=registry,
+            history=history_from_state(state, "fixer"),
         )
         return {"fix_text": result.text}
 

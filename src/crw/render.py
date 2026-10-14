@@ -36,7 +36,13 @@ from .workflow import engine as engine_mod
 from .workflow import records as records_mod
 from .workflow import state as state_mod
 
-_RULE_WIDTH = 52
+#: 规则线宽度（结论横幅与阶段标题共用）
+RULE_WIDTH = 52
+#: 兼容别名（既有实现按私有名引用）
+_RULE_WIDTH = RULE_WIDTH
+
+#: 密钥形态（与命令面同一构造：左侧非字母数字断言，避免误伤普通连字符词）
+_SECRET_PATTERN = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{8,}")
 
 #: 换行常量（正文拼接与裁剪用；写成常量以免源码里的转义在编辑中被误读）
 NEWLINE = "\n"
@@ -52,6 +58,7 @@ _NODE_STYLE: dict[str, str] = {
     "review_security": "bold blue",
     "merge_reviews": "bold white",
     "fix": "bold magenta",
+    "orchestrator": "bold green",
 }
 #: 分级着色（Design §6.2 #6）
 _SEVERITY_STYLE: dict[str, str] = {
@@ -64,6 +71,9 @@ _STATUS_STYLE: dict[str, str] = {"fixed": "green", "partial": "yellow", "skipped
 _STATUS_LABEL: dict[str, str] = {"fixed": "已修复", "partial": "部分修复", "skipped": "未采纳"}
 
 _STAGE_HINTS: dict[str, str] = {"encode": "生成初始代码"}
+
+#: 会话层节点（不在工作流图内）的显示名：编排节点（Design §5.4）
+_EXTRA_NODE_LABELS: dict[str, str] = {"orchestrator": "编排"}
 
 #: 并行双视角的分支节点：正文一律按节点缓存后整块输出（见 :meth:`RunRenderer.on_delta`）
 _PARALLEL_BRANCH_NODES = frozenset({"review_correctness", "review_security"})
@@ -359,7 +369,7 @@ class RunRenderer:
             self._line(_stage_banner(node, event.get("iteration")), style=_style_of(node))
         elif kind == "end":
             self._end_stage(node)
-            self._line(f"[{engine_mod.node_label(node)}] {text}", style=_style_of(node))
+            self._line(f"[{node_label(node)}] {text}", style=_style_of(node))
         elif kind == "retry":
             # Design §4.6：重试的第二次模型输出不重复渲染正文，只给一行提示
             self.discard_text(node)
@@ -374,7 +384,7 @@ class RunRenderer:
             self._line(f"[{engine_mod.node_label(node)}] 错误：{text}", style="bold red")
         elif kind == "interrupt":
             self._end_stage(node)
-            self._line(f"[{engine_mod.node_label(node)}] {text}", style="bold yellow")
+            self._line(f"[{node_label(node)}] {text}", style="bold yellow")
 
     def on_delta(self, node: str, text: str) -> None:
         """模型正文增量：单阶段时流式输出，多阶段（并行分支）时按节点缓存到该阶段结束。
@@ -533,13 +543,23 @@ class RunRenderer:
         self._line_open = not text.endswith("\n")
 
 
+def node_label(node: Any) -> str:
+    """节点显示名：工作流节点（编码 / 审查 / 修复…）与会话层节点（编排）统一口径。"""
+    return _EXTRA_NODE_LABELS.get(str(node), engine_mod.node_label(node))
+
+
+def mask_secrets(text: str) -> str:
+    """遮蔽 ``sk-`` 形态的密钥：会话层与命令面的报错通道统一口径（Design §8.2 的截断惯例）。"""
+    return _SECRET_PATTERN.sub("sk-***", text)
+
+
 def _style_of(node: str) -> str:
     return _NODE_STYLE.get(node, "bold")
 
 
 def _stage_banner(node: str, iteration: Any) -> str:
     """阶段横幅文本：``── [审查] 第 1 轮 ──`` / ``── [编码] 生成初始代码 ──``。"""
-    label = engine_mod.node_label(node)
+    label = node_label(node)
     round_number = iteration if isinstance(iteration, int) and iteration > 0 else None
     if node == "encode":
         title = f"[{label}] {_STAGE_HINTS['encode']}"
@@ -596,7 +616,11 @@ def _render_result(
         interrupted = result.interrupted or result.status == state_mod.STATUS_INTERRUPTED
         label = "已中断" if interrupted else "运行失败"
         node = result.error_node or "engine"
-        node_text = f"[{engine_mod.node_label(node)}] " if node in engine_mod.NODE_LABELS else ""
+        node_text = (
+            f"[{node_label(node)}] "
+            if node in {**engine_mod.NODE_LABELS, **_EXTRA_NODE_LABELS}
+            else ""
+        )
         err_console.print(
             f"crw {command}：{label} — {node_text}{result.error_message or '（无详细信息）'}",
             style="bold red",
@@ -610,6 +634,51 @@ def _render_result(
             target.print(
                 "说明：报告未生成；状态与事件已落盘（state.json / log.jsonl）。", style="dim"
             )
+
+
+def render_sessions(
+    summaries: Sequence[Any],
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
+    """会话列表：会话号 | 时间 | 轮次数 | 最后状态（Design §8.1）。"""
+    guarded(lambda: _render_sessions(summaries, out=out, color=color))
+
+
+def _render_sessions(
+    summaries: Sequence[Any],
+    *,
+    out: TextIO | None = None,
+    color: bool | None = None,
+) -> None:
+    console = console_for(out if out is not None else sys.stdout, color)
+    if not summaries:
+        console.print("（暂无会话记录；先执行 crw chat 或 crw chat --resume <会话号>）")
+        return
+    header = ("会话号", "时间", "轮次数", "最后状态")
+    rows = [
+        (
+            item.session_id,
+            item.created_at or "（未记录）",
+            str(item.round_count),
+            item.last_status if item.degraded else engine_mod.status_label(item.last_status),
+        )
+        for item in summaries
+    ]
+    widths = [
+        max(display_width(row[column]) for row in (header, *rows)) for column in range(len(header))
+    ]
+    console.print(
+        "  ".join(pad(text, widths[index]) for index, text in enumerate(header)).rstrip(),
+        style="bold",
+    )
+    console.print("  ".join("-" * width for width in widths).rstrip())
+    for item, row in zip(summaries, rows, strict=True):
+        console.print(
+            "  ".join(pad(text, widths[index]) for index, text in enumerate(row)).rstrip(),
+            style=_status_style(item.last_status) if not item.degraded else "",
+        )
 
 
 def render_runs(
@@ -632,7 +701,7 @@ def _render_runs(
     if not summaries:
         console.print("（暂无运行记录；先执行 crw run）")
         return
-    header = ("运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数", "模型")
+    header = ("运行号", "时间", "输入摘要", "状态", "修复轮数", "残留严重数", "模型", "会话")
     rows = [
         (
             item.run_id,
@@ -642,6 +711,7 @@ def _render_runs(
             _number(item.fix_rounds),
             _number(item.residual_severe),
             item.model or "（未记录）",
+            item.session_id or "—",
         )
         for item in summaries
     ]
@@ -713,6 +783,10 @@ def _render_detail(
         f"（来源：{engine_mod.source_label(state.get('max_iterations_source'))}）"
     )
     console.print(f"[时间] {_time_line(state, detail)}")
+    if state.get("session_id"):
+        console.print(
+            f"[会话] {state.get('session_id')} / 第 {state.get('round_index', '（未记录）')} 轮"
+        )
     if state.get("parent_run_id"):
         console.print(f"[父运行] {state.get('parent_run_id')}（续跑来源）")
     error = _mapping(state.get("error"))
@@ -867,7 +941,7 @@ def _tool_lines(detail: records_mod.RunDetail) -> list[str]:
             continue
         node = str(event.get("node") or "")
         round_number = event.get("iteration")
-        where = f"[{engine_mod.node_label(node)}]"
+        where = f"[{node_label(node)}]"
         if round_number is not None:
             where = f"{where} 第 {round_number} 轮"
         lines.append(f"{where} · {_brief(str(event.get('detail') or ''), limit=100)}")
@@ -893,6 +967,11 @@ def _not_converged(detail: records_mod.RunDetail, round_number: int) -> bool:
     if previous is None or current is None:
         return False
     return engine_mod.not_converged(previous.review, current.review)
+
+
+def version_base_of(state: Mapping[str, Any]) -> int:
+    """状态的起始版本号（展示用）：坏值按 1 处理，口径见 ``state.normalize_version_base``。"""
+    return state_mod.normalize_version_base(state.get("version_base"))
 
 
 def _duration_ms(started: str, ended: str) -> str:
@@ -960,19 +1039,23 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
     "父版本目录 → ``code_v1/``"；``-f`` 为"原文件 → ``code_v1/<原文件名>``"。
     """
     descriptor = _mapping(state.get("input"))
+    start_dir = state_mod.code_version_dir_name(version_base_of(state))
     if descriptor.get("kind") == state_mod.INPUT_FILE:
         source = str(descriptor.get("source_path") or "")
         if re.fullmatch(r"code_v\d+", Path(source).name or ""):
-            return (
-                f"父运行版本目录：{source or '（未记录）'} → {state_mod.code_version_dir_name(1)}/"
-            )
+            return f"父运行版本目录：{source or '（未记录）'} → {start_dir}/"
         return (
             f"文件：{source or '（未记录路径）'}"
-            f" → {state_mod.code_version_dir_name(1)}/{Path(source).name if source else '（未命名）'}"
+            f" → {start_dir}/{Path(source).name if source else '（未命名）'}"
         )
     if not descriptor:
         return summary.input_summary
-    return state_mod.summarize_input(descriptor, limit=200)
+    text = state_mod.summarize_input(descriptor, limit=200)
+    source = str(descriptor.get("source_path") or "")
+    if source and re.fullmatch(r"code_v\d+", Path(source).name or ""):
+        # 会话轮次：需求驱动编码起步、既有代码来自上一版本（Design §4.7）
+        return f"{text}（基于 {Path(source).name}/ 继续开发 → {start_dir}/）"
+    return text
 
 
 def review_json_report(merged: Mapping[str, Any]) -> str:

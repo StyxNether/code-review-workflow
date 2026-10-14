@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import operator
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
@@ -98,10 +99,19 @@ class RunState(TypedDict, total=False):
     parallel_review: bool
     session_id: str | None
     round_index: int | None
+    #: 本次运行的起始版本号（会话轮次跨轮连续递增时由命令面给出，Design §4.7）；
+    #: ``code_version`` = 该值 + 已完成修复轮数，一次性运行恒为 1
+    version_base: int
     current_version_dir: str
     #: 当前版本内的文件清单（版本内相对路径，posix 风格，与 manifest 一致）：
     # 审查 / 修复节点的任务提示词需要它（节点不接触文件，Design §3.1）
     version_files: list[str]
+    #: 既有实现的文件内容（``路径 → 内容``，会话轮次的编码上下文）：编码节点把它内联进
+    #: 任务提示词，使"按新需求修改"有真实依据。**瞬态键**：不进运行记录（见 PERSISTED_FIELDS）
+    prior_files: Mapping[str, str]
+    #: 三 Agent 各自的会话记忆（``agent → [{"role", "text"}]``，Design §4.7）：各节点把它
+    #: 作为历史消息交给运行时。**瞬态键**：不进运行记录（见 PERSISTED_FIELDS）
+    agent_memory: Mapping[str, list[Mapping[str, str]]]
     findings: list[Finding]
     #: 并行双视角审查的分支结论（独立 key：同超级步多写者不得冲突，Design §12.2）。
     #: 汇合节点消费后由 ``findings`` 承载权威结论，故不进入运行记录（见 PERSISTED_FIELDS）。
@@ -132,6 +142,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "parallel_review",
     "session_id",
     "round_index",
+    "version_base",
     "current_version_dir",
     "version_files",
     "findings",
@@ -162,6 +173,7 @@ _DEFAULTS: dict[str, Any] = {
     "parallel_review": False,
     "session_id": None,
     "round_index": None,
+    "version_base": 1,
     "current_version_dir": "",
     "version_files": [],
     "findings": [],
@@ -204,9 +216,29 @@ def round_number_for_fix(state: Mapping[str, Any]) -> int:
     return int(state.get("fix_rounds", 0)) + 1
 
 
+def normalize_version_base(value: Any) -> int:
+    """起始版本号归一：非法值（缺失 / 非整数 / 小于 1）一律按 1 处理。
+
+    请求侧与状态侧共用这一处规则（Design §4.7）：坏值只降级成"从第 1 版起"，
+    不让一个手改过的字段把版本目录名或报告渲染弄崩。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
 def code_version(state: Mapping[str, Any]) -> int:
-    """当前代码版本号 = 已完成修复轮数 + 1（Design §4.4：审查恒有 review_round == fix_rounds + 1）。"""
-    return int(state.get("fix_rounds", 0)) + 1
+    """当前代码版本号 = 起始版本号 + 已完成修复轮数（Design §4.4/§4.7）。
+
+    一次性运行的起始版本号恒为 1（等价于旧口径 ``fix_rounds + 1``）；会话轮次由命令面
+    给出跨轮连续递增的起始版本号，报告里的"第几版"因此在会话内始终指向同一份代码
+    （Design §4.7）。
+    """
+    try:
+        fix_rounds = int(state.get("fix_rounds", 0))
+    except (TypeError, ValueError):
+        fix_rounds = 0
+    return normalize_version_base(state.get("version_base")) + fix_rounds
 
 
 def new_state(
@@ -224,6 +256,7 @@ def new_state(
     parent_run_id: str | None = None,
     session_id: str | None = None,
     round_index: int | None = None,
+    version_base: int = 1,
 ) -> RunState:
     """构造运行初始状态（字段与默认值见 Design §4.3）。
 
@@ -234,12 +267,13 @@ def new_state(
         max_iterations: 修复轮次上限；``max_iterations_source`` 记录其来源。
         model: 本次运行的模型标识（``供应商/模型名``，Design §4.3）。
         created_at: 开始时间戳（ISO 8601，由注入时钟给出）。
-        rounds_mode: 轮次语义（M1 恒为 up-to，exact 随 M4 落地）。
+        rounds_mode: 轮次语义（up-to 干净即早退 / exact 跑满，Design §4.4）。
         strict: 是否启用加严干净判定（Design §4.4）。
         parallel_review: 是否启用并行双视角审查（Design §12.2 的扩展示例）。
         parent_run_id: 续跑来源运行号（resume 时写入，新运行为空）。
         session_id: 所属会话号（会话轮次写入；一次性运行为空）。
         round_index: 会话内轮次序号（从 1 起；一次性运行为空）。
+        version_base: 本次运行的起始版本号（会话跨轮连续递增，Design §4.7；一次性运行为 1）。
 
     Returns:
         完整的运行初始状态字典。
@@ -257,8 +291,11 @@ def new_state(
         parallel_review=parallel_review,
         session_id=session_id,
         round_index=round_index,
+        version_base=max(1, int(version_base)),
         current_version_dir="",
         version_files=[],
+        prior_files={},
+        agent_memory={},
         findings=[],
         findings_correctness=[],
         findings_security=[],
@@ -301,14 +338,40 @@ def loads(text: str) -> dict[str, Any]:
 
 
 def summarize_input(input_descriptor: Mapping[str, Any], *, limit: int = 40) -> str:
-    """输入摘要：供运行列表、报告与阶段标题共用（超长截断）。"""
+    """输入摘要：供运行列表、报告与阶段标题共用（超长截断）。
+
+    代码文件输入区分两种来源：``-f`` 是"文件：<名>"；续跑 / 会话轮次的来源是版本目录
+    （名称形如 ``code_vN``），摘要写"版本目录：<记录名>/code_vN"以便一眼看出由谁续的
+    （版本目录名单独出现时与真实文件名无从分辨）。
+    """
     kind = input_descriptor.get("kind")
     if kind == INPUT_FILE:
         source = str(input_descriptor.get("source_path") or "")
+        label = _version_dir_label(source)
+        if label:
+            return _ellipsis(f"版本目录：{label}", limit)
         name = Path(source).name or source or "（未命名文件）"
         return _ellipsis(f"文件：{name}", limit)
     requirement = " ".join(str(input_descriptor.get("requirement") or "").split())
     return _ellipsis(f"需求：{requirement}" if requirement else "（空需求）", limit)
+
+
+def _version_dir_label(source: str) -> str:
+    """源路径是**运行工作区里的版本目录**时给出 ``<记录名>/code_vN`` 标签；否则空串。
+
+    必须命中 ``.../<记录名>/workspace/code_vN`` 这一形态：只按文件名匹配 ``code_vN``
+    会把用户恰好这样命名的普通文件（``-f code_v1``）也说成版本目录。
+    """
+    path = Path(source)
+    if not re.fullmatch(r"code_v[0-9]+", path.name or ""):
+        return ""
+    parts = path.parts
+    if "workspace" in parts:
+        # 取**最后一个** workspace 分量：路径更早处恰好有同名目录时不至于取错
+        index = len(parts) - 1 - parts[::-1].index("workspace")
+        if index > 0:
+            return f"{parts[index - 1]}/{path.name}"
+    return ""
 
 
 def _ellipsis(text: str, limit: int) -> str:

@@ -306,6 +306,7 @@ def test_runs_table_lists_the_designed_columns() -> None:
         "修复轮数",
         "残留严重数",
         "模型",
+        "会话",
     ]
     assert lines[1].startswith("---")
     assert "r-20261012-0001" in lines[2]

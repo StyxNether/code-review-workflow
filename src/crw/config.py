@@ -198,6 +198,126 @@ def env_registry_path() -> Path:
     return data_dir() / "env-vars.json"
 
 
+# ---- settings.json：运行默认值（Design §8.3，与"仅供应商"的 models.json 分工）----
+
+#: 轮次上限的代码内绝对天花板（改动须评审，防"把上限改到无界"，Design §8.3）
+ROUNDS_LIMIT_CEILING = 20
+#: 未配置 settings.json 时的默认修复轮次（与命令行默认一致，Design §4.4）
+DEFAULT_ROUNDS_DEFAULT = 3
+#: 未配置 settings.json 时的轮次上限（与命令行 0–10 的硬闸一致，Design §8.1）
+DEFAULT_ROUNDS_LIMIT = 10
+
+
+def settings_path() -> Path:
+    """运行默认值文件路径：``data_dir()/settings.json``（Design §8.3）。"""
+    return data_dir() / "settings.json"
+
+
+def default_settings() -> dict[str, Any]:
+    """内置运行默认值（文件缺失 / 缺项时的回退，Design §4.4 的最下一级）。"""
+    return {"rounds": {"default": DEFAULT_ROUNDS_DEFAULT, "limit": DEFAULT_ROUNDS_LIMIT}}
+
+
+def load_settings() -> dict[str, Any]:
+    """读取 settings.json 并校验；文件不存在返回内置默认值，损坏抛 :class:`ConfigError`。
+
+    校验失败按配置错误处理（退出码 2）并给出修复指引：轮次默认值直接决定调用量，
+    静默夹取会让"我配了 30 轮"变成难以察觉的行为差异。
+    """
+    path = settings_path()
+    if not path.exists():
+        return default_settings()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"配置文件 {path} 读取失败：{exc}") from exc
+    validate_settings(data)
+    merged = default_settings()
+    rounds = data.get("rounds") if isinstance(data, dict) else None
+    if isinstance(rounds, dict):
+        # 校验已保证两个键都在（给出 rounds 就必须给全，避免"配了一半"的歧义状态）
+        merged["rounds"] = {"default": rounds["default"], "limit": rounds["limit"]}
+    return merged
+
+
+def save_settings(data: dict[str, Any]) -> None:
+    """校验后原子写入 settings.json（与 models.json 同一套原子写与权限口径）。"""
+    validate_settings(data)
+    _atomic_write_text(settings_path(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def rounds_config() -> tuple[int, int, int | None]:
+    """``(默认轮次, 轮次上限, 显式配置的默认轮次)``：**一次**读取 settings.json 得出三者。
+
+    第三项为 ``None`` 表示默认轮次来自内置回退（来源标注用：显式配置记 ``config``、
+    内置回退记 ``default``，Design §4.4 的来源枚举）。一次读取同时保证同一条命令里
+    各处的取值与来源标注一致（不会读到两次改动的中间态）；违规抛 :class:`ConfigError`。
+    """
+    path = settings_path()
+    if not path.exists():
+        return DEFAULT_ROUNDS_DEFAULT, DEFAULT_ROUNDS_LIMIT, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"配置文件 {path} 读取失败：{exc}") from exc
+    validate_settings(raw)
+    rounds = raw.get("rounds") if isinstance(raw, dict) else None
+    if not isinstance(rounds, dict):
+        return DEFAULT_ROUNDS_DEFAULT, DEFAULT_ROUNDS_LIMIT, None
+    return int(rounds["default"]), int(rounds["limit"]), int(rounds["default"])
+
+
+def rounds_settings() -> tuple[int, int]:
+    """``(默认轮次, 轮次上限)``：settings.json 的值，缺省为内置默认（违规抛 :class:`ConfigError`）。"""
+    default, limit, _configured = rounds_config()
+    return default, limit
+
+
+def configured_rounds_default() -> int | None:
+    """settings.json 里**显式配置**的默认轮次；文件缺失 / 未配置该键返回 ``None``。"""
+    return rounds_config()[2]
+
+
+def validate_settings(data: Any) -> None:
+    """settings.json 结构校验；不合法抛 :class:`ConfigError`。
+
+    规则（Design §8.3）：``rounds`` 允许缺席（用内置默认），给出时必须是非空对象、
+    只含 ``default`` / ``limit`` 两个整数键，且 ``0 ≤ default ≤ limit ≤ 20``。
+    """
+    if not isinstance(data, dict):
+        raise ConfigError("运行默认值文件结构无效：顶层必须是 JSON 对象。")
+    unknown = sorted(set(data) - {"rounds"})
+    if unknown:
+        raise ConfigError(
+            f"运行默认值文件结构无效：含未知字段（{'、'.join(unknown)}），仅支持 rounds。"
+        )
+    rounds = data.get("rounds")
+    if rounds is None:
+        return
+    if not isinstance(rounds, dict):
+        raise ConfigError("运行默认值文件结构无效：rounds 必须是对象。")
+    unknown_rounds = sorted(set(rounds) - {"default", "limit"})
+    if unknown_rounds:
+        raise ConfigError(
+            "运行默认值文件结构无效：rounds 含未知字段"
+            f"（{'、'.join(unknown_rounds)}），仅支持 default / limit。"
+        )
+    for key in ("default", "limit"):
+        if key not in rounds:
+            raise ConfigError(f"运行默认值文件结构无效：rounds 缺少 {key}。")
+        value = rounds[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(
+                f"运行默认值文件结构无效：rounds.{key} 必须是整数（收到 {value!r}）。"
+            )
+    low, high = rounds["default"], rounds["limit"]
+    if not 0 <= low <= high <= ROUNDS_LIMIT_CEILING:
+        raise ConfigError(
+            f"运行默认值文件结构无效：须满足 0 ≤ default ≤ limit ≤ {ROUNDS_LIMIT_CEILING}"
+            f"（当前 default={low}、limit={high}）；请运行 crw config 修正。"
+        )
+
+
 # ---- 前作配置探测（Design §6.2 #2 / D7：仅在零配置时提示导入，不读进常态解析路径）----
 
 #: 前作数据目录名（用户主目录下）

@@ -185,12 +185,14 @@ def route_after_review(state: Mapping[str, Any]) -> str:
     """复审条件边（只读纯函数）：干净 → 收尾；达修复轮次上限 → 收尾（残留）；否则进入修复。
 
     干净判定与轮次口径见 Design §4.4；并行形态下判据作用于汇合后的 ``findings``（与单视角
-    同一口径）。``rounds-mode=exact``（跑满 n 轮）随 M4 的会话轮次语义落地，届时本函数按
-    ``rounds_mode`` 分支。
+    同一口径）。两种轮次模式（§4.4）：``up-to`` 干净即早退；``exact`` 即使干净也继续跑满
+    n 轮修复（"精益求精"），因此**先判达限、再判干净**——末尾恒为一次审查。
     """
-    if state.get("clean"):
-        return END
     if _state_int(state, "fix_rounds") >= _state_int(state, "max_iterations"):
+        return END
+    if state.get("rounds_mode") == state_mod.ROUNDS_EXACT:
+        return "fix"
+    if state.get("clean"):
         return END
     return "fix"
 

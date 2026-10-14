@@ -21,7 +21,7 @@ from typing import Any
 from ..tools import EXEC_TOOL_NAME, ToolRegistry
 from ..workflow import state as state_mod
 from . import prompts
-from .runtime import REVIEW_EVIDENCE_KEY, AgentRuntime
+from .runtime import REVIEW_EVIDENCE_KEY, AgentRuntime, history_from_state
 
 #: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
 NodeFn = Callable[..., Mapping[str, Any]]
@@ -77,6 +77,7 @@ def build_review_node(
                 view=view,
             ),
             registry=registry,
+            history=history_from_state(state, "reviewer"),
         )
         evidence["value"] = evidence["value"] or result.tool_events > 0
         return {"review_text": result.text, EVIDENCE_KEY: evidence["value"]}

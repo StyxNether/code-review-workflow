@@ -536,3 +536,77 @@ def test_presets_prefill_thinking_levels_per_user_rulings() -> None:
     # GLM（Z.ai / BigModel）：思考恒开、无可配置项 → 条目保持纯字符串（不预填）
     for name in ("Z.ai Coding Plan", "Z.ai API", "BigModel Coding Plan", "BigModel API"):
         assert all(isinstance(item, str) for item in presets[name].models)
+
+
+# ---- settings.json：运行默认值（Design §8.3）----
+
+
+def test_settings_defaults_when_the_file_is_missing() -> None:
+    assert config.load_settings() == {
+        "rounds": {
+            "default": config.DEFAULT_ROUNDS_DEFAULT,
+            "limit": config.DEFAULT_ROUNDS_LIMIT,
+        }
+    }
+    assert config.rounds_settings() == (
+        config.DEFAULT_ROUNDS_DEFAULT,
+        config.DEFAULT_ROUNDS_LIMIT,
+    )
+    assert config.configured_rounds_default() is None  # 未显式配置 → 来源记内置默认
+
+
+def test_settings_round_trip_and_merge() -> None:
+    config.save_settings({"rounds": {"default": 5, "limit": 8}})
+
+    assert config.rounds_settings() == (5, 8)
+    assert config.configured_rounds_default() == 5
+    assert config.settings_path().is_file()
+    assert config.load_settings()["rounds"] == {"default": 5, "limit": 8}
+
+
+def test_partial_rounds_block_is_rejected() -> None:
+    """给出 rounds 就必须给全两个键：配一半是歧义状态，按配置错误报出（Design §8.3）。"""
+    config.settings_path().parent.mkdir(parents=True, exist_ok=True)
+    config.settings_path().write_text('{"rounds": {"limit": 12}}', encoding="utf-8")
+
+    with pytest.raises(config.ConfigError, match="缺少 default"):
+        config.load_settings()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"rounds": {"default": 30, "limit": 20}},  # default > limit 且超天花板
+        {"rounds": {"default": 4, "limit": 3}},  # default > limit
+        {"rounds": {"default": 3, "limit": 21}},  # limit 超天花板
+        {"rounds": {"default": -1, "limit": 5}},  # 负数
+        {"rounds": {"default": True, "limit": 5}},  # 布尔不算整数
+        {"rounds": {"default": "3", "limit": 5}},  # 字符串
+        {"rounds": {"default": 3}},  # 缺项
+        {"rounds": {"default": 3, "limit": 5, "mode": "exact"}},  # 未知键
+        {"unknown": {}},  # 顶层未知键
+        [],
+    ],
+)
+def test_invalid_settings_are_config_errors(payload: object) -> None:
+    """违规按配置错误处理（退出码 2 的上游）；不静默夹取（Design §8.3）。"""
+    config.settings_path().parent.mkdir(parents=True, exist_ok=True)
+    config.settings_path().write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(config.ConfigError):
+        config.load_settings()
+
+
+def test_corrupt_settings_file_reports_the_path() -> None:
+    config.settings_path().parent.mkdir(parents=True, exist_ok=True)
+    config.settings_path().write_text("{不是 JSON", encoding="utf-8")
+
+    with pytest.raises(config.ConfigError, match="读取失败"):
+        config.rounds_settings()
+
+
+def test_settings_ceiling_is_twenty() -> None:
+    """上限天花板 = 20（改动须评审，防"把上限改到无界"）。"""
+    assert config.ROUNDS_LIMIT_CEILING == 20
+    config.save_settings({"rounds": {"default": 20, "limit": 20}})
+    assert config.rounds_settings() == (20, 20)

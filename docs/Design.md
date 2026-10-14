@@ -62,11 +62,11 @@ src/crw/
   cli.py           # 命令面：run/runs/show/resume/review/config/graph/uninstall + chat/sessions + 参数解析
   render.py        # 终端渲染管线（流式 / 分级着色 / 节点阶段展示）
   session/
-    __init__.py    # 会话生命周期：新建 / 恢复 / 结束
-    chat.py        # 会话循环：读入用户消息、中断与退出语义、会话级渲染
+    __init__.py    # 会话层说明（模块分工与口径指针）
+    chat.py        # 会话循环：读入用户消息、编排路由、驱动工作流、中断与退出语义、会话档案与会话总报告
     orchestrator.py# 编排/路由节点：用户消息 → 意图与轮次参数（结构化）→ 选择下一节点 → 汇报渲染
     memory.py      # 三 Agent 各自的追加式记忆（落盘 / 载入 / 阈值压缩）
-    state.py       # 会话态 schema（跨轮的会话状态）与快照
+    state.py       # 会话态 schema、会话号与目录、会话档案读写与列表
   workflow/
     graph.py       # StateGraph 组装与条件路由（框架类型不外泄）
     state.py       # 状态 schema（数据化）与快照读写
@@ -190,6 +190,7 @@ flowchart TD
 | `parallel_review` | bool | 是否并行双视角审查（`--parallel-review`；汇合形态见 §12.2） | engine |
 | `session_id` | str? | 所属会话号（会话轮次写入；`crw run` 一次性运行为空） | engine（初始化） |
 | `round_index` | int? | 会话内轮次序号（从 1 起；非会话运行为空） | engine（初始化） |
+| `version_base` | int | 本次运行的起始版本号（一次性运行恒为 1；会话轮次跨轮连续递增，见 §4.7） | engine（初始化） |
 | `current_version_dir` | str | 最新版本目录路径（`workspace/code_vN/`） | engine（物化）/ encode / fix |
 | `version_files` | list[str] | 当前版本内的文件清单（版本内相对路径，posix 风格；节点构造任务提示词用，节点不接触文件） | engine（物化）/ encode / fix |
 | `findings` | list[Finding] | 最新一轮审查结论 | review / 汇合 |
@@ -211,12 +212,20 @@ Finding：
 
 `id` 由契约校验层按序生成（`f-1`、`f-2`…）并随 `review_N.json` 落盘（供修复逐条对应）；`location` 为**版本内相对路径**加行号（如 `parser.py:18`、`pkg/util.py:7`）。
 
+**瞬态键**（声明在状态 schema 内、不进 `PERSISTED_FIELDS`，只在图执行期间可见）：
+
+- `findings_correctness` / `findings_security`：并行双视角的两个分支结论（§12.2）；
+- `prior_files`：会话轮次的编码上下文（`路径 → 内容`，来自上一版本，见 §4.7）——编码节点
+  把它内联进任务提示词；因为它要进提示词，走状态而不是"从磁盘读"（节点不接触文件）；
+- `agent_memory`：三 Agent 各自的会话记忆（`agent → [{"role","text"}]`，见 §4.7）——各节点
+  把它作为**历史消息**交给运行时。
+
 ### 4.4 分支与循环语义
 
 - **干净判定**：本轮 findings 中【严重】数为 0（`--strict`：严重与一般均为 0）。
-- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为硬闸，防止误填大值造成无界循环与无界调用费用（默认 3、封顶 10 时最坏约 22 次模型调用）。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1；`--strict` 下残留可能全部由【一般】构成，故报告与终端文案统一写"阻塞问题"，"残留严重数"列仍只数【严重】）。engine 在图调用处显式设置 `recursion_limit` 作崩溃护栏（**默认串行图**为 `2 × max_iter + 8`，并行双视角形态按 `3 × max_iter + 8` 复算，见 §12.2——护栏是崩溃保护，不是预算），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 阶段摘要、report.md 与 `crw show` 均标注"未收敛"，但**不提前中止**（标注已落地）。
-- **轮次模式**：`up-to`（默认）= 至多 n 轮修复、任一复审干净即早退（首审干净则不进入修复）；`exact` = 固定跑满 n 轮修复 + n+1 次审查，即使中途干净也继续（"精益求精"场景）。两种模式**结尾恒为一次审查**，因此不存在"已修复但未审查"的收尾状态；`exact` 下若某轮修复与上版逐字节相同，按 §4.2 标注"本轮未产生改动"后继续。
-- **轮次取值来源与优先级**：命令行 `--max-iter`/`--rounds-mode`（显式）> 本次用户消息的结构化提取值（会话模式，§5.4）> 配置默认（`~/.crw/settings.json`，§8.3）> 内置 3 / `up-to`；全部受硬上限约束，来源记入 `max_iterations_source`。越界语义分开：**命令行越界 = 参数错误（退出码 2）**；**消息提取值越界 = 夹到上限执行并在报告与时间线标注**（那是意图理解）。
+- **循环**：每轮 = 修复 + 复审；`--max-iter` 为**0–10 的整数**（用户运行时指定）：默认 3；0 = 只审不修（首审不干净即残留，退出码 1）；负数 / 非整数 / 超过 10 为参数错误（退出码 2）。上限 10 为**命令行的误填防护**（默认 3、封顶 10 时最坏约 2×10 次修复/审查调用）；配置默认与会话消息提取走的是 `settings.rounds.limit`（默认 10、天花板 20，§8.3）——它们由配置界面显式设置、不是手滑输入，代价上限（每轮 1 次修复 + 1 次审查）在设置时可见。两条路径的护栏都由同一套机制兜底：`recursion_limit` 按实际轮次复算（`2n + 8`），达限即收尾。n 轮修复最多产生 n+1 次审查；达限仍未干净 → 以残留清单收尾（状态 residual，退出码 1；`--strict` 下残留可能全部由【一般】构成，故报告与终端文案统一写"阻塞问题"，"残留严重数"列仍只数【严重】）。engine 在图调用处显式设置 `recursion_limit` 作崩溃护栏（**默认串行图**为 `2 × max_iter + 8`，并行双视角形态按 `3 × max_iter + 8` 复算，见 §12.2——护栏是崩溃保护，不是预算），框架递归错误翻译为可读运行失败。同轮 findings 与上轮完全相同（location + issue 集合一致）→ 阶段摘要、report.md 与 `crw show` 均标注"未收敛"，但**不提前中止**（标注已落地）。
+- **轮次模式**：`up-to`（默认）= 至多 n 轮修复、任一复审干净即早退（首审干净则不进入修复）；`exact` = 固定跑满 n 轮修复 + n+1 次审查，即使中途干净也继续（"精益求精"场景）。两种模式**结尾恒为一次审查**，因此不存在"已修复但未审查"的收尾状态；`exact` 下若某轮修复与上版逐字节相同，按 §4.2 标注"本轮未产生改动"后继续。实现口径：条件边**先判达限、再判干净**（`exact` 下干净不停），`exact` 且本轮审查干净时修复按"复核改进"任务下发（无问题可改也要给出完整版本）。
+- **轮次取值来源与优先级**：命令行 `--max-iter`/`--rounds-mode`（显式）> 本次用户消息的结构化提取值（会话模式，§5.4）> 配置默认（`~/.crw/settings.json`，§8.3）> 内置 3 / `up-to`；全部受硬上限约束，来源记入 `max_iterations_source`。会话模式的当前设置（`session.json` 的 `settings`）插在"消息提取"之后参与后续轮次，**其自身来源沿用记录值**（cli / requirement / config / default——上一轮从消息里提取到的轮次会以 `requirement` 来源继续生效，直到被新的消息或命令行改变）。越界语义分开：**命令行越界 = 参数错误（退出码 2）**；**消息提取值越界 = 夹到上限执行并在报告与时间线标注**（那是意图理解）。
 - **早退**：`up-to` 模式下首轮审查即干净 → 直接收尾，不进入修复。
 - **输入模式**：代码文件输入跳过 encode，其余流程一致。
 - **续跑**：`crw resume <运行号>` 仅当父运行存在 `current_version_dir`（旧单文件格式记录除外——给一行可读提示 + 退出码 2）时可用（否则可读错误，退出码 2）；把父运行最新版本目录复制为新运行 `workspace/code_v1/`（`input.kind=file`，源记 `input.source_path`），`parent_run_id` 写入状态；`--max-iter`/`--rounds-mode`/`--strict`/`--no-exec` 由本次命令行决定，未显式给出的轮次设置**继承父运行**（来源标 `parent`），无父设置时退回配置默认；父运行的 `--strict` 与审查形态（`--parallel-review`）一并继承——续跑是"接着修"，换判定标准或换审查方式会让结论不可比；`--no-exec` 例外（它不进状态快照，命令面无法区分"显式关闭"与"从未设置"，故按未设置处理）。新运行轮次从 `review_round=1`/`fix_rounds=0` 重新计数；报告标注父运行与父残留摘要。
@@ -260,21 +269,38 @@ Finding：
 ~/.crw/
 ├── runs/<run_id>/                     # 一次性运行（crw run）——格式同 §4.5
 └── sessions/<session_id>/             # 一次会话（crw chat）
-    ├── session.json                   # 会话档案：轮次链（run_id 列表）、当前设置、记忆文件索引
+    ├── session.json                   # 会话档案：轮次链（run_id 列表）、当前轮次设置、记忆文件索引
     ├── session.md                     # 会话总报告：各轮摘要与结论演进（人读，供演示与复盘）
     ├── memory/<agent>.jsonl           # encoder / reviewer / fixer 各自的独立记忆（追加式）
     └── rounds/
         └── round-<i>/                 # 每轮 = 一条完整运行记录（report.md / state.json / log.jsonl / workspace/）
 ```
 
+- `session.json` 字段：`session_id` / `created_at` / `updated_at` / `status`（active / ended）/ `input`（起始输入）/ `settings`（当前轮次设置：max_iterations、max_iterations_source、rounds_mode、strict）/ `model` / `rounds`（轮次链：每轮一条，含 index、run_id、intent、message 预览、created_at / finished_at、status、conclusion、rounds_mode、max_iterations(_source)、note、version、review_round、fix_rounds）/ `memory`（记忆索引：agent → `memory/<agent>.jsonl`）/ `current_version_dir` / `current_version` / `version_files`。
 - 会话号 `s-YYYYMMDD-` + 4 位小写十六进制；运行号仍为 `r-YYYYMMDD-` + 4 位，**全局唯一**，按运行号在
-  `runs/` 与 `sessions/*/rounds/` 两处查找（`crw show` / `crw resume` 对两处一致可用）。
+  `runs/` 与 `sessions/*/rounds/` 两处查找（`crw show` / `crw resume` 对两处一致可用；
+  轮次目录按 `round-<i>` 命名，故会话侧按 `state.json` 里的 `run_id` 匹配；`state.json`
+  不可读的降级记录可用 `<会话号>/round-<i>` 引用）。
 - 每轮记录与 `crw run` **同构**：同一套 state/log/report/workspace 代码，仅父目录不同，且 `state.json` 多
-  `session_id` / `round_index` 两个字段；`crw runs` 扫两处并多一列"会话"。
-- **代码版本号跨轮连续递增**（`code_v1/` → `code_v2/` …）：会话内是同一份代码在演进，报告里的"第几版"始终指向同一文件。
-- 记忆文件每行一条消息（角色 / 文本 / 时间 / 来源轮次），**只追加、不改写**（对供应商前缀缓存友好）；压缩时追加一条
-  `{"kind": "compaction", …}` 记录并保留旧行于磁盘（仅不再参与后续请求）。
-- 会话结束写 `session.md`（各轮结论演进 + 最终状态 + 剩余建议）；`crw uninstall` 的清理范围包含 `sessions/`。
+  `session_id` / `round_index` / `version_base` 三个字段；`crw runs` 扫两处并在末列多一列"会话"。
+  `status` 增 `interrupted`：会话轮次被中断记 `interrupted`（一次性运行按 §4.6 记 `failed` +
+  `error.node="interrupt"`）。
+- **代码版本号跨轮连续递增**：会话档案记 `current_version`，下一轮把 `version_base` 设为它 + 1；
+  该轮的第一个版本目录（编码产物，或"只审查 / 再修一轮"时从上一版本复制来的起始版本）即 `code_v<该号>/`，
+  其后的修复依次 +1。会话内是同一份代码在演进，报告里的"第几版"在会话内始终指向同一份代码。
+  "只审查 / 再修一轮"轮次把上一轮的最新版本**复制**为本轮起始版本（与 `resume` 同口径）；
+  编码轮次不复制——新版本由编码输出定义，既有实现以 `prior_files` 内联进编码任务提示词
+  （编码节点无工具），供"按新需求修改"。
+- 记忆文件每行一条消息（角色 / 文本 / 时间 / 来源轮次），**只追加、不改写**（对供应商前缀缓存友好）。
+  记忆内容 = 各 Agent 在本次会话各轮的**结构化摘要**（任务要点 + 阶段摘要），由会话层从运行状态生成：
+  不含代码（代码在产物文件里，是唯一真相）、不含思考内容、不落模型原文。
+  下一轮把该 Agent 的有效记忆作为**历史消息**（system 之后的 user/assistant 序列）交给运行时——
+  追加式前缀逐轮稳定，供应商的上下文缓存因此可以命中已发送部分；空记忆（一次性运行）时行为与 M3 一致。
+- **压缩**：记忆的有效内容估算接近预算（阈值 = 70% × `CRW_MAX_CONTEXT_TOKENS`）时做一次**显式压缩**——
+  追加一条 `{"kind": "compaction", …}` 记录（把较早的行按来源轮次折叠成一段摘要）并把最近若干条
+  有效行原文续写在压缩行之后；旧行完整留盘、仅不再参与后续请求（追加式"快照 + 尾行"）。
+  压缩不调用模型（确定性折叠，省一次调用且可复核），被折叠的结论仍以摘要形式抵达模型。
+- 会话结束写 `session.md`（各轮结论演进 + 剩余建议 + 记忆索引 + 最终状态）；`crw uninstall` 的清理范围包含 `sessions/`。
 
 ## 5. Agent 协作机制
 
@@ -336,10 +362,16 @@ Finding：
   `review_fix` = 不改需求、从审查起步跑"审查→修复"循环（如"再检查一轮"）；`ask` = 提问或需澄清 → **不启动工作流**，直接回答 / 反问。
 - **校验规则**：`intent` 必须为枚举值；`ask` 必须给出 `reply`；`rounds` 缺省 = 用配置默认，取值受硬上限约束并**夹取而非报错**并经报告标注
   （意图理解 ≠ 用户显式参数，见 §4.4）；`rounds_mode` 缺省 `up-to`；未知字段忽略并原样保留。
-- **优先级**：命令行显式 `--max-iter` / `--rounds-mode` > 本次消息的结构化提取值 > 配置默认 > 内置 3 / `up-to`；
+  输出无法解析 / 校验不过时**携原因重试一次**，仍失败按 `ask` 反问（给出标准澄清问句 + 标注）。
+- **优先级**：命令行显式 `--max-iter` / `--rounds-mode` > 本次消息的结构化提取值 > 会话当前设置 > 配置默认 > 内置 3 / `up-to`；
   来源写入 `state.json` 的 `max_iterations_source`。
 - **路由兜底**：分不清意图时**一律按 `ask` 反问用户**（不静默挑一条路）；`ask` 分支不产生运行记录。
+  会话里还没有代码版本时的 `review` / `review_fix` 同理：给可读提示、不启动工作流。
 - **单口约束**：会话中只有编排节点与用户对话；三 Agent 不直接面向用户，其产出经结构化契约与状态进入汇报。
+- **每轮汇报从结构化状态渲染**：轮次使用情况（审查 / 修复轮数、上限与来源）、结论句（`engine.conclusion_text` 同源）、
+  代码版本、`next_action` 与运行记录路径——不由模型复述（模型只负责"本条消息按什么处理"的回复）。
+- **缓存友好**：编排节点的系统提示词是常量（会话现状与本次消息都在用户消息里），会话现状含已进行的轮次数、
+  当前版本与文件清单、上一轮结论。
 
 ## 6. 复用策略（与前作 code-review-agent）
 
@@ -415,7 +447,8 @@ crw --version                             # 版本号
 
 `crw run` 选项：`-f, --file <文件>`、`--max-iter <n>`（默认 3，取值 0–10）、`--rounds-mode {up-to,exact}`、`--strict`、`--no-exec`、`--parallel-review`、`--out <目录>`、`--model / --provider`、`--thinking <挡位|off>`（快捷切换思考挡位，可与 `--model/--provider` 同用；只认内置等级表，表外名称 = 参数错误并列出可用挡位）、`--no-stream`。
 `--parallel-review` = 并行双视角审查（正确性 + 安全性同轮审查、汇合去重，§12.2）；显式开关，默认关闭（**用户裁决 2026-10-14 确认维持默认关闭**）——开启后每轮审查的调用量约翻倍。`crw graph --parallel-review` 导出该形态的图。
-`crw chat` 选项：`-f, --file <文件>`（以既有代码开始会话）、`--resume <会话号>`、`--max-iter`、`--rounds-mode`、`--strict`、`--no-exec`、`--model / --provider`、`--no-stream`。
+`crw chat` 选项：`-f, --file <文件>`（以既有代码开始会话，与 `--resume` 二选一）、`--resume <会话号>`、`--max-iter`、`--rounds-mode`、`--strict`、`--no-exec`、`--model / --provider`、`--thinking <挡位|off>`、`--no-stream`（`--parallel-review` 不在会话内提供，见 §12.3）。
+`crw resume` 与 `crw chat` 的 `-f` 语义：`-f` 只用于「会话首轮以既有代码起步」，`--resume` 的起点由会话档案决定。
 `crw review` 选项：`-o, --out <文件>`（Markdown 报告）、`--json`（结构化输出）、`--no-exec`、`--model / --provider`、`--thinking <挡位|off>`。
 
 补充约定：
@@ -424,8 +457,10 @@ crw --version                             # 版本号
 - `crw resume` 选项：`--max-iter` / `--rounds-mode` / `--strict` / `--no-exec` / `--out` / `--model` / `--provider` / `--no-stream`（`-f` 不适用）；未显式给出的轮次设置继承父运行。
 - `crw chat`：进入会话模式（§4.7）；用户消息由编排节点解释为 `code | review | review_fix | ask`（§5.4）；**单口对话**（仅编排节点面向用户）；
   中断语义：**Ctrl+C 一次 = 中断本轮**（本轮落盘 `status=interrupted`、回提示符、会话保留），**两次 = 退出会话**；`/exit` 与 EOF 为正常退出；
-  每轮结束汇报含结构化 `next_action`（done / review_again / fix_again）与"轮次使用情况"；`--resume <会话号>` 恢复记忆、代码版本与轮次设置。
-- `crw runs` 输出列：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型（含思考挡位口径）。
+  每轮结束汇报含结构化 `next_action`（done / review_again / fix_again）与「轮次使用情况」；`--resume <会话号>` 恢复记忆、代码版本与轮次设置。
+  会话轮次设置：命令行显式 > 消息提取（越界夹到 `settings.rounds.limit` 并标注）> 会话当前设置 > 配置默认 > 内置；`/exit`、`exit`、EOF 与提示符处 Ctrl+C 均为正常退出；会话结束写 `session.md` 并打印会话目录。
+- `crw runs` 输出列：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型（含思考挡位口径）| 会话（非会话运行为 `—`）。
+- `crw sessions` 输出列：会话号 | 时间 | 轮次数 | 最后状态（最后状态取**最后一轮的运行状态**；`session.json` 不可读时按降级口径显示）。
 - `crw show` 输出：运行摘要 / 时间线（含每节点的工具调用数与工具调用明细）/ 逐轮 findings 表（含"未收敛"标注与逐条处置）/ 产物路径 /（失败或中断时）错误与"已中断"标注（陈旧 running 标注"可能已中断"）；摘要数据取自 `state.json`（损坏时**降级展示** `log.jsonl` 摘要 + 产物清单，并在 stdout 与 stderr 各给一行说明），逐轮表数据来源 = `workspace/review_*.json`。
 - `crw show` 的"记录损坏"口径（定稿）：**降级展示照给，退出码照实为 2**——人读仍拿得到可用信息，脚本化消费能察觉异常。
 - `crw graph`：输出规范化 mermaid（`__start__`/END 映射为可读标签、条件边标签中文映射）；与实现的一致性核对以节点/边集合快照测试为准（§4.1 为概念图）。
@@ -451,7 +486,7 @@ crw --version                             # 版本号
 - `report.md`：§4.5 报告结构。
 - `review_N.json`：schema = §5.2 契约对象（含顶层 `files` 清单；并行双视角时是汇合结果）；`review_N_<视角>.json`：并行双视角各分支的原始结论（同一 schema）；`fixes_N.json`：该轮处置包装对象 `{round, code_file, fixes, unknown_ids}`（供报告与 `crw show` 的"问题 ← 处置"对照，与 §5.2 的模型输出契约区分）；二者均原子写（同 `.tmp` + 替换）；落盘顺序固定：产物（code / fixes / review）先、`state.json` 后（防状态引用未落盘的结论）。
 - 写入与自检：临时文件 `.<名称>.tmp` + `os.replace` 原子替换（POSIX 尽力 0600）；列表 / 加载忽略 `*.tmp` 与非目录项；运行目录名白名单校验（`r-` 前缀，防路径穿越）；`log.jsonl` 读取时跳过最后一条不完整行、`detail` 只存截断预览（约 400 字符）；`state.json` 在每个节点结束与失败时各原子写一次（引入并行分支后改为图超级步边界，同一超级步只写一次）；`state.json` 损坏时 `crw show` 降级展示 `log.jsonl` 摘要 + 产物清单 + 可读提示；`status=running` 且长时间无更新（判据 = `max(mtime(state.json), mtime(log.jsonl))` 超过 30 分钟；log 逐事件 append + flush）→ 列表 / 展示标注"可能已中断"（不自动改状态）。
-- 会话相关：`session.json`（会话档案）/ `session.md`（会话总报告）/ `memory/<agent>.jsonl`（按 Agent 记忆）见 §4.7；会话轮次的 `state.json` 额外含 `session_id` / `round_index`；`status` 增 `interrupted`（被中断的本轮，`error.node="interrupt"`）；`crw runs` 跨 `runs/` 与 `sessions/*/rounds/` 两处聚合，会话列取自 `session_id`。
+- 会话相关：`session.json`（会话档案）/ `session.md`（会话总报告）/ `memory/<agent>.jsonl`（按 Agent 记忆）见 §4.7；会话轮次目录名是 `round-<i>`（运行号在 `state.json` 的 `run_id` 里），按运行号查找跨两处扫描；会话轮次的 `state.json` 额外含 `session_id` / `round_index` / `version_base`；`status` 增 `interrupted`（被中断的本轮，`error.node="interrupt"`）；`crw runs` 跨 `runs/` 与 `sessions/*/rounds/` 两处聚合，会话列取自 `session_id`；`state.json` 不可读的会话轮次在列表里以 `<会话号>/round-<i>` 标识，`crw show` 也接受该引用（降级展示照给、退出码照实为 2）。
 - runs 列表降级派生（单条坏记录不拖垮列表页）：修复轮数 = `state.fix_rounds` → workspace 中 `code_v*.py` 数 − 1 → "?"；残留严重数 = `state.findings` 计数 → 最新可解析 `review_N.json` 计数 → "?"；状态 = `state.status` → `log.jsonl` 末条 event 推断 → unknown。
 
 ### 8.3 配置文件与变量
@@ -503,7 +538,7 @@ crw --version                             # 版本号
   预配置过这个挡位（"切换时临时指定"正是它的用法）；表外名称 → 参数错误（退出码 2，并列出可用挡位），不静默夹取。
 - **思考内容不回传**（D12 的口径扩展到一次性运行）：推理文本不显示、不入库、不进日志；若某供应商要求工具循环中
   回传 reasoning 才能继续，则回传但同样不显示、不入库（实现轮以锁定版本实测为准并记入 PROGRESS）。
-- `~/.crw/settings.json`：**运行默认值**（与"仅供应商"的 `models.json` 分工）——当前仅 `rounds`：`{"rounds": {"default": 3, "limit": 10}}`；由 `crw config` 维护（交互菜单：默认修复轮次 / 轮次上限）；写入原子替换。校验：二者均为整数且 `0 ≤ default ≤ limit ≤ 20`（**20 = 代码内绝对天花板**，改动须评审，防"把上限改到无界"）；违规按配置错误处理（退出码 2）并给出修复指引。轮次取值优先级见 §4.4。
+- `~/.crw/settings.json`：**运行默认值**（与"仅供应商"的 `models.json` 分工）——当前仅 `rounds`：`{"rounds": {"default": 3, "limit": 10}}`；由 `crw config` 维护（交互菜单 7) 默认修复轮次 / 8) 轮次上限，菜单顶部回显当前值）；写入原子替换。校验：给出 `rounds` 就必须给全两个整数键、且 `0 ≤ default ≤ limit ≤ 20`（**20 = 代码内绝对天花板**，改动须评审，防"把上限改到无界"）；违规按配置错误处理（退出码 2）并给出修复指引，不静默夹取。语义：`default` 是命令行与消息都未指定时的轮次取值（来源记 `config`；未配置该文件时退回内置 3、来源记 `default`）；`limit` 是**会话内消息提取值的夹取上限**（命令行 `--max-iter` 仍受 §8.1 的 0–10 硬闸约束）。轮次取值优先级见 §4.4。
 - `crw config test`：逐供应商 `max_tokens=1` 探测（OK / 401 / 超时）；短超时 + 不重试（自检语义是快速反馈）。
 
 ### 8.4 其他约定
@@ -615,3 +650,5 @@ crw --version                             # 版本号
 > **出池记录（2026-10-13，用户点定）**：**编码 Agent 的多文件产出**已立项（规格见 §4.2.2）；
 > **模型级思考挡位配置**已立项（规格见 §8.3）——两项合并为 **M3.5 优化轮**，插在 M4 之前；原"多文件工作流与多语言审查扩展"
 > 条目保留在池内（那是工作流/审查面的语言扩展，与本轮的"编码产物版本化形态"是两件事）。
+>
+> **出池记录（2026-10-14）**：**会话模式**已落地（M4：`crw chat` / `crw sessions` / `--rounds-mode` /`settings.json` 轮次默认值与上限 / 会话目录与会话总报告 / 三 Agent 各自记忆与阈值压缩，实现口径见 §4.7 / §5.4 / §8.1 / §8.3）；**会话内的并行审查**保留在池内（会话层已就绪，作为后续评估项）。

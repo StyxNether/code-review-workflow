@@ -597,6 +597,7 @@ def test_runs_lists_the_designed_columns(
         "修复轮数",
         "残留严重数",
         "模型",
+        "会话",
     ]
     assert any("写一个计算器" in line for line in lines[1:])  # 数据行（不依赖表头 / 分隔行序）
 

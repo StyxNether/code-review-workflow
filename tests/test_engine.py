@@ -82,7 +82,7 @@ def failing_node(
     return node
 
 
-def _raise_file_exists(run_id: str) -> Path:
+def _raise_file_exists(run_id: str, *, parent: Path | None = None) -> Path:
     """模拟"目标目录已存在但不是运行目录"（如数据目录位置被文件占用）。"""
     raise FileExistsError(183, "Cannot create a file when that file already exists")
 
@@ -798,7 +798,7 @@ def test_run_directory_creation_failure_is_readable(
     fixed_clock: Callable[[], str],
     run_id_sequence: Callable[[], str],
 ) -> None:
-    def broken_create(run_id: str) -> Path:
+    def broken_create(run_id: str, *, parent: Path | None = None) -> Path:
         raise OSError("磁盘只读")
 
     monkeypatch.setattr(records, "create_run_dir", broken_create)

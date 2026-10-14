@@ -25,6 +25,15 @@ from . import state as state_mod
 #: 运行号直接拼进路径，白名单（而非仅剥离分隔符）使任何合法编号都只能是单个路径成分。
 RUN_ID_PATTERN = re.compile(r"^r-[0-9]{8}-[0-9a-f]{4}$")
 
+#: 会话号与轮次目录名白名单（Design §4.7）：本层只扫这两级目录，同样走白名单防穿越。
+#: 会话号格式与 ``session.state`` 同源，此处独立声明——扫描方必须自己校验看到的名字，
+#: 不依赖上游生成器"应该只产出合法名"。
+SESSION_ID_PATTERN = re.compile(r"^s-[0-9]{8}-[0-9a-f]{4}$")
+ROUND_DIR_PATTERN = re.compile(r"^round-[0-9]+$")
+
+#: 降级记录的展示引用形式：``<会话号>/round-<i>``（state.json 不可读时没有运行号可用）
+_SESSION_ROUND_REF = re.compile(r"^(s-[0-9]{8}-[0-9a-f]{4})/(round-[0-9]+)$")
+
 #: 序号选择输入：仅 ASCII 十进制正整数（``0`` / 负数 / ``＋1`` 等一律视为取消）。
 _INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
@@ -62,6 +71,8 @@ class RunSummary:
     """``status=running`` 且长时间无更新：可能已中断（Design §8.2，只标注不改状态）。"""
     model: str = ""
     """本次运行的模型标识（``供应商/模型名（思考：…）``口径，Design §8.3 的回显要求）。"""
+    session_id: str = ""
+    """所属会话号（会话轮次非空，Design §4.7 的 runs 列表「会话」列）。"""
 
 
 @dataclass(frozen=True)
@@ -99,45 +110,130 @@ def runs_root() -> Path:
     return data_dir() / "runs"
 
 
+def sessions_root() -> Path:
+    """会话根目录：``data_dir()/sessions``（会话轮次记录在其下，Design §4.7）。"""
+    return data_dir() / "sessions"
+
+
 def is_valid_run_id(run_id: str) -> bool:
     """运行号是否合法（白名单：格式 + 仅单一路径成分，防路径穿越）。"""
     return bool(RUN_ID_PATTERN.fullmatch(run_id))
 
 
-def run_dir(run_id: str) -> Path:
+def parse_session_round_ref(ref: str) -> tuple[str, str] | None:
+    """``<会话号>/round-<i>`` → ``(会话号, 轮次目录名)``；不是该形态返回 ``None``。
+
+    这是**降级记录**的引用形式：会话轮次目录按 ``round-<i>`` 命名，运行号存在
+    ``state.json`` 里——状态快照不可读时没有运行号可用，展示层据此给一个仍可定位的标识。
+    """
+    match = _SESSION_ROUND_REF.fullmatch(ref)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def run_dir(run_id: str, *, parent: Path | None = None) -> Path:
     """运行号 → 运行目录路径；非法运行号抛 :class:`RunRecordError`。
 
-    会话模式的轮次记录位于 ``sessions/<会话号>/rounds/round-<i>/``（Design §4.7），
-    M4 在此处扩展两处查找；运行号本身全局唯一，记录格式与目录契约保持一致。
+    ``parent`` 用于会话轮次（记录落在 ``sessions/<会话号>/rounds/`` 下的独立目录里）；
+    省略时取 ``runs/``。查找既有记录用 :func:`find_run_dir`（会跨两处扫描）。
     """
     if not is_valid_run_id(run_id):
         raise RunRecordError(
             f"运行号格式非法：{run_id!r}（应为 r-YYYYMMDD-xxxx，xxxx 为 4 位小写十六进制）"
         )
-    return runs_root() / run_id
+    return (parent if parent is not None else runs_root()) / run_id
+
+
+def iter_session_round_dirs() -> list[Path]:
+    """枚举会话轮次记录目录（``sessions/<会话号>/rounds/round-<i>/``）。
+
+    会话目录与轮次目录都走白名单：本函数是"扫描方"，不依赖上游只产出合法名。
+    不可读的目录跳过（坏记录不拖垮列表页，Design §8.2）。
+    """
+    found: list[Path] = []
+    for session_path in _iter_dir(sessions_root()):
+        if not session_path.is_dir() or not SESSION_ID_PATTERN.fullmatch(session_path.name):
+            continue
+        for round_path in _iter_dir(session_path / "rounds"):
+            if round_path.is_dir() and ROUND_DIR_PATTERN.fullmatch(round_path.name):
+                found.append(round_path)
+    return found
+
+
+def find_run_dir(run_id: str) -> Path | None:
+    """按运行号在两处查找记录目录：``runs/<运行号>/`` 与 ``sessions/*/rounds/*/``。
+
+    运行号全局唯一，但目录名不一定等于运行号（会话轮次目录按 ``round-<i>`` 命名），
+    故会话侧按 ``state.json`` 里的 ``run_id`` 匹配。也接受降级引用
+    ``<会话号>/round-<i>``（state.json 不可读的轮次记录）。找不到返回 ``None``。
+    """
+    ref = parse_session_round_ref(run_id)
+    if ref is not None:
+        candidate = sessions_root() / ref[0] / "rounds" / ref[1]
+        return candidate if candidate.is_dir() else None
+    if not is_valid_run_id(run_id):
+        return None
+    direct = runs_root() / run_id
+    if direct.is_dir():
+        return direct
+    for path in iter_session_round_dirs():
+        state = read_state(path)
+        if isinstance(state, Mapping) and str(state.get("run_id") or "") == run_id:
+            return path
+    return None
 
 
 def new_run_id(*, day: str, hex_factory: Callable[[], str] | None = None) -> str:
     """生成运行号 ``r-YYYYMMDD-xxxx``；与既有记录碰撞时重新抽取（Design §4.3）。
+
+    碰撞检查覆盖两处记录（``runs/`` 与会话轮次）：运行号在全局唯一，跨两处重名会让
+    ``crw show`` 无从分辨。
 
     Args:
         day: 日期部分（8 位数字，由调用方从注入时钟截取）。
         hex_factory: 4 位小写十六进制生成器；省略时用 ``secrets.token_hex(2)``（可注入以复现碰撞）。
     """
     generator = hex_factory or (lambda: secrets.token_hex(2))
-    root = runs_root()
+    existing = _existing_run_ids()
     for _ in range(_RUN_ID_ATTEMPTS):
         candidate = f"r-{day}-{generator().lower()}"
         if not is_valid_run_id(candidate):
             raise RunRecordError(f"运行号生成器给出非法编号：{candidate!r}")
-        if not (root / candidate).exists():
+        if candidate not in existing:
             return candidate
     raise RunRecordError("运行号生成失败：连续碰撞次数过多，请检查系统随机源。")
 
 
-def create_run_dir(run_id: str) -> Path:
+def _existing_run_ids() -> set[str]:
+    """两处记录里已占用的运行号集合（**一次**扫描，供候选判重）。
+
+    ``state.json`` 不可读的降级轮次拿不到运行号，无法参与判重——它的运行号本就无从得知，
+    只能靠"降级记录用 <会话号>/round-<i> 引用"的展示口径区分。
+    """
+    ids = {
+        path.name for path in _iter_dir(runs_root()) if path.is_dir() and is_valid_run_id(path.name)
+    }
+    for path in iter_session_round_dirs():
+        state = read_state(path)
+        if isinstance(state, Mapping):
+            value = str(state.get("run_id") or "")
+            if value:
+                ids.add(value)
+    return ids
+
+
+def create_run_dir(run_id: str, *, parent: Path | None = None) -> Path:
     """创建运行目录与工作区；目录已存在抛 ``FileExistsError``（编号碰撞由调用方重试）。"""
-    path = run_dir(run_id)
+    return create_run_dir_at(run_dir(run_id, parent=parent))
+
+
+def create_run_dir_at(path: Path) -> Path:
+    """在指定目录创建一条运行记录（会话轮次按 ``round-<i>`` 命名，Design §4.7）。
+
+    目录已存在即抛 ``FileExistsError``：既有轮次记录不得被覆盖（运行号进不去目录名，
+    重试换号解决不了这个问题，故由调用方按可读错误处理）。
+    """
     path.mkdir(parents=True, exist_ok=False)
     (path / "workspace").mkdir()
     return path
@@ -286,28 +382,43 @@ def is_legacy_record(state: Mapping[str, Any]) -> bool:
 def list_runs(*, root: Path | None = None) -> list[RunSummary]:
     """列出运行记录（按开始时间倒序）；非目录项 / 非法名称 / 临时文件一律忽略。
 
+    默认跨两处聚合（Design §4.7）：``runs/`` 与 ``sessions/*/rounds/round-*/``；给出
+    ``root`` 时只扫该目录（测试与"只看一次性运行"的调用方用）。
     单条记录损坏不拖垮列表页：缺失字段按 Design §8.2 的降级派生链回退
     （修复轮数 → 工作区版本文件数；残留严重数 → 最新可解析审查结论；状态 → 日志末条事件）。
     """
-    directory = root if root is not None else runs_root()
-    summaries = [
-        _summarize(path)
-        for path in _iter_dir(directory)
-        if path.is_dir() and is_valid_run_id(path.name)
-    ]
+    if root is not None:
+        paths = [path for path in _iter_dir(root) if path.is_dir() and is_valid_run_id(path.name)]
+    else:
+        paths = [
+            path for path in _iter_dir(runs_root()) if path.is_dir() and is_valid_run_id(path.name)
+        ]
+        paths.extend(iter_session_round_dirs())
+    summaries = [_summarize(path) for path in paths]
     summaries.sort(key=lambda item: (item.created_at, item.run_id), reverse=True)
     return summaries
 
 
-def load_detail(run_id: str) -> RunDetail:
-    """按运行号加载完整记录；名称非法 / 记录不存在抛 :class:`RunRecordError`。
+def is_valid_run_ref(run_id: str) -> bool:
+    """是否是可定位的记录引用：运行号本身，或降级形态的 ``<会话号>/round-<i>``。"""
+    return is_valid_run_id(run_id) or parse_session_round_ref(run_id) is not None
 
-    ``state.json`` 损坏时**降级返回**（Design §8.2）：摘要与时间线改由 ``log.jsonl`` 与
-    产物清单派生，``degraded`` 置真并附可读原因——记录坏了不代表这一条运行不可查，
-    命令面据此提示并按"记录损坏"给退出码（Design §8.1 的 ``crw show`` 行）。
+
+def load_detail(run_id: str) -> RunDetail:
+    """按运行号加载完整记录；引用非法 / 记录不存在抛 :class:`RunRecordError`。
+
+    查找跨两处记录（``runs/`` 与会话轮次，Design §4.7）。``state.json`` 损坏时**降级
+    返回**（Design §8.2）：摘要与时间线改由 ``log.jsonl`` 与产物清单派生，``degraded``
+    置真并附可读原因——记录坏了不代表这一条运行不可查，命令面据此提示并按"记录损坏"
+    给退出码（Design §8.1 的 ``crw show`` 行）。
     """
-    path = run_dir(run_id)
-    if not path.is_dir():
+    if not is_valid_run_ref(run_id):
+        raise RunRecordError(
+            f"运行号格式非法：{run_id!r}（应为 r-YYYYMMDD-xxxx，xxxx 为 4 位小写十六进制；"
+            "会话轮次记录可用 <会话号>/round-<i> 引用）"
+        )
+    path = find_run_dir(run_id)
+    if path is None:
         raise RunRecordError(f"运行记录不存在：{run_id}（可用 crw runs 查看现有记录）")
     state = read_state(path)
     summary = _summarize(path)
@@ -382,8 +493,13 @@ def is_stale_running(
 
 
 def _summarize(path: Path) -> RunSummary:
-    """单条运行的摘要（含降级派生）；不抛异常——坏记录也要能在列表页出现。"""
+    """单条运行的摘要（含降级派生）；不抛异常——坏记录也要能在列表页出现。
+
+    会话轮次的运行号取自 ``state.json``（目录名是 ``round-<i>``）；状态快照不可读时
+    用 ``<会话号>/round-<i>`` 作展示标识（仍可被 ``crw show`` 定位，Design §8.2 的降级口径）。
+    """
     state = read_state(path)
+    session_id = _state_str(state, "session_id") or _session_of(path)
     created_at = _state_str(state, "created_at") or _mtime_text(path)
     input_descriptor = state.get("input") if state else None
     input_summary = (
@@ -401,8 +517,9 @@ def _summarize(path: Path) -> RunSummary:
         residual = contracts.residual_severe(findings)
     else:
         residual = _latest_review_severe(path)
+    run_id = _display_run_id(path, state, session_id)
     return RunSummary(
-        run_id=path.name,
+        run_id=run_id,
         created_at=created_at,
         input_summary=input_summary,
         status=status,
@@ -411,7 +528,32 @@ def _summarize(path: Path) -> RunSummary:
         path=path,
         stale=is_stale_running(state, path),
         model=_state_str(state, "model"),
+        session_id=session_id,
     )
+
+
+def _display_run_id(path: Path, state: Mapping[str, Any] | None, session_id: str) -> str:
+    """列表 / 详情的展示标识（降级口径，Design §8.2）。
+
+    正常记录取 ``state.json`` 里的运行号；会话轮次目录名是 ``round-<i>``，状态快照不可读时
+    用 ``<会话号>/round-<i>`` 作标识（``crw show`` 也能按它定位）；一次性运行的目录名就是
+    运行号。
+    """
+    run_id = _state_str(state, "run_id")
+    if run_id:
+        return run_id
+    if is_valid_run_id(path.name):
+        return path.name
+    if session_id:
+        return f"{session_id}/{path.name}"
+    return path.name
+
+
+def _session_of(path: Path) -> str:
+    """记录目录所属的会话号（``.../sessions/<会话号>/rounds/round-<i>``）；非会话记录返回空串。"""
+    if path.parent.name == "rounds" and SESSION_ID_PATTERN.fullmatch(path.parent.parent.name):
+        return path.parent.parent.name
+    return ""
 
 
 def _infer_status(path: Path) -> str:

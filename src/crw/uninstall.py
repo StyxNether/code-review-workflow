@@ -266,7 +266,7 @@ def _print_manifest(io: UninstallIO, inventory: Inventory) -> None:
         io.say("  ③ 本程序登记的环境变量：（无登记）")
     io.say(
         f"  ④ 用户数据目录：{_display_path(inventory.data_dir)}"
-        "（含可能带明文 key 的 models.json、runs/ 运行记录、env-vars.json）"
+        "（含可能带明文 key 的 models.json / settings.json、runs/ 运行记录、sessions/ 会话、env-vars.json）"
     )
 
 
@@ -359,7 +359,7 @@ def _run_data_tier(io: UninstallIO, inventory: Inventory) -> bool:
         io.fail(f"出于安全考虑，数据目录删除已跳过：{reason}。")
         io.fail(f"如确需清理，请核对后手工删除：{display}")
         return False
-    prompt = f"删除用户数据目录 {display}（含可能带明文 key 的 models.json、运行记录等）？（y/N）"
+    prompt = f"删除用户数据目录 {display}（含可能带明文 key 的 models.json / settings.json、runs/ 运行记录、sessions/ 会话等）？（y/N）"
     if not _confirmed(io.ask(prompt)):
         io.say(f"已保留用户数据目录：{display}")
         return False

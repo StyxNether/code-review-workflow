@@ -633,3 +633,40 @@ def requirement_input_with_clean_reviews(
             script.append(ai_tool_call("read_file", path="code_v1/main.py"))
         script.append(ai_text(review_fence([], "未发现问题。")))
     return script
+
+
+# ---- 会话模式的脚本片段（编排节点 + 审查轮次；Design §5.4 / §4.7）----
+
+
+def orchestrator_reply(
+    intent: str,
+    *,
+    rounds: int | None = None,
+    rounds_mode: str | None = None,
+    reply: str = "好的。",
+) -> AIMessage:
+    """编排节点的响应：一个合法的 JSON 围栏（意图 + 可选的轮次参数）。"""
+    payload: dict[str, Any] = {"intent": intent, "reply": reply}
+    if rounds is not None:
+        payload["rounds"] = rounds
+    if rounds_mode is not None:
+        payload["rounds_mode"] = rounds_mode
+    return ai_text("```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```\n")
+
+
+def clean_review_calls(name: str = "main.py", *, version: int = 1) -> list[Any]:
+    """审查轮次：读文件后报无问题（干净）。"""
+    return [
+        ai_tool_call("read_file", path=f"code_v{version}/{name}"),
+        ai_text(review_fence([], "已读取完整文件，未发现阻塞问题。", files=[name])),
+    ]
+
+
+def dirty_review_calls(
+    name: str = "main.py", *, version: int = 1, issue: str = "缺少除零处理"
+) -> list[Any]:
+    """审查轮次：读文件后报一条【严重】。"""
+    return [
+        ai_tool_call("read_file", path=f"code_v{version}/{name}"),
+        ai_text(review_fence([finding(location=f"{name}:1", issue=issue)], files=[name])),
+    ]
