@@ -1588,7 +1588,8 @@ def _usage_section(state: Mapping[str, Any]) -> list[str]:
     lines = ["## Token 用量", "", f"| {' | '.join(_USAGE_HEADER)} |", _USAGE_DIVIDER]
     for node, record in by_node.items():
         cells = usage_mod.cells(usage_mod.merge(usage_mod.empty(), record))
-        lines.append("| " + " | ".join([node_label(node), *cells]) + " |")
+        # 节点名经 _cell 转义：state.json 是"可能被手工改过"的输入，含 | 或换行的键不得串列
+        lines.append("| " + " | ".join([_cell(node_label(node)), *cells]) + " |")
     lines.append("| " + " | ".join(["**合计**", *usage_mod.cells(totals)]) + " |")
     lines.append("")
     note = usage_mod.note(totals)

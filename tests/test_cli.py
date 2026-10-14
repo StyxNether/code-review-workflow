@@ -1667,3 +1667,25 @@ def test_review_command_hints_when_thinking_dominates_output(
 
     err = capsys.readouterr().err
     assert "[提示] 思考 token 占输出 80%" in err
+
+
+def test_usage_table_escapes_a_poisoned_node_name(
+    configured_provider: Callable[[], dict[str, object]], fake_chat_model: object
+) -> None:
+    """state.json 是"可能被手工改过"的输入：用量表里的节点名不得把表格弄串列。"""
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+    run_dir = records.find_run_dir(run_id)
+    state = dict(records.read_state(run_dir))
+    state["usage"] = {**state["usage"], "evil|node": state["usage"]["encode"]}
+
+    report = engine_mod.build_report(
+        state=state,
+        rounds=records.read_rounds(run_dir),
+        run_dir=run_dir,
+        artifacts=records.run_artifacts(run_dir),
+    )
+
+    rows = [line for line in report.splitlines() if "evil" in line]
+    assert len(rows) == 1
+    assert "evil\\|node" in rows[0]
+    assert rows[0].count(" | ") == 5  # 仍是 6 列：名字里的竖线被转义，不产生新列

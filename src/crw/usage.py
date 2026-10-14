@@ -46,7 +46,9 @@ def empty() -> dict[str, int]:
 
 
 def is_empty(record: Mapping[str, Any]) -> bool:
-    """是否一条未记到任何调用的空账。"""
+    """是否一条未记到任何调用的空账（非映射按空账处理，与 merge / totals 同一口径）。"""
+    if not isinstance(record, Mapping):
+        return True
     return not _as_int(record.get("calls"))
 
 
@@ -251,15 +253,23 @@ def cells(record: Mapping[str, Any]) -> list[str]:
 def note(record: Mapping[str, Any]) -> str:
     """账目本身的缺陷说明（数据不全时给人读的交代）；数据完整返回空串。
 
-    只交代"有多少调用没回报"，不复述表里已有的 token 数。
+    只交代"有多少调用没回报"，不复述表里已有的 token 数。缓存字段的两种形态都要覆盖：
+    完全不回报（供应商没有这个字段）与**部分**回报——后者若不说，报告里就只剩一个
+    没有来由的"未回报"（命中率因此不给数，读数的人会以为整批都没回报）。
     """
     calls = _as_int(record.get("calls"), default=0) or 0
     with_usage = _as_int(record.get("with_usage"), default=0) or 0
+    reported = _as_int(record.get("cache_reported"), default=0) or 0
+    notes: list[str] = []
     if calls and with_usage < calls:
-        return f"其中 {calls - with_usage} 次调用未回报 usage（按未知处理，未计入 token 数）"
-    if with_usage and not _as_int(record.get("cache_reported")):
-        return "该供应商未回报前缀缓存命中数"
-    return ""
+        notes.append(f"其中 {calls - with_usage} 次调用未回报 usage（按未知处理，未计入 token 数）")
+    if with_usage and reported < with_usage:
+        notes.append(
+            "该供应商未回报前缀缓存命中数"
+            if reported == 0
+            else f"其中 {with_usage - reported} 次调用未回报前缀缓存命中数（命中率因此不给数）"
+        )
+    return "；".join(notes)
 
 
 def format_line(record: Mapping[str, Any]) -> str:
@@ -317,6 +327,7 @@ def _as_int(value: Any, *, default: int | None = None) -> int | None:
 
 __all__ = [
     "FIELDS",
+    "THINKING_HINT_SHARE",
     "TOKEN_FIELDS",
     "cache_hit_rate",
     "cells",
@@ -324,10 +335,12 @@ __all__ = [
     "format_line",
     "from_log_events",
     "from_usage_metadata",
+    "hint",
     "is_empty",
     "log_detail",
     "merge",
     "merge_by_node",
     "note",
+    "thinking_share",
     "totals",
 ]

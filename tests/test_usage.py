@@ -248,3 +248,30 @@ def test_thinking_hint_needs_reported_output() -> None:
     assert usage.hint(usage.empty()) == ""
     unknown = usage.from_usage_metadata(None)
     assert usage.thinking_share(unknown) is None
+
+
+def test_is_empty_tolerates_non_mapping() -> None:
+    """非映射（手改过的 state.json / 测试替身返的怪值）按空账处理，不抛 AttributeError。"""
+    assert usage.is_empty(None)  # type: ignore[arg-type]
+    assert usage.is_empty("损坏")  # type: ignore[arg-type]
+    assert usage.is_empty(usage.empty())
+    assert not usage.is_empty(usage.from_usage_metadata({"input_tokens": 1, "output_tokens": 1}))
+
+
+def test_note_covers_partially_reported_cache() -> None:
+    """部分调用回报了缓存字段：note 说清"命中率因此不给数"，不留一个无来由的"未回报"。"""
+    mixed = usage.merge(
+        usage.from_usage_metadata(DEEPSEEY_STYLE),  # 回报缓存
+        usage.from_usage_metadata({"input_tokens": 100, "output_tokens": 5}),  # 未回报缓存
+    )
+    assert usage.note(mixed) == "其中 1 次调用未回报前缀缓存命中数（命中率因此不给数）"
+    assert usage.cache_hit_rate(mixed) is None
+
+    silent = usage.merge(usage.from_usage_metadata(DEEPSEEY_STYLE), usage.from_usage_metadata(None))
+    assert "其中 1 次调用未回报 usage" in usage.note(silent)
+
+    never = usage.merge(
+        usage.from_usage_metadata({"input_tokens": 9, "output_tokens": 1}),
+        usage.from_usage_metadata({"input_tokens": 9, "output_tokens": 1}),
+    )
+    assert usage.note(never) == "该供应商未回报前缀缓存命中数"
