@@ -496,19 +496,49 @@ def _tool_name(item: Any) -> str:
     )
 
 
-def ai_text(text: str, *, finish_reason: str | None = None) -> AIMessage:
-    """文本响应（可带 finish_reason，用于验证长度截断提示）。"""
+def call_usage(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+) -> dict[str, Any]:
+    """LangChain ``usage_metadata`` 形态的构造（供应商回报什么就给什么）。
+
+    ``cached_tokens`` / ``reasoning_tokens`` 省略即"该调用未回报这个字段"——
+    与真实兼容端点的形态一致（不同供应商回报的 detail 字段不一样多）。
+    """
+    metadata: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    if cached_tokens is not None:
+        metadata["input_token_details"] = {"cache_read": cached_tokens}
+    if reasoning_tokens is not None:
+        metadata["output_token_details"] = {"reasoning": reasoning_tokens}
+    return metadata
+
+
+def ai_text(
+    text: str, *, finish_reason: str | None = None, usage: dict[str, Any] | None = None
+) -> AIMessage:
+    """文本响应（可带 finish_reason 与 usage_metadata，分别用于截断提示与用量采集用例）。"""
     metadata = {"finish_reason": finish_reason} if finish_reason else {}
-    return AIMessage(content=text, response_metadata=metadata)
+    return AIMessage(content=text, response_metadata=metadata, usage_metadata=usage)
 
 
 _tool_call_counter = itertools.count(1)
 
 
-def ai_tool_call(name: str, **arguments: Any) -> AIMessage:
+def ai_tool_call(name: str, *, usage: dict[str, Any] | None = None, **arguments: Any) -> AIMessage:
     """工具调用响应（``call_id`` 按构造顺序递增：可复现、且重复调用不会撞 id）。"""
     call_id = f"call-{next(_tool_call_counter)}-{name}"
-    return AIMessage(content="", tool_calls=[{"name": name, "args": arguments, "id": call_id}])
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": arguments, "id": call_id}],
+        usage_metadata=usage,
+    )
 
 
 def file_fence(code: str, path: str = "main.py") -> str:

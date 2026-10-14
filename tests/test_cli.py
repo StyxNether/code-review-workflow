@@ -13,6 +13,7 @@ import json
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import fakes
 import pytest
@@ -1422,3 +1423,186 @@ def test_version_copy_sources_follow_the_manifest(tmp_path: Path) -> None:
     (version_dir / "manifest.json").unlink()
     fallback = crw.cli._version_copy_sources(version_dir)
     assert sorted(path.name for path in fallback) == ["main.py", "notes.txt"]
+
+
+# ---- 用量采集：state.json / report.md / crw show / crw review ----
+
+
+def usage_script(*, name: str = "main.py") -> list[Any]:
+    """干净通过路径的响应脚本，每次调用都带 usage（用量采集用例的数据源）。
+
+    三个数（800+900+1100 输入、300+30+80 输出、0+512+512 命中）刻意互不相同，
+    断言才能证明"按节点归账"与"运行级合计"两件事都真的成立。
+    """
+    return [
+        fakes.ai_text(
+            fakes.file_fence(CLEAN_CODE, name),
+            usage=fakes.call_usage(
+                input_tokens=800, output_tokens=300, cached_tokens=0, reasoning_tokens=120
+            ),
+        ),
+        fakes.ai_tool_call(
+            "read_file",
+            path=f"code_v1/{name}",
+            usage=fakes.call_usage(input_tokens=900, output_tokens=30, cached_tokens=512),
+        ),
+        fakes.ai_text(
+            fakes.review_fence([], "已读取完整文件，未发现阻塞问题。", files=[name]),
+            usage=fakes.call_usage(input_tokens=1100, output_tokens=80, cached_tokens=512),
+        ),
+    ]
+
+
+def _run_with_usage(fake_chat_model: object, configured_provider: Callable[[], dict]) -> str:
+    """跑一次干净通过的需求运行，返回运行号。"""
+    configured_provider()
+    fake_chat_model.load(usage_script())
+    assert main(["run", "写一个计算器"]) == 0
+    (summary,) = records.list_runs()
+    return summary.run_id
+
+
+def test_run_writes_token_usage_into_state_json(
+    configured_provider: Callable[[], dict[str, object]], fake_chat_model: object
+) -> None:
+    """按节点归账进 state.json：编码 1 次调用、审查 2 次（工具轮 + 收官轮）。"""
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+
+    state = records.read_state(records.find_run_dir(run_id))
+    assert state is not None
+    usage = state["usage"]
+    assert usage["encode"] == {
+        "calls": 1,
+        "with_usage": 1,
+        "input_tokens": 800,
+        "output_tokens": 300,
+        "reasoning_tokens": 120,
+        "cached_tokens": 0,
+        "cache_reported": 1,
+    }
+    assert usage["review"]["calls"] == 2
+    assert usage["review"]["input_tokens"] == 2000
+    assert usage["review"]["cached_tokens"] == 1024
+
+
+def test_run_writes_per_call_usage_events_to_the_log(
+    configured_provider: Callable[[], dict[str, object]], fake_chat_model: object
+) -> None:
+    """每次调用一条 usage 事件（与工具事件同一条时间线，供逐调用归因）。"""
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+
+    events = records.read_events(records.find_run_dir(run_id) / "log.jsonl")
+    calls = [event for event in events if event["event"] == "usage"]
+    assert [event["node"] for event in calls] == ["encode", "review", "review"]
+    assert json.loads(calls[1]["detail"]) == {
+        "input_tokens": 900,
+        "output_tokens": 30,
+        "reasoning_tokens": 0,
+        "cached_tokens": 512,
+    }
+    assert calls[2]["iteration"] == 1  # 引擎按当前节点轮次补 iteration（工具事件同口径）
+
+
+def test_run_report_has_the_usage_table_with_a_total_row(
+    configured_provider: Callable[[], dict[str, object]], fake_chat_model: object
+) -> None:
+    """report.md 的 Token 用量小节：逐节点一行 + 合计行（命中率 = 命中/输入）。"""
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+
+    report = (records.find_run_dir(run_id) / "report.md").read_text(encoding="utf-8")
+    assert "## Token 用量" in report
+    assert "| 节点 | 调用 | 输入 | 缓存命中 | 输出 | 其中思考 |" in report
+    assert "| **合计** | 3 | 2,800 | 1,024（37%） | 410 | 120 |" in report
+
+
+def test_show_prints_the_usage_line(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+    capsys.readouterr()
+
+    assert main(["show", run_id]) == 0
+
+    text = capsys.readouterr().out
+    assert "[用量] 输入 2,800 · 输出 410（思考 120） · 缓存命中 1,024（37%） · 3 次调用" in text
+
+
+def test_show_recovers_usage_from_the_log_when_state_is_broken(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """state.json 损坏（降级展示）时用量仍能回读：数据源退到 log.jsonl。"""
+    run_id = _run_with_usage(fake_chat_model, configured_provider)
+    run_dir = records.find_run_dir(run_id)
+    (run_dir / "state.json").write_text("{ 坏掉的快照", encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["show", run_id]) == 2
+
+    text = capsys.readouterr().out
+    assert "[用量] 输入 2,800" in text
+    assert "3 次调用" in text
+
+
+def test_failed_node_still_records_the_usage_it_spent(
+    configured_provider: Callable[[], dict[str, object]], fake_chat_model: object
+) -> None:
+    """节点失败：失败前花掉的用量照记——钱已经花了，账必须留在记录里。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_text(
+                fakes.file_fence(CLEAN_CODE),
+                usage=fakes.call_usage(input_tokens=800, output_tokens=300),
+            ),
+            # 两次都不是契约要求的 json 围栏 → 审查节点按失败收尾（Design §4.6）
+            fakes.ai_text(
+                "我要开始审查了。", usage=fakes.call_usage(input_tokens=900, output_tokens=40)
+            ),
+            fakes.ai_text(
+                "我还是没给出 JSON。", usage=fakes.call_usage(input_tokens=950, output_tokens=50)
+            ),
+        ]
+    )
+
+    assert main(["run", "写一个计算器"]) == 2
+
+    (summary,) = records.list_runs()
+    state = records.read_state(summary.path)
+    assert state is not None
+    assert state["status"] == state_mod.STATUS_FAILED
+    assert state["usage"]["encode"]["calls"] == 1
+    assert state["usage"]["review"] == {
+        "calls": 2,
+        "with_usage": 2,
+        "input_tokens": 1850,
+        "output_tokens": 90,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_reported": 0,
+    }
+
+
+def test_review_command_reports_a_usage_line(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``crw review`` 不产生运行记录，用量在命令结束时以一行回显（stderr）。"""
+    configured_provider()
+    fake_chat_model.load(
+        [
+            fakes.ai_text(
+                "【建议】divide_by_zero.py:1 — 示例",
+                usage=fakes.call_usage(input_tokens=1500, output_tokens=200, cached_tokens=1024),
+            )
+        ]
+    )
+
+    assert main(["review", str(sample_path("divide_by_zero.py"))]) == 0
+
+    err = capsys.readouterr().err
+    assert "[用量] 输入 1,500 · 输出 200 · 缓存命中 1,024（68%） · 1 次调用" in err

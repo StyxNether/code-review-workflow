@@ -10,6 +10,7 @@ import pytest
 
 from crw import agents as agents_mod
 from crw import llm
+from crw import usage as usage_mod
 from crw.tools import EXEC_TOOL_NAME, build_registry
 from crw.workflow import state as state_mod
 
@@ -708,3 +709,159 @@ def test_drain_notices_for_only_takes_the_named_node(workspace: Path) -> None:
     notices = runtime.drain_notices_for("review_correctness")
     assert notices
     assert runtime.drain_notices_for("review_correctness") == []
+
+
+# ---- 用量采集（每次模型调用的输入 / 缓存命中 / 输出 token）----
+
+
+def test_each_model_call_is_recorded_and_emitted(workspace: Path) -> None:
+    """一次任务里的每次调用都记一笔，并即时发出 usage 事件（与工具事件同一条时间线）。"""
+    (workspace / "code_v1.py").write_text("print(1)\n", encoding="utf-8")
+    events: list[dict[str, Any]] = []
+    model = fakes.ScriptedChatModel(
+        responses=[
+            fakes.ai_tool_call(
+                "read_file",
+                path="code_v1.py",
+                usage=fakes.call_usage(input_tokens=1000, output_tokens=40, cached_tokens=512),
+            ),
+            fakes.ai_text(
+                "结论：没问题。",
+                usage=fakes.call_usage(input_tokens=1200, output_tokens=60, cached_tokens=1024),
+            ),
+        ]
+    )
+    runtime = make_runtime(model, emit=events.append)
+
+    runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="审查 code_v1.py",
+        registry=review_registry(workspace),
+    )
+
+    usage_events = [event for event in events if event["event"] == "usage"]
+    assert [event["detail"] for event in usage_events] == [
+        {"input_tokens": 1000, "output_tokens": 40, "reasoning_tokens": 0, "cached_tokens": 512},
+        {"input_tokens": 1200, "output_tokens": 60, "reasoning_tokens": 0, "cached_tokens": 1024},
+    ]
+    assert all(event["node"] == "review" for event in usage_events)
+
+    record = runtime.drain_usage_for("review")
+    assert record["calls"] == 2
+    assert record["input_tokens"] == 2200
+    assert record["cached_tokens"] == 1536
+    assert record["cache_reported"] == 2
+
+
+def test_model_without_usage_yields_call_count_only(workspace: Path) -> None:
+    """假模型不带 usage（供应商未回报同理）：只记调用次数，不崩也不虚增 token。"""
+    model = fakes.ScriptedChatModel(responses=[fakes.ai_text("结论。")])
+    events: list[dict[str, Any]] = []
+    runtime = make_runtime(model, emit=events.append)
+
+    runtime.run(
+        node="fix",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="修复",
+        registry=review_registry(workspace),
+    )
+
+    (event,) = [item for item in events if item["event"] == "usage"]
+    assert event["detail"] == {}  # 未回报：日志里如实留一条空 detail
+    record = runtime.drain_usage_for("fix")
+    assert record["calls"] == 1
+    assert record["with_usage"] == 0
+    assert record["input_tokens"] == 0
+
+
+def test_history_messages_are_not_billed_to_this_task(workspace: Path) -> None:
+    """会话记忆的历史消息不带本次调用的用量：不得被计进本轮账。"""
+    model = fakes.ScriptedChatModel(
+        responses=[
+            fakes.ai_text(
+                "结论。",
+                usage=fakes.call_usage(input_tokens=50, output_tokens=10, cached_tokens=20),
+            )
+        ]
+    )
+    runtime = make_runtime(model)
+
+    runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="审查",
+        registry=review_registry(workspace),
+        history=[
+            {"role": "user", "text": "上一轮任务"},
+            {"role": "assistant", "text": "上一轮结论"},
+        ],
+    )
+
+    record = runtime.drain_usage_for("review")
+    assert record["calls"] == 1
+    assert record["input_tokens"] == 50
+
+
+def test_usage_is_keyed_per_node_and_draining_clears(workspace: Path) -> None:
+    """按节点归账：取走自己的不碰别的节点，取走后清空；drain_usage 一次取全部。"""
+    model = fakes.ScriptedChatModel(
+        responses=[
+            fakes.ai_text("编码产出。", usage=fakes.call_usage(input_tokens=7, output_tokens=3)),
+            fakes.ai_text("审查结论。", usage=fakes.call_usage(input_tokens=11, output_tokens=5)),
+        ]
+    )
+    runtime = make_runtime(model)
+    registry = review_registry(workspace)
+
+    runtime.run(node="encode", system_prompt=SYSTEM_PROMPT, user_prompt="写", registry=registry)
+    runtime.run(node="review", system_prompt=SYSTEM_PROMPT, user_prompt="审", registry=registry)
+
+    assert runtime.drain_usage_for("review")["input_tokens"] == 11
+    assert runtime.drain_usage_for("review") == usage_mod.empty()
+    everything = runtime.drain_usage()
+    assert set(everything) == {"encode"}
+    assert everything["encode"]["output_tokens"] == 3
+    assert runtime.drain_usage() == {}
+
+
+def test_retry_attempt_bills_both_attempts(workspace: Path) -> None:
+    """收官回答不可用而重发：两次的调用与 token 都记账（钱确实花了两遍）。"""
+    model = fakes.ScriptedChatModel(
+        responses=[
+            fakes.ai_text("   ", usage=fakes.call_usage(input_tokens=30, output_tokens=2)),
+            fakes.ai_text(
+                "结论。", usage=fakes.call_usage(input_tokens=40, output_tokens=8, cached_tokens=30)
+            ),
+        ]
+    )
+    runtime = make_runtime(model)
+
+    runtime.run(
+        node="review",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt="审",
+        registry=review_registry(workspace),
+    )
+
+    record = runtime.drain_usage_for("review")
+    assert record["calls"] == 2
+    assert record["input_tokens"] == 70
+    assert record["with_usage"] == 2
+
+
+def test_shrunk_message_list_is_not_rebilled(workspace: Path) -> None:
+    """消息列表被裁短（本栈不会发生，属版本漂移防御）：游标不回落，漏记而不重复记账。"""
+    runtime = make_runtime(fakes.ScriptedChatModel(responses=[]))
+    used = fakes.call_usage(input_tokens=10, output_tokens=1)
+    first = [fakes.ai_text("一", usage=used), fakes.ai_text("二", usage=used)]
+
+    assert runtime._record_usage("review", first, 0) == 2
+    grown_but_shorter = [first[0], fakes.ai_text("三", usage=used)]
+    assert runtime._record_usage("review", grown_but_shorter, 2) == 2  # 裁短：不回落
+
+    with_new = [*grown_but_shorter, fakes.ai_text("四", usage=used)]
+    assert runtime._record_usage("review", with_new, 2) == 3
+
+    record = runtime.drain_usage_for("review")
+    assert record["calls"] == 3  # 一、二、四入账；"三"被漏记——少报花费好于多报花费

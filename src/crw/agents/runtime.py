@@ -42,6 +42,7 @@ from langchain_core.messages import (
 from langchain_core.tools import StructuredTool, tool
 
 from .. import config, llm
+from .. import usage as usage_mod
 from ..tools import ERROR_PREFIX, EXEC_TOOL_NAME, Tool, ToolRegistry
 
 #: 单个节点任务允许的最大工具轮次，超过则强制要求模型给出结论
@@ -396,6 +397,9 @@ class AgentRuntime:
         self._graphs: dict[tuple[str, int], Any] = {}
         self._guardrails: dict[tuple[str, int], _GuardrailMiddleware] = {}
         self._bridges: dict[tuple[str, int], _ToolBridgeMiddleware] = {}
+        #: 各节点累计的 token 用量（``节点名 → 账``，见 :mod:`crw.usage`）：与护栏记录同样
+        #: 由上层按节点取走（并行分支各自回收自己的），引擎把它写进运行记录
+        self._usage: dict[str, dict[str, int]] = {}
         # 并行双视角的两个分支在别的线程里共用本 runtime：图的按需编译（_graph_for 的
         # 读-建-写）与护栏记录的清空 / 取用都必须串行，避免重复编译与记录错位
         self._lock = threading.RLock()
@@ -496,6 +500,24 @@ class AgentRuntime:
                 guardrail.notices.clear()
         return notices
 
+    def drain_usage_for(self, node: str) -> dict[str, int]:
+        """取走并清空该节点已累计的 token 用量（无调用时为空账，不是 ``None``）。"""
+        with self._lock:
+            record = self._usage.pop(node, None)
+        return usage_mod.merge(usage_mod.empty(), record)
+
+    def drain_usage(self) -> dict[str, dict[str, int]]:
+        """取走并清空**全部**节点的用量账（``crw review`` 的批量审查与中断收尾用）。
+
+        返回 ``节点名 → 账``；一次性运行由引擎按节点取走，本方法给没有引擎接入的
+        调用方（``crw review`` 逐文件审查、被中断时残留的本节点）兜底取用。
+        """
+        with self._lock:
+            drained, self._usage = self._usage, {}
+        return {
+            node: usage_mod.merge(usage_mod.empty(), record) for node, record in drained.items()
+        }
+
     def model_label(self) -> str:
         """当前模型标识（命令面写 ``state["model"]`` 用；注入假模型时为类名）。"""
         name = getattr(self._chat_model, "model_name", "") or getattr(self._chat_model, "model", "")
@@ -509,9 +531,14 @@ class AgentRuntime:
         ``stream_mode="messages"`` 提供正文增量（工具轮伴随的少量文本同样渲染，已知
         取舍）；``"values"`` 提供每步后的状态快照，末次即最终状态。护栏经 config 位置
         参数传入——kwargs 会被框架吞进废弃参数桶而静默失效（M1 实测）。
+
+        每次模型调用落进状态的新 AI 消息都记一笔用量（并即时发出 usage 事件，与工具
+        事件在同一时间线上交错）：输入 / 缓存命中 / 输出 token 只有在**调用当时**拿得到，
+        等节点收尾再汇总就分不清是哪一次调用花的。
         """
         limit = _NODES_PER_TOOL_ROUND * self.max_tool_rounds + 5
         final_state: dict[str, Any] | None = None
+        reported = len(fed)  # 喂进去的历史消息与本轮 user 不带本次调用的用量，跳过
         for mode, payload in graph.stream(
             {"messages": list(fed)}, {"recursion_limit": limit}, stream_mode=["messages", "values"]
         ):
@@ -523,7 +550,27 @@ class AgentRuntime:
                         self._on_delta(node, text)
             else:
                 final_state = payload
+                reported = self._record_usage(node, payload.get("messages") or [], reported)
         return final_state
+
+    def _record_usage(self, node: str, messages: Sequence[Any], reported: int) -> int:
+        """为状态里新增的 AI 消息记用量，返回已处理的条数。
+
+        只处理 ``messages[reported:]``：values 模式每个超级步都给完整消息列表，靠
+        "已处理条数"避免重复入账。列表被框架裁短（本栈的装配不会——消息通道只追加，
+        记忆压缩在会话层做）时**游标不回落**：宁可漏记几条（少报花费），也不能把
+        已入账的调用重复记一遍（多报花费）。
+        """
+        if len(messages) < reported:
+            return reported
+        for message in messages[reported:]:
+            if not isinstance(message, AIMessage):
+                continue
+            record = usage_mod.from_usage_metadata(getattr(message, "usage_metadata", None))
+            self._emit({"node": node, "event": "usage", "detail": usage_mod.log_detail(record)})
+            with self._lock:
+                self._usage[node] = usage_mod.merge(self._usage.get(node), record)
+        return len(messages)
 
     def _graph_for(
         self,

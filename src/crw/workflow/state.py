@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
+from .. import usage as usage_mod
+
 # ---- 取值枚举（Design §4.3 / §8.1）----
 
 STATUS_RUNNING = "running"
@@ -124,6 +126,9 @@ class RunState(TypedDict, total=False):
     next_action: str | None
     error: ErrorInfo | None
     model: str
+    #: 各节点的 token 用量账（``节点名 → 账``，字段见 :mod:`crw.usage`）：并行分支写同一
+    #: 键，故 reducer 按节点并入、同键相加；无模型调用（假节点）时保持空表
+    usage: Annotated[dict[str, dict[str, int]], usage_mod.merge_by_node]
     created_at: str
     finished_at: str | None
 
@@ -153,6 +158,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "next_action",
     "error",
     "model",
+    "usage",
     "created_at",
     "finished_at",
 )
@@ -184,6 +190,7 @@ _DEFAULTS: dict[str, Any] = {
     "next_action": None,
     "error": None,
     "model": "",
+    "usage": {},
     "created_at": "",
     "finished_at": None,
 }
@@ -306,6 +313,7 @@ def new_state(
         next_action=None,
         error=None,
         model=model,
+        usage={},
         created_at=created_at,
         finished_at=None,
     )

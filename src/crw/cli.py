@@ -27,6 +27,7 @@ from . import render
 from . import thinking as thinking_mod
 from . import tools as tools_mod
 from . import uninstall as uninstall_mod
+from . import usage as usage_mod
 from .session import chat as session_chat_mod
 from .session import state as session_state_mod
 from .workflow import contracts as contracts_mod
@@ -976,9 +977,22 @@ def _cmd_review(args: argparse.Namespace) -> int:
             failed = True
         else:
             print(f"报告已写入：{target}", file=sys.stderr)
+    _report_review_usage(runtime)
     if failed:
         return _EXIT_ERROR
     return _EXIT_ISSUES if (args.as_json and severe) else _EXIT_OK
+
+
+def _report_review_usage(runtime: Any) -> None:
+    """``crw review`` 的用量一行（stderr）：本命令不产生运行记录，用量只能在结束时回显。
+
+    ``crw run`` / ``crw chat`` 的用量进 state.json 与 report.md（Design §4.5），这里给的是
+    同一套数的即时读数——批量审查花掉多少输入 / 输出 token、缓存命中多少，不看记录也要能知道。
+    """
+    record = usage_mod.totals(runtime.drain_usage())
+    if usage_mod.is_empty(record):
+        return
+    print(f"[用量] {usage_mod.format_line(record)}", file=sys.stderr)
 
 
 # ---- crw config：供应商配置 / 连通性自检 ----

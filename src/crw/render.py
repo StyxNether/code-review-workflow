@@ -31,6 +31,7 @@ from typing import Any, TextIO
 
 from rich.console import Console
 
+from . import usage as usage_mod
 from .workflow import contracts
 from .workflow import engine as engine_mod
 from .workflow import records as records_mod
@@ -790,6 +791,9 @@ def _render_detail(
         f"（来源：{engine_mod.source_label(state.get('max_iterations_source'))}）"
     )
     console.print(f"[时间] {_time_line(state, detail)}")
+    usage_line = _usage_line(detail)
+    if usage_line:
+        console.print(f"[用量] {usage_line}")
     if state.get("session_id"):
         console.print(
             f"[会话] {state.get('session_id')} / 第 {state.get('round_index', '（未记录）')} 轮"
@@ -999,6 +1003,20 @@ def _time_line(state: Mapping[str, Any], detail: records_mod.RunDetail) -> str:
     if not stamps:
         return "（未记录）"
     return f"{stamps[0]} → {stamps[-1]}（取自日志）"
+
+
+def _usage_line(detail: records_mod.RunDetail) -> str:
+    """用量一行：``state.json`` 的按节点账优先，读不出时回退 log.jsonl 的 usage 事件。
+
+    无任何用量数据（本功能之前留下的旧记录、或假节点跑的记录）返回空串——
+    这一行整个不出现，比写"0 token"诚实。
+    """
+    record = usage_mod.totals(_mapping(detail.state.get("usage")))
+    if usage_mod.is_empty(record):
+        record = usage_mod.from_log_events(detail.events)
+    if usage_mod.is_empty(record):
+        return ""
+    return usage_mod.format_line(record)
 
 
 def _status_style(status: str) -> str:

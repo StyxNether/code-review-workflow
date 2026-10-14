@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from .. import agents as agents_mod
 from .. import config as config_mod
+from .. import usage as usage_mod
 from . import contracts, records
 from . import graph as graph_mod
 from . import state as state_mod
@@ -74,7 +75,14 @@ class _NodeFailure(RuntimeError):
     """节点失败：携带节点名、可读消息与时间信息，供 engine 写状态与时间线。"""
 
     def __init__(
-        self, *, node: str, message: str, round_number: int, started_at: str, duration_ms: int
+        self,
+        *,
+        node: str,
+        message: str,
+        round_number: int,
+        started_at: str,
+        duration_ms: int,
+        usage: Mapping[str, int] | None = None,
     ):
         super().__init__(message)
         self.node = node
@@ -82,6 +90,8 @@ class _NodeFailure(RuntimeError):
         self.round_number = round_number
         self.started_at = started_at
         self.duration_ms = duration_ms
+        #: 失败前该节点已花掉的用量：钱已经花了，账要留在运行记录里
+        self.usage = usage if usage is not None else usage_mod.empty()
 
 
 class RunObserver(Protocol):
@@ -502,6 +512,29 @@ class WorkflowEngine:
         except Exception:  # noqa: BLE001 — 摘要附加信息不得影响运行结论
             return []
 
+    def _drain_usage(self, node: str) -> dict[str, int]:
+        """取走该节点本次任务的 token 用量账（注入的假运行时不回报用量时为空账）。
+
+        用量采集是观测面而非判定面：取不到就按"未记录"处理，绝不影响运行结论与退出码。
+        """
+        drain = getattr(self._runtime, "drain_usage_for", None) if self._runtime else None
+        if drain is None:
+            return usage_mod.empty()
+        try:
+            return drain(node)
+        except Exception:  # noqa: BLE001 — 观测数据不得把一次正常运行判成失败
+            return usage_mod.empty()
+
+    def _drain_residual_usage(self) -> dict[str, dict[str, int]]:
+        """取走运行时里未被按节点回收的用量（被中断的节点、无引擎接入的调用方）。"""
+        drain = getattr(self._runtime, "drain_usage", None) if self._runtime else None
+        if drain is None:
+            return {}
+        try:
+            return drain()
+        except Exception:  # noqa: BLE001 — 同上：观测数据不影响收尾
+            return {}
+
     def _emit(self, event: Mapping[str, Any]) -> None:
         """落盘一条事件并转交观察者（Design §5.1）；log 写入失败按运行失败处理。
 
@@ -553,6 +586,7 @@ class WorkflowEngine:
                     round_number=round_number,
                     started_at=started_at,
                     duration_ms=duration,
+                    usage=self._drain_usage(name),
                 ) from exc
             duration = self._elapsed_ms(active)
             summary = _append_notices(summary, self._drain_notices(name))
@@ -567,7 +601,11 @@ class WorkflowEngine:
                 summary=summary,
                 artifacts=list(artifacts),
             )
-            return {**update, "history": [entry]}
+            node_usage = self._drain_usage(name)
+            # 空账不写字段：假节点（脚本化、不经模型）的运行记录里不该出现"用量全 0"的误导行
+            if usage_mod.is_empty(node_usage):
+                return {**update, "history": [entry]}
+            return {**update, "history": [entry], "usage": {name: node_usage}}
 
         return wrapped
 
@@ -963,10 +1001,28 @@ class WorkflowEngine:
                 "error": {"node": failure.node, "message": failure.message},
                 "finished_at": self._clock(),
                 "history": [*list(state.get("history") or []), entry],
+                **self._usage_update(state, {failure.node: failure.usage}),
             }
         )
         self._latest = state
         return self._finalize(state, _EXIT_ERROR)
+
+    def _usage_update(
+        self, state: Mapping[str, Any], by_node: Mapping[str, Mapping[str, int]]
+    ) -> dict[str, Any]:
+        """把 ``节点 → 账`` 并入状态的用量表（绕过图 reducer 的收尾路径用）。
+
+        全 0 的账不写字段：假节点 / 未回报用量的场景下，记录里应看不到"用量为 0"，
+        否则读报告的人会以为这次运行真的只花了 0 token。
+        """
+        additions = {
+            node: record
+            for node, record in by_node.items()
+            if record is not None and not usage_mod.is_empty(record)
+        }
+        if not additions:
+            return {}
+        return {"usage": usage_mod.merge_by_node(state.get("usage"), additions)}
 
     def _handle_interrupt(self, latest: Mapping[str, Any]) -> RunResult:
         """中断收尾（Design §4.6 / §8.2）：interrupt 事件 → 原子写 state.json → 退出码 2。
@@ -984,6 +1040,7 @@ class WorkflowEngine:
                 ),
                 "error": {"node": "interrupt", "message": "运行被用户中断（Ctrl+C）。"},
                 "finished_at": self._clock(),
+                **self._usage_update(state, self._drain_residual_usage()),
             }
         )
         self._latest = state
@@ -1458,6 +1515,10 @@ def build_report(
         lines.append("（无节点事件）")
     lines.append("")
 
+    usage_section = _usage_section(state)
+    if usage_section:
+        lines.extend(usage_section)
+
     lines.append("## 逐轮问题清单")
     lines.append("")
     if rounds:
@@ -1505,6 +1566,36 @@ def _append_notices(summary: str, notices: Sequence[str]) -> str:
     if not notices:
         return summary
     return f"{summary}（{'；'.join(notices)}，结论可能不完整）"
+
+
+#: 用量小节的表头（列序与 :func:`crw.usage.cells` 的单元一一对应）
+_USAGE_HEADER = ("节点", "调用", "输入", "缓存命中", "输出", "其中思考")
+_USAGE_DIVIDER = "| --- | --- | --- | --- | --- | --- |"
+
+
+def _usage_section(state: Mapping[str, Any]) -> list[str]:
+    """Token 用量小节：按节点一行 + 合计行（无用量数据时整节省略）。
+
+    节点行顺序 = 用量首次记进状态的顺序（``usage`` 按键并入、先写的键在前），与时间线的
+    阅读顺序一致；未回报的调用由 :func:`crw.usage.cells` 写成"未回报"而不是 0。
+    """
+    by_node = state.get("usage")
+    if not isinstance(by_node, Mapping):
+        return []
+    totals = usage_mod.totals(by_node)
+    if usage_mod.is_empty(totals):
+        return []
+    lines = ["## Token 用量", "", f"| {' | '.join(_USAGE_HEADER)} |", _USAGE_DIVIDER]
+    for node, record in by_node.items():
+        cells = usage_mod.cells(usage_mod.merge(usage_mod.empty(), record))
+        lines.append("| " + " | ".join([node_label(node), *cells]) + " |")
+    lines.append("| " + " | ".join(["**合计**", *usage_mod.cells(totals)]) + " |")
+    lines.append("")
+    note = usage_mod.note(totals)
+    if note:
+        lines.append(f"注：{note}。")
+        lines.append("")
+    return lines
 
 
 def _cell(value: Any) -> str:
