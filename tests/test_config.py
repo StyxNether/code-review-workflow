@@ -541,10 +541,11 @@ def _preset_levels(preset: config.ProviderPreset, model: str) -> list[str] | Non
 
 
 def test_presets_prefill_thinking_levels_per_provider() -> None:
-    """预设只按各供应商真实支持的挡位回填。
+    """预设按既定口径回填各供应商的挡位清单（不随供应商文档变动自动调整）。
 
     口径：GLM 不接受关闭思考 → 不预填；Kimi k2.6 额外支持 on（thinking.type 开启）；
     百炼用 enable-off 映射（enable_thinking 关闭）；OpenAI 按 5.6 系列的挡位口径预填。
+    默认挡位则预填在该供应商的**关闭通道**上；没有可靠关闭通道的供应商（GLM 系）不预填、不发送参数。
     """
     presets = {preset.name: preset for preset in config.PROVIDER_PRESETS}
 

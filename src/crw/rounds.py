@@ -33,8 +33,8 @@ def code_version_dir_name(version: int) -> str:
 def version_of_dir_name(name: str) -> int | None:
     """目录名 → 版本号；不是版本目录名时返回 ``None``。
 
-    版本目录名的**唯一判定处**：写侧生成、读侧扫描、渲染与提示词都调用它，
-    避免同一份命名规则在多处各写一遍正则而慢慢分叉。
+    版本目录名**文法**的唯一判定处：写侧生成、读侧扫描、渲染与提示词都经它判断，
+    避免同一份命名规则在多处各写一遍正则而慢慢分叉（路径→目录名的切分由调用方负责）。
     """
     match = _VERSION_DIR_NAME_RE.fullmatch(name)
     return int(match.group(1)) if match else None

@@ -56,8 +56,8 @@ _ESTIMATE_FACTOR = 0.6
 EventSink = Callable[[Mapping[str, Any]], None]
 #: 正文增量回调：``(节点名, 增量文本)``——渲染层据此流式输出（``--no-stream`` 由渲染层缓存）
 DeltaSink = Callable[[str, str], None]
-#: 节点函数类型（``(state[, retry_feedback=...]) -> Mapping``，与 workflow 层同构；
-#: agents 不向上 import workflow，故此处自带别名）
+#: 节点函数类型（``(state[, retry_feedback=...]) -> Mapping``）：agents 层共用的别名，
+#: 与 workflow 层的同名别名同构——agents 不得向上 import workflow，故本层自带定义）
 NodeFn = Callable[..., Mapping[str, Any]]
 
 #: 审查节点交回引擎的执行证据键（执行有效性门禁；不在状态 schema 内）
