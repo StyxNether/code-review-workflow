@@ -634,6 +634,37 @@ class TestToolMarkupGuard:
         assert [] in model.bound_tools
         assert "不要再调用工具" in last_prompt(model)
 
+    def test_retry_keeps_tools_when_the_lost_round_had_read_content(self, workspace: Path) -> None:
+        """证据只在工具结果里时，重发必须带着工具（整项目审查形态的实测缺陷）。
+
+        不带工具的重发会让模型在"什么都没读过"的上下文里收尾——它如实回答"未能读取任何
+        文件"，前一轮读进来的内容全部白花，整批结论不可用。
+        """
+        (workspace / "code_v1.py").write_text("print(1)\n", encoding="utf-8")
+        events: list[dict[str, Any]] = []
+        model = fakes.ScriptedChatModel(
+            responses=[
+                fakes.ai_tool_call("read_file", path="code_v1.py"),
+                fakes.ai_text(self.MARKUP),
+                fakes.ai_text("重发后基于已读内容给出结论。"),
+            ]
+        )
+        runtime = make_runtime(model, emit=events.append)
+
+        result = runtime.run(
+            node="review",
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt="审查",
+            registry=review_registry(workspace),
+        )
+
+        assert result.text == "重发后基于已读内容给出结论。"
+        assert len(model.requests) == 3  # 工具调用 → 不可用回答 → 带工具重发
+        assert [] not in model.bound_tools  # 重发没有走"去工具"变体
+        assert model.bound_tools and model.bound_tools[0]
+        assert "请按需重新读取要审查的内容" in last_prompt(model)
+        assert "不要再调用工具" not in last_prompt(model)
+
     def test_markup_twice_fails_readably(self, workspace: Path) -> None:
         model = fakes.ScriptedChatModel(
             responses=[fakes.ai_text(self.MARKUP), fakes.ai_text("<tool_calls></tool_calls>")]

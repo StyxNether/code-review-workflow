@@ -111,7 +111,7 @@ def _tool_markup_message(text: str) -> str | None:
     if any(marker in text for marker in _TOOL_MARKUP_MARKERS):
         return (
             "模型未按工具协议返回：正文里带的是工具调用标记而不是结论（该次调用未被解析为"
-            "工具调用）。本轮作废，请重试；若反复出现，可换用别的模型（--model / crw config）。"
+            "工具调用）。这段回答不作结论，请重发；若反复出现，可换用别的模型（--model / crw config）。"
         )
     return None
 
@@ -125,17 +125,27 @@ class _Answer:
     problem: str | None = None
 
 
-def _retry_prompt(user_prompt: str, problem: str | None) -> str:
-    """本次尝试的用户消息：首次原文直传，重发时附上"上一轮不可用 + 直接给结论"的要求。
+def _retry_prompt(user_prompt: str, problem: str | None, *, keep_tools: bool = False) -> str:
+    """本次尝试的用户消息：首次原文直传，重发时附上"上一轮不可用 + 怎么收尾"的要求。
 
     只有**重发**（``problem`` 非空）才追加这段要求：它同时是"去掉工具"这一变体的说明，
     首次尝试仍带工具，若把它拼进首次消息，模型会照做（实测有节点据此判定"本轮禁止调用
     工具"，放弃 read_file / run_python 而凭清单重写整份代码）。
 
+    ``keep_tools``（上一轮已有成功工具事件时的重发）：整项目审查这类任务的证据**只在工具
+    结果里**，重发不带工具就等于让模型在"什么都没读过"的上下文里硬给结论（实测它如实回答
+    "未能读取任何文件"，整批白花）。此时保留工具，并明确要求按需重读后再收尾。
+
     追加在**用户消息**（而不是系统提示词）末尾：系统提示词是缓存前缀，必须保持不变。
     """
     if problem is None:
         return user_prompt
+    if keep_tools:
+        return (
+            f"{user_prompt}\n\n（上一轮回答不可用：{problem}。"
+            "本轮仍可读取文件：请按需重新读取要审查的内容，"
+            "然后用文字直接给出最终结论，并在结论里说明覆盖范围。）"
+        )
     return (
         f"{user_prompt}\n\n（上一轮回答不可用：{problem}。"
         "请直接用文字给出最终结论，不要再调用工具；信息不完整请在结论中说明。）"
@@ -437,18 +447,22 @@ class AgentRuntime:
         memory = _history_messages(history)
         tool_events = 0
         problem: str | None = None
+        had_evidence = False  # 上一轮是否有成功工具事件（决定重发是否保留工具）
         for attempt in range(1, _ANSWER_RETRY_ATTEMPTS + 1):
-            # 重发一律换成"无工具 + 直接要结论"：实测这类故障多发于多轮工具探索之后，
+            # 重发默认换成"无工具 + 直接要结论"：实测这类故障多发于多轮工具探索之后，
             # 原样重发很可能再撞一次；去掉工具并显式要求收尾才能稳定拿到结论。
+            # 例外是上一轮靠工具读到过内容——证据只活在工具结果里，不带工具的重发等于
+            # 从零开始，只能得到"什么都没读到"的空结论（整项目审查形态实测踩过）。
             retry = attempt > 1
+            keep_tools = retry and had_evidence
             graph, bridge, _ = self._graph_for(
-                node, system_prompt, registry, tools_enabled=not retry
+                node, system_prompt, registry, tools_enabled=not retry or had_evidence
             )
             bridge.counter["ok"] = 0
             bridge.callbacks = (self._emit, node)
             fed: list[BaseMessage] = [
                 *memory,
-                HumanMessage(content=_retry_prompt(user_prompt, problem)),
+                HumanMessage(content=_retry_prompt(user_prompt, problem, keep_tools=keep_tools)),
             ]
             try:
                 final_state = self._drive(graph, fed, node)
@@ -460,6 +474,7 @@ class AgentRuntime:
             finally:
                 bridge.callbacks = None
             tool_events = max(tool_events, bridge.counter["ok"])
+            had_evidence = bridge.counter["ok"] > 0
             answer = _final_answer(final_state)
             if answer.problem is None:
                 break
