@@ -213,7 +213,7 @@ $ uv run crw chat
 
 `crw run "需求"` 的路径是：`cli` 解析参数并解析模型配置 → `workflow/engine` 开一条运行记录（`~/.crw/runs/<运行号>/`）并把输入物化为起始版本目录 → `workflow/graph` 的 `StateGraph` 依次驱动 `agents` 的三个节点：编码产出 `code_v1/`，审查读文件 / 跑代码后给出结构化 findings，修复用 `write_file` 只把改动文件写进复制来的 `code_v2/` → 每轮结论由 `workflow/contracts` 校验（失败重试一次）并交回状态，`engine` 据此判定"是否还有阻塞问题 / 是否已达轮次上限"并循环 → 收尾由 `engine` 生成 `report.md` 与退出码，`render` 把过程与结论渲染到终端。`crw chat` 在这条链路外面多包一层 `session/`：编排节点先把你的消息解析成 `{intent, rounds, rounds_mode}`（`workflow/contracts` 校验），再按意图调用同一套工作流，每轮仍是一条完整运行记录，跨轮的代码版本与三份 Agent 记忆由会话层持有。
 
-框架类型的边界：LangGraph 的图与状态类型不越出 `workflow/`，LangChain 的消息与流对象不越出 `agents/runtime.py`——上层只见到字符串与普通数据（`usage.py` 这类叶子模块因此能同时被各层共用）。工具层四件：`list_dir` / `read_file` / `write_file` / `run_python`，路径一律相对**上下文根**解析、越界拒绝。
+框架类型的边界：LangGraph 的图与状态类型限于 `workflow/`（`llm.py` 只负责把框架的递归错误翻译成可读报错），LangChain 的消息与流类型限于 `agents/runtime.py` 与 `llm.py`——上层（`cli` / `session` / `render`）只见字符串与普通数据（`usage.py` 这类叶子模块因此能同时被各层共用）。工具层四件：`list_dir` / `read_file` / `write_file` / `run_python`，路径一律相对**上下文根**解析、越界拒绝。
 
 各层的逐条规格（状态 schema、节点协议、契约字段、退出码来源）见 [docs/Design.md](docs/Design.md) 的 §3–§5 与 §8。
 
