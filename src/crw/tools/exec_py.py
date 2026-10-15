@@ -274,7 +274,18 @@ def _join_readers(readers: tuple[Any, Any], timeout: float) -> None:
 
 
 def _reader_text(reader: Any) -> str:
-    return str(reader.get("text") or "")
+    """捕获到的输出文本；读取线程在回收窗口内没跑完时**如实标注**，不当成"没有输出"。
+
+    子进程退出后管道仍可能被孙进程占着（进程树场景），``_join_readers`` 只等
+    ``KILL_REAP_SECONDS``；此时 ``reader["text"]`` 还是初始空串——把它直接交给模型就等于
+    把"没收集完"报成"无输出"，模型会据此判定程序什么都没打印（Design §4.6 不静默吞掉）。
+    """
+    text = str(reader.get("text") or "")
+    thread = reader.get("thread")
+    if thread is not None and thread.is_alive():
+        note = "（输出未收集完：读取线程在回收窗口内仍未结束，以上可能不完整）"
+        return f"{text}\n{note}" if text else note
+    return text
 
 
 def _kill_process_tree(process: subprocess.Popen[str]) -> str | None:

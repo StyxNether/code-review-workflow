@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -719,3 +720,25 @@ class TestSelfReviewGuards:
 
         assert "42" in result
         assert not (root / "__pycache__").exists()
+
+
+def test_reader_that_overshot_the_reap_window_is_marked_incomplete() -> None:
+    """读取线程超窗未收尾：输出必须带"未收集完"标注，不得报成"无输出"。
+
+    子进程退出后管道仍可被孙进程占着，`_join_readers` 只等 KILL_REAP_SECONDS；把
+    未收尾的空缓冲直接交给模型，等于让模型以为程序什么都没打印（Design §4.6）。
+    """
+    hold = threading.Event()
+    thread = threading.Thread(target=lambda: hold.wait(5), daemon=True)
+    thread.start()
+    try:
+        pending = {"text": "", "thread": thread}
+        first = exec_py._reader_text(pending)
+        assert "未收集完" in first
+        assert exec_py._reader_text({"text": "已收集", "thread": thread}).startswith("已收集")
+
+        hold.set()
+        thread.join(5)
+    finally:
+        hold.set()
+    assert exec_py._reader_text({"text": "已收集", "thread": thread}) == "已收集"
