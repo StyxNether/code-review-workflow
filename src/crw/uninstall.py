@@ -184,11 +184,17 @@ def _ask(prompt: str) -> str | None:
         return None
 
 
-def _uv_tool_names() -> list[str]:
-    """``uv tool list`` 的工具名清单；uv 不可用或命令失败返回空表。
+#: ``uv tool list`` 的工具首行形状："名称 v版本"（实测 uv 0.9 输出 ``code-review-agent v0.1.0``）
+_UV_TOOL_LINE = re.compile(r"^(?P<name>\S+)\s+v\S+")
 
-    输出形态：每个工具首行 "名称 vX.Y.Z"，随后若干 "- 别名/可执行文件" 行——
-    非 "-" 开头的非空行首词即工具名。
+
+def _uv_tool_names() -> list[str]:
+    """``uv tool list`` 的工具名清单；uv 不可用、命令失败或**没有工具**时返回空表。
+
+    输出形态：每个工具首行 "名称 vX.Y.Z"，随后若干 "- 别名/可执行文件" 行。取词必须按
+    "名称 v版本" 的形状匹配，不能拿"非 '-' 开头的非空行首词"当工具名——**没有工具时 uv
+    打印一行提示文本 ``No tools installed``**（实测），按首词取会得到 ``["No"]``：
+    "已无其他 uv 工具"因此判反，PATH 条目被静默保留，而"干净退场"正是这一步的目的。
     """
     try:
         result = subprocess.run(["uv", "tool", "list"], capture_output=True, text=True, check=False)
@@ -198,10 +204,9 @@ def _uv_tool_names() -> list[str]:
         return []
     names: list[str] = []
     for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("-"):
-            continue
-        names.append(stripped.split()[0])
+        match = _UV_TOOL_LINE.match(line.strip())
+        if match:
+            names.append(match.group("name"))
     return names
 
 
@@ -530,8 +535,8 @@ def _windows_program_cleanup_script(parent_pid: int, *, remove_path: bool) -> st
     )
     if remove_path:
         script += (
-            "$names = @(uv tool list 2>$null | Where-Object { "
-            "$_ -and -not $_.Trim().StartsWith('-') })\n"
+            "$names = @(uv tool list 2>$null | ForEach-Object { $_.Trim() } | "
+            "Where-Object { $_ -match '^\\S+\\s+v\\S+' })\n"
             "if ($LASTEXITCODE -eq 0 -and $names.Count -eq 0) {\n"
             "  $bin = Join-Path $env:USERPROFILE '.local\\bin'\n"
             "  $user = [Environment]::GetEnvironmentVariable('Path', 'User')\n"

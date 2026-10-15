@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -448,8 +449,32 @@ def test_last_uv_tool_removes_path_entry_on_windows(home: Path) -> None:
     script = _spawned_script(io)
     assert "'.local\\bin'" in script
     assert "uv tool list" in script
+    # 脚本侧的取词必须按"名称 v版本"形状，与 _uv_tool_names 同一口径（否则无工具时
+    # uv 打印的 "No tools installed" 会让 $names.Count 不为 0，条目被静默保留）
+    assert "-match '^\\S+\\s+v\\S+'" in script
     assert "[Environment]::GetEnvironmentVariable('Path', 'User')" in script
     assert "后台卸载任务中一并移除" in io.stdout()
+
+
+def test_uv_tool_names_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``uv tool list`` 的解析口径：只认"名称 v版本"首行；没有工具时为空表。"""
+
+    def stub(stdout: str) -> None:
+        class _StubSubprocess:
+            @staticmethod
+            def run(*args: object, **kwargs: object) -> object:
+                return SimpleNamespace(returncode=0, stdout=stdout)
+
+        monkeypatch.setattr(uninstall, "subprocess", _StubSubprocess)
+
+    stub("code-review-workflow v0.1.0\n- crw\nother-tool v1.2\n- a\n- b\n")
+    assert uninstall._uv_tool_names() == ["code-review-workflow", "other-tool"]
+
+    stub("No tools installed\n")
+    assert uninstall._uv_tool_names() == []
+
+    stub("")
+    assert uninstall._uv_tool_names() == []
 
 
 def test_posix_path_entry_is_printed_not_executed(home: Path) -> None:
