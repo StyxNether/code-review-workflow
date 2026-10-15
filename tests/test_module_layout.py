@@ -1,4 +1,4 @@
-"""模块骨架测试：清单里的模块均可导入、带 docstring，且清单不漂移。"""
+"""模块布局测试：清单里的模块均可导入、带 docstring，且包目录的模块集合与清单一致。"""
 
 from __future__ import annotations
 
