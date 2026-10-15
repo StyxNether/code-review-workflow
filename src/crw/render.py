@@ -1068,7 +1068,7 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
     start_dir = rounds_mod.code_version_dir_name(version_base_of(state))
     if descriptor.get("kind") == state_mod.INPUT_FILE:
         source = str(descriptor.get("source_path") or "")
-        if re.fullmatch(r"code_v\d+", Path(source).name or ""):
+        if rounds_mod.is_code_version_dir_name(Path(source).name or ""):
             return f"父运行版本目录：{source or '（未记录）'} → {start_dir}/"
         return (
             f"文件：{source or '（未记录路径）'}"
@@ -1078,7 +1078,7 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
         return summary.input_summary
     text = state_mod.summarize_input(descriptor, limit=200)
     source = str(descriptor.get("source_path") or "")
-    if source and re.fullmatch(r"code_v\d+", Path(source).name or ""):
+    if source and rounds_mod.is_code_version_dir_name(Path(source).name or ""):
         # 会话轮次：需求驱动编码起步、既有代码来自上一版本（Design §4.7）
         return f"{text}（基于 {Path(source).name}/ 继续开发 → {start_dir}/）"
     return text

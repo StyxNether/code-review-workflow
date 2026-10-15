@@ -26,6 +26,12 @@ def code_version_dir_name(version: int) -> str:
     return f"code_v{version}"
 
 
+def is_code_version_dir_name(name: str) -> bool:
+    """该目录名是否代码版本目录（与 :func:`code_version_dir_name` 同一份命名规则）。"""
+    head, separator, tail = name.partition("_v")
+    return head == "code" and separator == "_v" and tail.isdigit()
+
+
 def round_number_for_review(state: Mapping[str, Any]) -> int:
     """本轮审查序号（= 已完成审查数 + 1，1-based，Design §4.3）。"""
     return int(state.get("review_round", 0)) + 1

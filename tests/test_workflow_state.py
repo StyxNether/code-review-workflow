@@ -89,6 +89,16 @@ def test_artifact_names_follow_the_directory_contract() -> None:
     assert state_mod.fixes_file_name(3) == "fixes_3.json"
 
 
+def test_version_dir_name_predicate_matches_the_generator() -> None:
+    """判定与生成器共用同一份命名规则：生成的名字必被认出，其余一律不认。"""
+    assert all(
+        rounds_mod.is_code_version_dir_name(rounds_mod.code_version_dir_name(n))
+        for n in (1, 2, 10, 127)
+    )
+    for name in ("code_v", "code_vx", "code_v1x", "main.py", "code_final", "xcode_v1", ""):
+        assert not rounds_mod.is_code_version_dir_name(name)
+
+
 def test_snapshot_projects_only_persisted_fields() -> None:
     """节点交回的暂存键与未来扩展键不进入运行记录（Design §3.1）。"""
     state = make_state(code_text="print('未落盘')", review_text="x", future_field=1)
