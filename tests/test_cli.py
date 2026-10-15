@@ -1491,13 +1491,20 @@ def test_review_reports_model_failure_with_exit_code_2(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """单文件审查失败：stderr 可读报错 + 退出码 2。"""
+    """单文件审查失败：stderr 可读报错 + stdout 给失败占位行 + 退出码 2。
+
+    stdout 留空白会被脚本化消费读成"审查通过、没有问题"，必须与多文件形态的占位行同口径。
+    """
     configured_provider()
-    fake_chat_model.load([RuntimeError("模型连接中断")])
+    model = fake_chat_model
+    model.load([RuntimeError("模型连接中断")])
 
     assert main(["review", str(sample_path("syntax_error.py"))]) == 2
 
-    assert "审查失败" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "审查失败" in captured.err
+    assert "[该文件审查失败，结论不可用]" in captured.out
+    assert len(model.requests) == 1
 
 
 def test_review_directory_without_text_files_is_a_run_error(

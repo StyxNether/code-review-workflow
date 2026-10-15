@@ -441,6 +441,18 @@ def _configured_rounds_fallback() -> tuple[int, str]:
     return default, state_mod.SOURCE_DEFAULT
 
 
+def _out_suffix(index: int) -> str:
+    """``--out`` 重名序号：首个为空，其后 ``_2`` / ``_3`` …"""
+    return "" if index == 1 else f"_{index}"
+
+
+def _export_target(out_dir: Path, kind: str, suffix: str) -> Path:
+    """``--out`` 的一类产物在目标目录里的落点（版本目录与报告共用同一序号）。"""
+    if kind == "report":
+        return out_dir / f"report{suffix}.md"
+    return out_dir / f"code_final{suffix}"
+
+
 def _export_outputs(result: engine_mod.RunResult, out_dir: Path) -> None:
     """``--out``：把最终版本目录与报告复制到指定目录（Design §4.2.2 / §4.5；重名加序号）。
 
@@ -469,19 +481,12 @@ def _export_outputs(result: engine_mod.RunResult, out_dir: Path) -> None:
         return
     # 版本目录与报告成对加序号：两者一并落到同一序号，产物目录里不会出现"半新半旧"的一组
     index = 1
-    while True:
-        suffix = "" if index == 1 else f"_{index}"
-        targets = {
-            "code_final": out_dir / f"code_final{suffix}",
-            "report": out_dir / f"report{suffix}.md",
-        }
-        if all(not targets[kind].exists() for kind in kinds):
-            break
+    while any(_export_target(out_dir, kind, _out_suffix(index)).exists() for kind in kinds):
         index += 1
+    suffix = _out_suffix(index)
+    targets = {kind: _export_target(out_dir, kind, suffix) for kind in kinds}
     for kind, target in targets.items():
-        source = kinds.get(kind)
-        if source is None:
-            continue
+        source = kinds[kind]
         try:
             if source.is_dir():
                 for file_path in _version_copy_sources(source):
@@ -1282,14 +1287,16 @@ def _review_per_file_session(
         markdown = render.review_json_report(merged)
     else:
         if len(files) > 1:
-            for position, ((display_name, _), answer) in enumerate(zip(files, text_answers)):
+            for position, ((display_name, _), answer) in enumerate(
+                zip(files, text_answers, strict=True)
+            ):
                 if position:
                     print()
                 print(f"===== {display_name} =====")
                 print(_answer_or_placeholder(answer))
         else:
             for answer in text_answers:
-                print(answer if answer is not None else "")
+                print(_answer_or_placeholder(answer))
         markdown = render.review_text_report(files, text_answers)
     if args.out and not _write_review_report(args, markdown):
         failed = True
