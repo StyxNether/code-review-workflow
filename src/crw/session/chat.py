@@ -30,6 +30,7 @@ from .. import config as config_mod
 from .. import render
 from .. import rounds as rounds_mod
 from .. import tools as tools_mod
+from ..workflow import contracts as contracts_mod
 from ..workflow import engine as engine_mod
 from ..workflow import records as records_mod
 from ..workflow import state as state_mod
@@ -54,9 +55,6 @@ _AGENT_OF_NODE: Mapping[str, str] = {
     "merge_reviews": "reviewer",
     "fix": "fixer",
 }
-
-#: 版本目录名 → 版本号（会话内跨轮连续递增，目录名是权威来源）
-_VERSION_DIR_RE = re.compile(r"^code_v([0-9]+)$")
 
 #: 运行状态 → 退出码（``crw chat`` 的退出码即最后一轮的状态映射）
 _STATUS_EXIT_CODES: Mapping[str, int] = {
@@ -595,7 +593,7 @@ def _run_round(
             prior_files = engine_mod.read_version_files(Path(current_dir))
         elif file_input is not None:
             source_path = file_input[0]
-            prior_files = {_input_name(file_input[0]): _normalize_text(file_input[1])}
+            prior_files = {_input_name(file_input[0]): contracts_mod.normalize_code(file_input[1])}
     elif current_dir and Path(current_dir).is_dir():
         source_dir = Path(current_dir)
     elif file_input is not None:
@@ -1051,13 +1049,7 @@ def _next_round_index(state: Mapping[str, Any]) -> int:
 def _version_of_dir(path_text: str) -> int | None:
     """版本目录路径 → 版本号；不是版本目录时返回 ``None``。"""
     name = path_text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    match = _VERSION_DIR_RE.fullmatch(name)
-    return int(match.group(1)) if match else None
-
-
-def _normalize_text(text: str) -> str:
-    """``-f`` 内容归一（与引擎物化同口径：去掉首尾换行、单个结尾换行）。"""
-    return text.strip("\n") + "\n"
+    return rounds_mod.version_of_dir_name(name)
 
 
 def _input_name(path: Path) -> str:

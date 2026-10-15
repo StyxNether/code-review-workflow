@@ -15,19 +15,13 @@ log 区分是哪位审查者在动作）。
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .. import rounds as rounds_mod
 from ..tools import EXEC_TOOL_NAME, ToolRegistry
 from . import prompts
-from .runtime import REVIEW_EVIDENCE_KEY, AgentRuntime, history_from_state
-
-#: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
-NodeFn = Callable[..., Mapping[str, Any]]
-
-#: 交回引擎的执行证据键（引擎读它作为 ``has_tool_evidence``）
-EVIDENCE_KEY = REVIEW_EVIDENCE_KEY
+from .runtime import REVIEW_EVIDENCE_KEY, AgentRuntime, NodeFn, history_from_state
 
 
 def _files_of(state: Mapping[str, Any]) -> list[str]:
@@ -80,7 +74,7 @@ def build_review_node(
             history=history_from_state(state, "reviewer"),
         )
         evidence["value"] = evidence["value"] or result.tool_events > 0
-        return {"review_text": result.text, EVIDENCE_KEY: evidence["value"]}
+        return {"review_text": result.text, REVIEW_EVIDENCE_KEY: evidence["value"]}
 
     return review_node
 
@@ -104,6 +98,38 @@ def review_once(
         system_prompt=prompts.REVIEWER_SYSTEM_PROMPT,
         user_prompt=prompts.inline_review_prompt(
             display_name=display_name, content=content, as_json=as_json, max_lines=max_lines
+        ),
+        registry=registry,
+    )
+    return result.text
+
+
+def review_project_once(
+    runtime: AgentRuntime,
+    registry: ToolRegistry,
+    *,
+    listing: Sequence[tuple[str, int]],
+    as_json: bool,
+    allow_exec: bool,
+    omitted: Sequence[str] = (),
+    total_lines: int = 0,
+) -> str:
+    """整项目审查（``crw review`` 的目标是目录或多于一个路径）：一次会话给出**文件清单**，
+    内容由模型自己顺 import / 调用链读取。
+
+    与 :func:`review_once`（内联单文件）的差别：任务里不附正文，跨文件的逻辑链
+    （签名对不上、循环导入、异常跨层被吞）只有同一次判断里读到双方才看得见；
+    一次会话即**一位审查者的一份结论**，返回的正文可以是多条 ``files`` 的报告。
+    """
+    result = runtime.run(
+        node="review",
+        system_prompt=prompts.REVIEWER_SYSTEM_PROMPT,
+        user_prompt=prompts.project_review_prompt(
+            listing=listing,
+            as_json=as_json,
+            allow_exec=allow_exec,
+            omitted=omitted,
+            total_lines=total_lines,
         ),
         registry=registry,
     )

@@ -330,7 +330,7 @@ def _resolve_model(
 
 
 def _legacy_config_hint() -> str:
-    """零配置且检测到姊妹工具 ``code-review-agent`` 的 ``~/.cra/models.json`` 时的导入提示。
+    """零配置且检测到既有配置 ``~/.cra/models.json`` 时的导入提示。
 
     只探测存在性并提示，不读取内容——配置导入是用户显式发起的动作。
     """
@@ -339,10 +339,7 @@ def _legacy_config_hint() -> str:
     legacy = config_mod.legacy_config_path()
     if not legacy.exists():
         return ""
-    return (
-        f"提示：检测到 code-review-agent 的配置 {legacy}——"
-        "运行 crw config 可选择导入（不会修改那个文件）。"
-    )
+    return f"提示：检测到可导入的配置 {legacy}——运行 crw config 可选择导入（不会修改那个文件）。"
 
 
 def _read_input_file(path: Path) -> tuple[str | None, int]:
@@ -1889,7 +1886,7 @@ def _set_model_thinking(
 
 
 def _maybe_import_legacy_config(session: _ConfigSession) -> None:
-    """零配置时提示导入姊妹工具 ``code-review-agent`` 的 ``~/.cra/models.json``。
+    """零配置时提示导入既有配置 ``~/.cra/models.json``。
 
     只在"本工具尚无任何供应商"时探测该文件的存在性，用户显式同意才导入；导入只读取
     它的供应商名称、接入点、模型清单与 key（条目结构两者同构），**不修改那个文件**。
@@ -1904,9 +1901,7 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     entries = config_mod.importable_providers(data)
     if not entries:
         return
-    _say(
-        f"检测到 code-review-agent 的配置：{config_mod.legacy_config_path()}（{len(entries)} 个供应商）"
-    )
+    _say(f"检测到可导入的配置：{config_mod.legacy_config_path()}（{len(entries)} 个供应商）")
     answer = _ask("是否导入到本工具？（y/N；只读取该文件，不修改它）")
     if answer is None or answer.lower() not in ("y", "yes"):
         _say("已跳过导入。")
@@ -1927,7 +1922,7 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     try:
         config_mod.validate_config(probe)
     except config_mod.ConfigError as exc:
-        _say_error(f"导入失败：code-review-agent 的配置不符合本工具的配置规则 — {exc}")
+        _say_error(f"导入失败：该配置不符合本工具的配置规则 — {exc}")
         return
     session.data["providers"] = probe["providers"]
     if imported_default:
@@ -1936,7 +1931,7 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     _say(f"已导入 {len(candidate)} 个供应商。")
     if not imported_default:
         _say(
-            "提示：code-review-agent 的默认模型未一并导入（引用的供应商或模型不在清单内），可用菜单 4) 设置默认模型。"
+            "提示：该配置的默认模型未一并导入（引用的供应商或模型不在清单内），可用菜单 4) 设置默认模型。"
         )
 
 

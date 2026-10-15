@@ -99,6 +99,23 @@ def test_version_dir_name_predicate_matches_the_generator() -> None:
         assert not rounds_mod.is_code_version_dir_name(name)
 
 
+def test_version_of_dir_name_reads_the_number_and_rejects_everything_else() -> None:
+    """目录名 → 版本号：只认 ``code_v`` + ASCII 数字，且必须是整个名字（防路径成分混入）。"""
+    assert rounds_mod.version_of_dir_name("code_v1") == 1
+    assert rounds_mod.version_of_dir_name("code_v01") == 1
+    assert rounds_mod.version_of_dir_name("code_v127") == 127
+    for name in (
+        "code_v",
+        "code_v²",
+        "code_v1x",
+        "code_v1.py",
+        "xcode_v1",
+        "code_v1/",
+        "../code_v2",
+    ):
+        assert rounds_mod.version_of_dir_name(name) is None
+
+
 def test_snapshot_projects_only_persisted_fields() -> None:
     """节点交回的暂存键与未来扩展键不进入运行记录。"""
     state = make_state(code_text="print('未落盘')", review_text="x", future_field=1)

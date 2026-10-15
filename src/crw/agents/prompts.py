@@ -19,6 +19,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .. import rounds as rounds_mod
+
 #: 会话轮次内联既有实现的总量上限（字符）：超出时省略较后的文件并如实标注。
 #: 版本契约上限为 1 MB，正常规模的实现远小于此；该上限只防"把超大版本整份塞进提示词"。
 PRIOR_FILES_MAX_CHARS = 200_000
@@ -239,7 +241,7 @@ def _prior_label(source: str, *, version_label: str) -> str:
     都没有时说明"本会话当前的实现将要生成到 ``version_label``"。
     """
     name = Path(str(source or "")).name
-    if re.fullmatch(r"code_v[0-9]+", name):
+    if rounds_mod.version_of_dir_name(name) is not None:
         return f"来自版本 {name}/，本会话此前的产出"
     if name:
         return f"来自文件 {name}，请在此基础上修改"

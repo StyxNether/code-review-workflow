@@ -283,7 +283,7 @@ def snapshot(state: Mapping[str, Any]) -> dict[str, Any]:
     只保留 ``PERSISTED_FIELDS`` 声明的字段：节点交回的暂存键（如 ``code_text``）与
     未来扩展键不进入运行记录；缺席字段补默认值，保证 state.json 恒为完整快照。
     """
-    return {name: _jsonable(state.get(name, _DEFAULTS[name])) for name in PERSISTED_FIELDS}
+    return {name: jsonable(state.get(name, _DEFAULTS[name])) for name in PERSISTED_FIELDS}
 
 
 def dumps(state: Mapping[str, Any]) -> str:
@@ -344,12 +344,12 @@ def _ellipsis(text: str, limit: int) -> str:
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 
-def _jsonable(value: Any) -> Any:
-    """Path → str 归一：状态字段必须可 JSON 序列化。"""
+def jsonable(value: Any) -> Any:
+    """Path → str 归一：状态与档案字段必须可 JSON 序列化（会话档案同用）。"""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return [_jsonable(item) for item in value]
+        return [jsonable(item) for item in value]
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {str(key): jsonable(item) for key, item in value.items()}
     return value

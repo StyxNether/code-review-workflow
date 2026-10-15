@@ -828,7 +828,7 @@ class WorkflowEngine:
         current_files = _version_files_of(state)
         previous_dir = self._workspace_path() / rounds_mod.code_version_dir_name(current_version)
         base_files = {
-            path: _normalize_code(content)
+            path: contracts.normalize_code(content)
             for path, content in self._read_version_files(previous_dir).items()
         }
         version_dir = self._write_version(new_version, base_files)
@@ -923,7 +923,7 @@ class WorkflowEngine:
         那是 ``write_file`` 没被调用的典型形态，放过去就等于报告了一轮不存在的修复。
         """
         files = {
-            path: _normalize_code(content)
+            path: contracts.normalize_code(content)
             for path, content in read_written_files(version_dir).items()
         }
         errors: list[str] = []
@@ -1224,7 +1224,7 @@ class WorkflowEngine:
             files = read_version_files(request.source_dir)
         elif request.source_text is not None:
             name = request.source_path.name if request.source_path is not None else "main.py"
-            files = {name: _normalize_code(request.source_text)}
+            files = {name: contracts.normalize_code(request.source_text)}
         else:
             return
         version_dir = self._write_version(
@@ -1238,7 +1238,7 @@ class WorkflowEngine:
         if request.source_dir is not None:
             return read_version_files(request.source_dir)
         name = request.source_path.name if request.source_path is not None else "main.py"
-        return {name: _normalize_code(request.source_text or "")}
+        return {name: contracts.normalize_code(request.source_text or "")}
 
     def _write_version(self, version: int, files: Mapping[str, str]) -> Path:
         """落盘一个版本目录：全部文件（原子写）→ ``manifest.json``，返回目录路径。
@@ -1250,7 +1250,7 @@ class WorkflowEngine:
         # 纵深防御：路径在契约层已校验过（拒绝绝对路径 / 盘符 / `..`），这里落盘前再验一次——
         # "模型输出拼进文件系统路径"是本项目风险最高的一类输入，写盘边界不能只靠上游自觉
         normalized = {
-            contracts.validate_version_path(path): _normalize_code(content)
+            contracts.validate_version_path(path): contracts.normalize_code(content)
             for path, content in files.items()
         }
         try:
@@ -1862,15 +1862,6 @@ def _relative_display(path: Path, run_dir: Path) -> str:
     with contextlib.suppress(ValueError):
         return path.relative_to(run_dir).as_posix()
     return str(path)
-
-
-def _normalize_code(code: str) -> str:
-    """代码文本归一：去掉首尾换行、统一以单个换行结尾（行内空白原样保留）。
-
-    围栏抽取会剥掉内容首尾的换行，磁盘版本则统一为"单个结尾换行"——两处表示一致，
-    整版本逐字节比较才有意义。
-    """
-    return code.strip("\n") + "\n"
 
 
 def read_version_files(directory: Path) -> dict[str, str]:

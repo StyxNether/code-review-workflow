@@ -10,16 +10,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from .. import rounds as rounds_mod
 from ..tools import ToolRegistry
 from . import prompts
-from .runtime import AgentRuntime, history_from_state
-
-#: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
-NodeFn = Callable[..., Mapping[str, Any]]
+from .runtime import AgentRuntime, NodeFn, history_from_state
 
 
 def build_encode_node(runtime: AgentRuntime, registry: ToolRegistry) -> NodeFn:

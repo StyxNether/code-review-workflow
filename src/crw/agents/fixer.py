@@ -12,17 +12,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .. import rounds as rounds_mod
 from ..tools import EXEC_TOOL_NAME, READ_FILE_TOOL, WRITE_FILE_TOOL, build_registry
 from . import prompts
-from .runtime import AgentRuntime, history_from_state
-
-#: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
-NodeFn = Callable[..., Mapping[str, Any]]
+from .runtime import AgentRuntime, NodeFn, history_from_state
 
 #: 修复节点的工具集：读文件、只写改动文件、运行核实
 FIX_TOOL_NAMES: tuple[str, ...] = (READ_FILE_TOOL, WRITE_FILE_TOOL, EXEC_TOOL_NAME)

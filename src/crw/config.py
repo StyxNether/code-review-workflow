@@ -207,6 +207,11 @@ def data_dir() -> Path:
     return Path.home() / DEFAULT_HOME_NAME
 
 
+def sessions_root() -> Path:
+    """会话根目录：``data_dir()/sessions``；会话档案与各轮运行记录都在其下。"""
+    return data_dir() / "sessions"
+
+
 def config_path() -> Path:
     """models.json 路径（``data_dir()/models.json``）。"""
     return data_dir() / "models.json"
@@ -341,19 +346,19 @@ def validate_settings(data: Any) -> None:
         )
 
 
-# ---- 姊妹工具配置探测（code-review-agent 的 ~/.cra：仅在零配置时提示导入，不读进常态解析路径）----
+# ---- 既有配置探测（``~/.cra``：仅在零配置时提示导入，不读进常态解析路径）----
 
-#: 姊妹工具的数据目录名（用户主目录下）
+#: 既有配置所在的数据目录名（用户主目录下）
 LEGACY_HOME_NAME = ".cra"
 
 
 def legacy_config_path() -> Path:
-    """姊妹工具的配置文件路径 ``~/.cra/models.json``（只用于"探测存在性 + 提示导入"）。"""
+    """既有配置文件路径 ``~/.cra/models.json``（只用于"探测存在性 + 提示导入"）。"""
     return Path.home() / LEGACY_HOME_NAME / "models.json"
 
 
 def load_legacy_config() -> dict[str, Any] | None:
-    """读取姊妹工具的配置；不存在 / 损坏 / 顶层非对象返回 ``None``。
+    """读取既有配置；不存在 / 损坏 / 顶层非对象返回 ``None``。
 
     导入是可选的便利功能：那个文件读不了就当它不存在，不得让 ``crw config`` 因此报错。
     """
@@ -365,9 +370,9 @@ def load_legacy_config() -> dict[str, Any] | None:
 
 
 def importable_providers(data: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """把姊妹工具配置的供应商条目规范为本工具形态（只保留结构完整者，丢弃损坏条目）。
+    """把既有配置的供应商条目规范为本工具形态（只保留结构完整者，丢弃损坏条目）。
 
-    两个工具的 ``models.json`` 结构一致：顶层为 ``default`` 与 ``providers``（条目含
+    两份 ``models.json`` 的结构一致：顶层为 ``default`` 与 ``providers``（条目含
     ``name`` / ``base_url`` / ``models`` / 可选 ``api_key``），差异只在数据目录与 key 环境变量
     前缀，条目本身可直接沿用；此处只做结构过滤，
     避免把半截条目带进新配置（整表校验由调用方执行）。

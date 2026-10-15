@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import rounds as rounds_mod
-from ..config import data_dir
+from ..config import data_dir, sessions_root
 from . import contracts
 from . import state as state_mod
 
@@ -40,7 +40,6 @@ _SESSION_ROUND_REF = re.compile(r"^(s-[0-9]{8}-[0-9a-f]{4})/(round-[0-9]+)$")
 _INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
 _REVIEW_NAME_PATTERN = re.compile(r"^review_([0-9]+)\.json$")
-_CODE_VERSION_DIR_PATTERN = re.compile(r"^code_v([0-9]+)$")
 
 #: 旧单文件格式的产物名（版本形态已是目录；该形态只用于识别并提示"记录来自旧格式"）
 _LEGACY_CODE_NAME_PATTERN = re.compile(r"^code_v([0-9]+)\.py$")
@@ -110,11 +109,6 @@ class RunDetail:
 def runs_root() -> Path:
     """运行记录根目录：``data_dir()/runs``（数据目录经 ``CRW_HOME`` 解析）。"""
     return data_dir() / "runs"
-
-
-def sessions_root() -> Path:
-    """会话根目录：``data_dir()/sessions``（会话轮次记录在其下）。"""
-    return data_dir() / "sessions"
 
 
 def is_valid_run_id(run_id: str) -> bool:
@@ -345,7 +339,7 @@ def run_artifacts(run_path: Path) -> list[Path]:
     for directory in (run_path, workspace):
         for path in _iter_dir(directory):
             if path.is_dir():
-                if directory is workspace and _CODE_VERSION_DIR_PATTERN.fullmatch(path.name):
+                if directory is workspace and rounds_mod.version_of_dir_name(path.name) is not None:
                     artifacts.extend(_version_dir_files(path))
                 continue
             if not path.name.startswith(".") and not path.name.endswith(".tmp"):
@@ -583,9 +577,9 @@ def _count_code_versions(path: Path) -> int | None:
     版本号从 1 起，故结果 ≥ 0；``code_v0/`` 之类手工造的异常目录按 0 兜底，不产出负数。
     """
     versions = [
-        int(match.group(1))
+        version
         for entry in _iter_dir(path / "workspace")
-        if (match := _CODE_VERSION_DIR_PATTERN.fullmatch(entry.name))
+        if (version := rounds_mod.version_of_dir_name(entry.name)) is not None
     ]
     return max(0, max(versions) - 1) if versions else None
 

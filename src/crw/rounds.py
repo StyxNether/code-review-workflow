@@ -12,6 +12,7 @@ crw 模块、不含框架类型，入参一律是 ``Mapping[str, Any]``。
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -20,16 +21,28 @@ from typing import Any
 ROUNDS_UP_TO = "up-to"
 ROUNDS_EXACT = "exact"
 
+#: 版本目录名的语法：``code_v`` + ASCII 十进制数字，无前后缀（判定与生成同源）
+_VERSION_DIR_NAME_RE = re.compile(r"code_v([0-9]+)")
+
 
 def code_version_dir_name(version: int) -> str:
     """代码版本目录名：``code_v<version>``（一个版本 = 一个目录 + 目录内的 manifest.json）。"""
     return f"code_v{version}"
 
 
+def version_of_dir_name(name: str) -> int | None:
+    """目录名 → 版本号；不是版本目录名时返回 ``None``。
+
+    版本目录名的**唯一判定处**：写侧生成、读侧扫描、渲染与提示词都调用它，
+    避免同一份命名规则在多处各写一遍正则而慢慢分叉。
+    """
+    match = _VERSION_DIR_NAME_RE.fullmatch(name)
+    return int(match.group(1)) if match else None
+
+
 def is_code_version_dir_name(name: str) -> bool:
     """该目录名是否代码版本目录（与 :func:`code_version_dir_name` 同一份命名规则）。"""
-    head, separator, tail = name.partition("_v")
-    return head == "code" and separator == "_v" and tail.isdigit()
+    return version_of_dir_name(name) is not None
 
 
 def round_number_for_review(state: Mapping[str, Any]) -> int:

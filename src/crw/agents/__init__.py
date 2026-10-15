@@ -26,10 +26,10 @@ from ..tools import (
 )
 from .encoder import build_encode_node
 from .fixer import FIX_TOOL_NAMES, build_fix_node
-from .prompts import REVIEWER_SYSTEM_PROMPT, project_review_prompt
-from .reviewer import EVIDENCE_KEY, build_review_node, review_once
+from .reviewer import build_review_node, review_once, review_project_once
 from .runtime import (
     MAX_TOOL_ROUNDS,
+    REVIEW_EVIDENCE_KEY,
     AgentRuntime,
     DeltaSink,
     EventSink,
@@ -148,40 +148,6 @@ def build_review_runtime(
     registry = build_registry(roots, names=NODE_TOOL_NAMES["review"], allow_exec=not no_exec)
     return runtime, registry
 
-
-def review_project_once(
-    runtime: AgentRuntime,
-    registry: ToolRegistry,
-    *,
-    listing: Sequence[tuple[str, int]],
-    as_json: bool,
-    allow_exec: bool,
-    omitted: Sequence[str] = (),
-    total_lines: int = 0,
-) -> str:
-    """``crw review`` 的整项目审查：一次会话给出**文件清单**，内容由模型自己顺链读取。
-
-    与 :func:`review_once`（内联单文件）的差别：任务里不附正文，跨文件的
-    逻辑链（签名对不上、循环导入、异常跨层被吞）只有同一次判断里读到双方才看得见；
-    一次会话即**一位审查者的一份结论**，返回的正文可以是多条 ``files`` 的报告。
-    """
-    result = runtime.run(
-        node="review",
-        system_prompt=REVIEWER_SYSTEM_PROMPT,
-        user_prompt=project_review_prompt(
-            listing=listing,
-            as_json=as_json,
-            allow_exec=allow_exec,
-            omitted=omitted,
-            total_lines=total_lines,
-        ),
-        registry=registry,
-    )
-    return result.text
-
-
-#: 审查节点交回引擎的执行证据键（引擎侧经此常量引用，避免两处字面量漂移）
-REVIEW_EVIDENCE_KEY = EVIDENCE_KEY
 
 __all__ = [
     "ALL_TOOL_NAMES",

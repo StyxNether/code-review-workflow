@@ -19,13 +19,14 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
-from ..config import data_dir
+from ..config import sessions_root
 from ..workflow import records
+from ..workflow.state import jsonable
 
 #: 会话状态枚举：进行中 / 已结束（结束由会话收尾写入，用于 sessions 列表展示）
 SESSION_STATUS_ACTIVE = "active"
@@ -111,11 +112,6 @@ class SessionSummary:
     """``session.json`` 不可读（轮次数与状态改由轮次目录派生，列表页据此标"记录损坏"）。"""
 
 
-def sessions_root() -> Path:
-    """会话根目录：``data_dir()/sessions``（经 ``CRW_HOME`` 解析）。"""
-    return data_dir() / "sessions"
-
-
 def is_valid_session_id(session_id: str) -> bool:
     """会话号是否合法（白名单：格式 + 仅单一路径成分，防路径穿越）。"""
     return bool(SESSION_ID_PATTERN.fullmatch(session_id))
@@ -195,7 +191,7 @@ def snapshot(state: Mapping[str, Any]) -> dict[str, Any]:
                 if item
             ]
         elif name in state:
-            data[name] = _jsonable(state[name])
+            data[name] = jsonable(state[name])
     return data
 
 
@@ -380,18 +376,7 @@ def _round_snapshot(entry: Any) -> dict[str, Any]:
     """轮次条目 → 白名单投影（外来键不落盘）。"""
     if not isinstance(entry, Mapping):
         return {}
-    return {name: _jsonable(entry[name]) for name in _ROUND_FIELDS if name in entry}
-
-
-def _jsonable(value: Any) -> Any:
-    """Path → str 归一（与 workflow.state 同口径：档案必须可 JSON 序列化）。"""
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    return value
+    return {name: jsonable(entry[name]) for name in _ROUND_FIELDS if name in entry}
 
 
 __all__ = [

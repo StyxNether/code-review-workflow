@@ -38,6 +38,15 @@ MAX_VERSION_BYTES = 1024 * 1024
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?:[ \t]*(?P<info>[^`~]*?))?[ \t]*$")
 
 
+def normalize_code(code: str) -> str:
+    """代码文本归一：去掉首尾换行、统一以单个换行结尾（行内空白原样保留）。
+
+    围栏抽取会剥掉内容首尾的换行，磁盘版本统一为"单个结尾换行"——两处表示一致，
+    整版本逐字节比较才有意义。``-f`` 输入、引擎物化与写入口径都走这一把尺子。
+    """
+    return code.strip("\n") + "\n"
+
+
 class ContractViolation(ValueError):
     """契约校验失败：携带逐条可读错误清单，清单即节点重试的反馈输入。"""
 

@@ -338,7 +338,7 @@ def test_config_can_import_the_previous_tool_configuration(
     assert main(["config"]) == 0
 
     captured = capsys.readouterr()
-    assert "检测到 code-review-agent 的配置" in captured.out
+    assert "检测到可导入的配置" in captured.out
     assert "已导入 1 个供应商。" in captured.out
     data = config_mod.load_raw()
     assert [entry["name"] for entry in data["providers"]] == ["LegacyProvider"]
@@ -394,7 +394,7 @@ def test_config_import_rejects_a_self_conflicting_legacy_config(
     assert main(["config"]) == 0
 
     captured = capsys.readouterr()
-    assert "检测到 code-review-agent 的配置" in captured.out
+    assert "检测到可导入的配置" in captured.out
     assert "导入失败" in captured.err
     assert "供应商名重复" in captured.err  # 逐条原因，不是笼统的"不符合规则"
     assert not config_mod.config_path().exists()  # 一个都没写盘（无半导入状态）
@@ -425,7 +425,7 @@ def test_import_hint_appears_when_nothing_is_configured(
 
     assert main(["run", "写一个计算器"]) == 2
 
-    assert "检测到 code-review-agent 的配置" in capsys.readouterr().err
+    assert "检测到可导入的配置" in capsys.readouterr().err
 
 
 def test_resume_inherits_the_parallel_review_shape(
