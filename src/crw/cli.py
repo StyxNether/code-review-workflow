@@ -172,6 +172,12 @@ def _add_review_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="输出结构化结果（存在【严重】时退出码 1）",
     )
+    parser.add_argument(
+        "--per-file",
+        dest="per_file",
+        action="store_true",
+        help="逐文件各开一次会话的旧快审形态（整项目一次会话的质量对照与安全阀）",
+    )
     _add_model_options(parser)
 
 
@@ -809,6 +815,23 @@ class _ReviewInputError(Exception):
     """审查入参的文件级错误（路径不存在 / 目录无文本文件 / 不可读），退出码 2。"""
 
 
+#: 整项目清单的文件数闸门。清单每行（路径 + 行数）约 40–60 字节，200 行约 12 KB——
+#: 清单本身按输入计费，且审查者按轮次预算最多读几十个文件，超过这个规模该由用户切分
+#: 目标（分批审查）而不是把提示词撑爆。
+_REVIEW_MAX_FILES = 200
+#: 整项目清单的总字节闸门：低于单文件读取上限（``tools.fs.MAX_READ_BYTES`` = 10 MB），
+#: 保证"扫描 + 行数统计"这一趟全量读入内存有界；8 MB 约合两万行代码，已远超一次会话
+#: 读得完的量（``_REVIEW_PROJECT_TOOL_ROUNDS`` × ``MAX_READ_LINES`` 量级）。
+_REVIEW_MAX_BYTES = 8 * 1024 * 1024
+#: 整项目形态的工具轮次预算：一轮约读一个文件，缺省 10 轮只够小工程；给 30 轮才能
+#: 顺 import / 调用链读到依赖末端。单文件与 stdin 的内联快审不改（仍用缺省 10）。
+_REVIEW_PROJECT_TOOL_ROUNDS = 30
+#: 清单排序里视为"程序入口"的文件名（审查者的读取顺序：入口与主干先看）
+_REVIEW_ENTRY_NAMES = ("main.py", "__main__.py", "cli.py", "app.py", "index.py")
+#: 跳过清单的打印上限（超大目录不得把 stderr 刷成日志）
+_REVIEW_SKIP_NAMES = 20
+
+
 def _review_roots(paths: Sequence[str]) -> list[Path]:
     """审查上下文本根：文件取其所在目录、目录取自身；stdin 退回进程启动目录（Design §8.4）。"""
     roots: list[Path] = []
@@ -823,40 +846,210 @@ def _review_roots(paths: Sequence[str]) -> list[Path]:
     return roots
 
 
-def _collect_review_files(paths: Sequence[str]) -> list[tuple[str, str]]:
-    """展开审查入参：目录展开第一层文本文件、``-`` 读 stdin。
+def _as_absolute(path: Path) -> Path:
+    """目标的绝对形态（只作路径算术用，不改用户输入的显示形态）。"""
+    return Path(os.path.abspath(str(path)))
 
-    跳过点开头的隐藏文件（含 .env 等敏感文件，其内容不应进入审查）与二进制文件，跳过
-    清单打印到 stderr。返回 ``(显示名, 内容)``：显示名保留用户输入形态（location 引用
-    与报告标题用它），stdin 固定 ``<stdin>``。
+
+def _review_common_root(paths: Sequence[str]) -> Path | None:
+    """整项目形态的**单一**上下文根 = 各目标的公共父目录；无法确定时返回 ``None``。
+
+    唯一化是清单可读的前提：多根下 ``read_file("pkg/util.py")`` 会按根的顺序命中第一个
+    同名候选（Design §8.4），同一个名字对应两个文件时审查者读到哪个都可能错。公共父目录
+    无法确定（跨盘符等）时不猜、不改语义，由调用方退回逐文件形态。
     """
-    collected: list[tuple[str, str]] = []
+    candidates: list[str] = []
+    for raw in paths:
+        path = Path(raw)
+        base = path if path.is_dir() else path.parent
+        candidates.append(str(_as_absolute(base)))
+    if not candidates:
+        return None
+    try:
+        return Path(os.path.commonpath(candidates))
+    except ValueError:
+        return None
+
+
+def _review_skip_line(label: str, names: Sequence[str]) -> None:
+    """跳过项的一行 stderr 说明（超限只打印前若干名并给出总数，不静默）。"""
+    shown = "、".join(names[:_REVIEW_SKIP_NAMES])
+    rest = f"…（共 {len(names)} 项）" if len(names) > _REVIEW_SKIP_NAMES else ""
+    print(f"已跳过{label}：{shown}{rest}", file=sys.stderr)
+
+
+def _review_data_dir_names() -> frozenset[str]:
+    """数据目录名：运行记录与配置不是待审代码，整目录跳过（Design §8.4 的拒绝名单）。"""
+    return frozenset({config_mod.data_dir().name, ".crw", ".cra"})
+
+
+def _scan_review_dir(directory: Path) -> list[Path]:
+    """递归展开目录目标为文本文件清单。
+
+    跳过**隐藏文件与目录**（含 ``.env`` 等敏感文件，其内容不得进入审查）、**忽略名单目录**
+    与数据目录（依赖 / 构建 / 缓存产物对审查没有价值且会撑爆清单）、**二进制文件**；
+    三类跳过各打一行 stderr 说明（用户看得见"哪些没被审"）。
+    """
+    data_names = _review_data_dir_names()
+    selected: list[Path] = []
+    ignored: list[str] = []
+    hidden: list[str] = []
+    binary: list[str] = []
+    for current, dir_names, file_names in os.walk(directory):
+        base = Path(current)
+        kept: list[str] = []
+        for name in sorted(dir_names):
+            if name.startswith("."):
+                hidden.append(name)
+                continue
+            if name in tools_mod.fs.IGNORED_DIRS or name in data_names:
+                ignored.append(name)
+                continue
+            kept.append(name)
+        # 原地改写 dir_names：os.walk 只递归留下来的子目录（剪枝，不是扫完再筛）
+        dir_names[:] = kept
+        for name in sorted(file_names):
+            item = base / name
+            if name.startswith("."):
+                hidden.append(name)
+                continue
+            if not tools_mod.fs.looks_textual(item):
+                binary.append(item.relative_to(directory).as_posix())
+                continue
+            selected.append(item)
+    if ignored:
+        _review_skip_line("忽略名单与数据目录", sorted(set(ignored)))
+    if hidden:
+        _review_skip_line("隐藏文件与目录", sorted(set(hidden)))
+    if binary:
+        _review_skip_line("二进制文件", sorted(set(binary)))
+    return selected
+
+
+def _apply_review_gate(files: Sequence[Path]) -> tuple[list[Path], list[Path]]:
+    """规模闸门：按目标顺序装入清单，超出文件数或总字节的部分退回"未列入"并如实打印。
+
+    宁可少覆盖也要让规模有界，但**未列入清单的文件必须逐个可见**——静默丢文件会让
+    "审查通过"被读成"全都看过"。
+    """
+    kept: list[Path] = []
+    omitted: list[Path] = []
+    total = 0
+    for item in files:
+        try:
+            size = item.stat().st_size
+        except OSError as exc:
+            raise _ReviewInputError(f"无法读取文件 {item}：{exc}") from exc
+        if len(kept) >= _REVIEW_MAX_FILES or total + size > _REVIEW_MAX_BYTES:
+            omitted.append(item)
+            continue
+        total += size
+        kept.append(item)
+    if omitted:
+        _review_skip_line(
+            f"超出清单规模上限的文件（{_REVIEW_MAX_FILES} 个 / "
+            f"{_REVIEW_MAX_BYTES // 1048576} MB，本次不覆盖）",
+            [str(item) for item in omitted],
+        )
+    return kept, omitted
+
+
+def _gather_review_files(paths: Sequence[str]) -> tuple[list[Path], list[Path]]:
+    """展开审查目标为待审文件（目录递归、跨目标去重）；返回（列入清单, 因闸门未列入）。"""
+    found: list[Path] = []
+    seen: set[str] = set()
     for raw in paths:
         if raw == "-":
-            collected.append(("<stdin>", _read_stdin_text()))
             continue
         path = Path(raw)
         if not path.exists():
             raise _ReviewInputError(f"路径不存在：{path}")
-        if path.is_dir():
-            selected: list[Path] = []
-            skipped: list[str] = []
-            for item in sorted(path.iterdir()):
-                if not item.is_file() or item.name.startswith("."):
-                    continue
-                if not tools_mod.fs.looks_textual(item):
-                    skipped.append(item.name)
-                    continue
-                selected.append(item)
-            if not selected:
-                detail = f"（已跳过：{', '.join(skipped)}）" if skipped else ""
-                raise _ReviewInputError(f"目录 {path} 第一层没有可审查的文本文件{detail}。")
-            if skipped:
-                print(f"已跳过二进制文件：{', '.join(skipped)}", file=sys.stderr)
-            collected.extend((str(item), _read_review_text(item)) for item in selected)
-        else:
-            collected.append((str(path), _read_review_text(path)))
+        for item in _scan_review_dir(path) if path.is_dir() else [path]:
+            key = str(_as_absolute(item))
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(item)
+    if not found and "-" not in paths:
+        raise _ReviewInputError("目标里没有可审查的文本文件（隐藏文件、二进制与忽略目录不入库）。")
+    return _apply_review_gate(found)
+
+
+def _relative_to_root(path: Path, root: Path) -> str:
+    """相对上下文根的 posix 路径（清单与 ``location`` 的口径）；不在根内时退回绝对路径。"""
+    absolute = _as_absolute(path)
+    if not absolute.is_relative_to(root):
+        return absolute.as_posix()
+    return absolute.relative_to(root).as_posix()
+
+
+def _review_listing_priority(entry: tuple[str, int]) -> tuple[int, int, int, str]:
+    """清单排序键：入口文件 > 非测试文件 > 行数多的在前 > 路径字典序。
+
+    读取预算有限时清单顺序就是实际读取顺序，入口与主干文件被依赖最多，先看它们才能
+    在后续轮次里顺链验证跨文件一致性。
+    """
+    path, lines = entry
+    segments = path.split("/")
+    name = segments[-1]
+    is_entry = 0 if name in _REVIEW_ENTRY_NAMES else 1
+    is_test = 1 if (name.startswith("test_") or "tests" in segments[:-1]) else 0
+    return (is_entry, is_test, -lines, path)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReviewScope:
+    """整项目形态的审查范围：单一上下文根、任务清单、未列入清单者与规模读数。"""
+
+    root: Path
+    listing: tuple[tuple[str, int], ...]
+    omitted: tuple[str, ...]
+    total_lines: int
+
+    @property
+    def file_count(self) -> int:
+        """清单里的文件数（提示词、报告标题与进度行共用）。"""
+        return len(self.listing)
+
+
+def _build_review_scope(root: Path, files: Sequence[Path], omitted: Sequence[Path]) -> _ReviewScope:
+    """整项目形态的任务清单：``(相对根的路径, 行数)``，按建议读取优先级排序。"""
+    entries: list[tuple[str, int]] = []
+    for item in files:
+        lines = len(tools_mod.fs.split_lines(_read_review_text(item)))
+        entries.append((_relative_to_root(item, root), lines))
+    entries.sort(key=_review_listing_priority)
+    return _ReviewScope(
+        root=root,
+        listing=tuple(entries),
+        omitted=tuple(_relative_to_root(item, root) for item in omitted),
+        total_lines=sum(count for _, count in entries),
+    )
+
+
+def _review_contents(paths: Sequence[str], files: Sequence[Path]) -> list[tuple[str, str]]:
+    """内联形态（单文件 / stdin / ``--per-file``）的入参：``(显示名, 内容)``。
+
+    显示名保留用户输入形态（location 引用与报告标题用它），stdin 固定 ``<stdin>``。
+    """
+    collected: list[tuple[str, str]] = []
+    if "-" in paths:
+        collected.append(("<stdin>", _read_stdin_text()))
+    collected.extend((str(item), _read_review_text(item)) for item in files)
     return collected
+
+
+def _wants_project_review(args: argparse.Namespace) -> bool:
+    """整项目一次会话的选形：目标是目录**或**多于一个路径，且未 ``--per-file``、不含 stdin。
+
+    单文件与 stdin 保持内联快审（内容已在手，无需再读，Design §8.1）；``--per-file``
+    是显式回退开关，用于与整项目形态做质量对照。
+    """
+    if args.per_file or "-" in args.paths:
+        return False
+    if len(args.paths) > 1:
+        return True
+    return Path(args.paths[0]).is_dir()
 
 
 def _read_stdin_text() -> str:
@@ -897,13 +1090,28 @@ def _answer_or_placeholder(answer: str | None) -> str:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    """单 Agent 审查：批量审查 → 结论 / ``--json`` / ``-o`` 报告（Design §8.1）。
+    """单 Agent 审查：整项目一次会话，或单文件 / stdin / ``--per-file`` 的内联快审。
 
     stdout 只承载结论与 ``--json``（过程与错误走 stderr）；退出码 0 完成、1 为 ``--json``
-    模式下存在【严重】、2 为运行错误（含单文件失败）。**不产生运行记录**（无 run_id）。
+    模式下存在【严重】、2 为运行错误（整项目形态下这一次调用失败即整批失败；内联形态下
+    逐文件隔离，任一失败退出 2）。**不产生运行记录**（无 run_id）。
     """
+    project = _wants_project_review(args)
+    scope: _ReviewScope | None = None
+    contents: list[tuple[str, str]] = []
     try:
-        files = _collect_review_files(args.paths)
+        files, omitted = _gather_review_files(args.paths)
+        if project:
+            root = _review_common_root(args.paths)
+            if root is None:
+                print(
+                    "crw review：各目标没有公共父目录，已退回逐文件审查形态。",
+                    file=sys.stderr,
+                )
+            else:
+                scope = _build_review_scope(root, files, omitted)
+        if scope is None:
+            contents = _review_contents(args.paths, files)
     except _ReviewInputError as exc:
         print(f"crw review：{exc}", file=sys.stderr)
         return _EXIT_ERROR
@@ -911,6 +1119,16 @@ def _cmd_review(args: argparse.Namespace) -> int:
     if resolved is None:
         return _EXIT_ERROR
     observer = render.RunRenderer(stream=True)
+    if scope is not None:
+        runtime, registry = agents_mod.build_review_runtime(
+            resolved=resolved,
+            roots=[scope.root],
+            no_exec=bool(args.no_exec),
+            emit=observer.on_event,
+            on_delta=observer.on_delta,
+            max_tool_rounds=_REVIEW_PROJECT_TOOL_ROUNDS,
+        )
+        return _review_project_session(args, runtime, registry, scope)
     runtime, registry = agents_mod.build_review_runtime(
         resolved=resolved,
         roots=_review_roots(args.paths),
@@ -918,6 +1136,96 @@ def _cmd_review(args: argparse.Namespace) -> int:
         emit=observer.on_event,
         on_delta=observer.on_delta,
     )
+    return _review_per_file_session(args, runtime, registry, contents)
+
+
+def _write_review_report(args: argparse.Namespace, markdown: str) -> bool:
+    """``-o`` 报告落盘：成功返回 ``True``；失败给一行可读原因并返回 ``False``（退出码 2）。"""
+    target = Path(args.out)
+    try:
+        records_mod.atomic_write_text(target, markdown)
+    except OSError as exc:
+        print(f"crw review：报告写入失败 — {target}（{exc}）", file=sys.stderr)
+        return False
+    print(f"报告已写入：{target}", file=sys.stderr)
+    return True
+
+
+def _review_project_session(
+    args: argparse.Namespace,
+    runtime: agents_mod.AgentRuntime,
+    registry: agents_mod.ToolRegistry,
+    scope: _ReviewScope,
+) -> int:
+    """整项目形态：一次会话产出全工程结论（失败隔离由"逐文件"变"整批"）。
+
+    只调用一次，因此没有"部分成功"：调用失败或 ``--json`` 输出不合契约都给 stderr 一行
+    可读原因 + 退出码 2，stdout 不留半截结论。
+    """
+    print(
+        f"正在审查 {scope.root.as_posix()}（整项目一次会话，{scope.file_count} 个文件）…",
+        file=sys.stderr,
+    )
+    try:
+        answer = agents_mod.review_project_once(
+            runtime,
+            registry,
+            listing=scope.listing,
+            as_json=bool(args.as_json),
+            allow_exec=not bool(args.no_exec),
+            omitted=scope.omitted,
+            total_lines=scope.total_lines,
+        )
+    except KeyboardInterrupt:
+        # 中断：已花掉的用量照样回显——钱花了就该看得见（Design §8.1）
+        print("crw review：已中断（整项目一次会话），未产出结论。", file=sys.stderr)
+        _report_review_usage(runtime)
+        return _EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 — 一次调用即整批：如实报错，不产出部分结论
+        print(f"crw review：整项目审查失败 — {_mask_secrets(str(exc))}", file=sys.stderr)
+        _report_review_usage(runtime)
+        return _EXIT_ERROR
+    severe = False
+    if args.as_json:
+        try:
+            report = contracts_mod.parse_review_report(answer)
+        except contracts_mod.ContractViolation as exc:
+            print(f"crw review：结构化输出无效 — {exc}", file=sys.stderr)
+            _report_review_usage(runtime)
+            return _EXIT_ERROR
+        # 一位审查者一次结论：报告里的多条 files 条目全部采纳，不做逐文件拼接
+        entries = report["files"]
+        merged = contracts_mod.merge_review_reports(entries)
+        summary = str(report.get("summary") or "") or str(merged.get("summary") or "")
+        payload = {"files": entries, "summary": summary}
+        severe = any(
+            finding.get("severity") == contracts_mod.SEVERE
+            for entry in entries
+            for finding in entry["findings"]
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        body = render.review_json_report(payload)
+    else:
+        print(answer)
+        body = answer
+    if args.out:
+        markdown = render.review_project_report(
+            targets=args.paths, file_count=scope.file_count, body=body
+        )
+        if not _write_review_report(args, markdown):
+            _report_review_usage(runtime)
+            return _EXIT_ERROR
+    _report_review_usage(runtime)
+    return _EXIT_ISSUES if (args.as_json and severe) else _EXIT_OK
+
+
+def _review_per_file_session(
+    args: argparse.Namespace,
+    runtime: agents_mod.AgentRuntime,
+    registry: agents_mod.ToolRegistry,
+    files: list[tuple[str, str]],
+) -> int:
+    """内联形态（单文件 / stdin / ``--per-file``）：逐文件各开一次会话，逐文件失败隔离。"""
     json_entries: list[dict[str, Any]] = []
     text_answers: list[str | None] = [None] * len(files)  # 与 files 逐位对齐；None = 该文件审查失败
     failed = False
@@ -983,15 +1291,8 @@ def _cmd_review(args: argparse.Namespace) -> int:
             for answer in text_answers:
                 print(answer if answer is not None else "")
         markdown = render.review_text_report(files, text_answers)
-    if args.out:
-        target = Path(args.out)
-        try:
-            records_mod.atomic_write_text(target, markdown)
-        except OSError as exc:
-            print(f"crw review：报告写入失败 — {target}（{exc}）", file=sys.stderr)
-            failed = True
-        else:
-            print(f"报告已写入：{target}", file=sys.stderr)
+    if args.out and not _write_review_report(args, markdown):
+        failed = True
     _report_review_usage(runtime)
     if failed:
         return _EXIT_ERROR
@@ -1087,6 +1388,9 @@ def _print_providers(data: dict[str, Any]) -> None:
             f"　模型：{', '.join(config_mod.model_names(entry.get('models') or []))}"
             f"{note}"
         )
+        thinking_note = config_mod.thinking_note_for(str(entry.get("name") or ""))
+        if thinking_note:
+            _say(f"    思考说明：{thinking_note}")
 
 
 class _ConfigSession:
@@ -1498,8 +1802,15 @@ def _config_manage_thinking(session: _ConfigSession) -> None:
         new_levels = levels
     elif text in ("清空", "clear"):
         # "清空"= 一次性清除该模型的全部挡位配置（含默认挡位）：只清清单却留着
-        # 默认值会得到自相矛盾的配置（默认不在可选清单内），这里不制造这种半状态
+        # 默认值会得到自相矛盾的配置（默认不在可选清单内），这里不制造这种半状态。
+        # 清空后不再发送任何思考参数——对"默认就是思考开"的供应商，这等于把挡位交回供应商
+        # 默认（比关闭更贵），所以要提醒一句，并给出"跟随默认"这条更省的路。
         _set_model_thinking(session, entry, models, model_name, [], None)
+        _say(
+            "注意：清空后不发送任何思考参数，部分供应商（如 DeepSeek）的出厂默认是"
+            "「思考开、high」。"
+        )
+        _say("      想按本产品的默认关闭思考，用「跟随默认」（或把默认挡位填成 off）。")
         return
     else:
         new_levels = []
@@ -1511,11 +1822,24 @@ def _config_manage_thinking(session: _ConfigSession) -> None:
                 return
             if token not in new_levels:
                 new_levels.append(token)
-    selected_raw = _ask(f"默认挡位（须在上面清单内或 off；回车保留 {selected or '（无）'}）：")
+    selected_raw = _ask(
+        f"默认挡位（须在上面清单内或 off；输入 跟随默认 用预设默认值；"
+        f"回车保留 {selected or '（无）'}）："
+    )
     if selected_raw is None:
         _say("已取消。")
         return
-    new_selected = selected_raw.strip() or selected
+    if selected_raw.strip() in ("跟随默认", "default"):
+        preset_default = config_mod.preset_default_thinking(
+            str(entry.get("name") or ""), model_name
+        )
+        if preset_default is None:
+            _say("该模型在预设里没有可靠的默认挡位（查不到就不猜），请手选挡位或输入 清空。")
+            return
+        new_selected = preset_default
+        _say(f"将按预设默认挡位设为 {new_selected}。")
+    else:
+        new_selected = selected_raw.strip() or selected
     if new_selected and new_selected != "off" and new_selected not in new_levels:
         _say(f"默认挡位 {new_selected!r} 不在挡位清单内，已取消（请先启用它再设默认）。")
         return

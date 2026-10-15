@@ -531,6 +531,64 @@ class TestStandaloneReview:
 
         assert len(model.requests) == 2
 
+    def test_review_runtime_defaults_to_the_shared_round_budget(self, workspace: Path) -> None:
+        """缺省工具轮次预算仍是运行时的 10（本层不为单一命令改默认）。"""
+        model = fakes.ScriptedChatModel(responses=[])
+        runtime, _ = agents_mod.build_review_runtime(model=model, roots=[workspace])
+
+        assert runtime.max_tool_rounds == agents_mod.MAX_TOOL_ROUNDS == 10
+
+    def test_review_runtime_can_raise_its_round_budget(self, workspace: Path) -> None:
+        """整项目形态的高预算经装配入口透传（一次会话要顺链读多个文件，10 轮不够）。"""
+        model = fakes.ScriptedChatModel(responses=[])
+        runtime, _ = agents_mod.build_review_runtime(
+            model=model, roots=[workspace], max_tool_rounds=30
+        )
+
+        assert runtime.max_tool_rounds == 30
+
+    def test_project_prompt_lists_files_without_their_content(self, workspace: Path) -> None:
+        """整项目任务只给清单（路径 + 行数），正文留给审查者自己读。"""
+        model = fakes.ScriptedChatModel(responses=[fakes.ai_text("跨文件结论。")])
+        runtime, registry = agents_mod.build_review_runtime(model=model, roots=[workspace])
+
+        text = agents_mod.review_project_once(
+            runtime,
+            registry,
+            listing=(("main.py", 12), ("pkg/util.py", 5)),
+            as_json=False,
+            allow_exec=True,
+            total_lines=17,
+        )
+
+        assert text == "跨文件结论。"
+        prompt = str(last_prompt(model, 0))
+        assert "main.py（12 行）" in prompt and "pkg/util.py（5 行）" in prompt
+        assert "顺着 import / 调用链" in prompt
+        assert "必查项" in prompt
+        assert "没读完就如实说明覆盖了清单里的哪些文件" in prompt
+        assert "run_python" in prompt  # allow_exec=True：给出核实手段
+
+    def test_project_prompt_reports_omitted_files_and_static_mode(self, workspace: Path) -> None:
+        """闸门外的文件必须出现在任务里；``--no-exec`` 时改为静态审查口径。"""
+        model = fakes.ScriptedChatModel(responses=[fakes.ai_text("结论。")])
+        runtime, registry = agents_mod.build_review_runtime(model=model, roots=[workspace])
+
+        agents_mod.review_project_once(
+            runtime,
+            registry,
+            listing=(("main.py", 3),),
+            as_json=True,
+            allow_exec=False,
+            omitted=("huge.py",),
+            total_lines=3,
+        )
+
+        prompt = str(last_prompt(model, 0))
+        assert "未列入清单" in prompt and "huge.py" in prompt
+        assert "--no-exec" in prompt
+        assert '"files"' in prompt  # JSON 契约形态
+
 
 def test_build_nodes_covers_every_graph_node(workspace: Path) -> None:
     from crw.workflow import graph as graph_mod

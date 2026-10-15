@@ -64,6 +64,8 @@ class ProviderPreset:
     base_url: str
     models: tuple[str | dict[str, Any], ...]
     env_var: str
+    thinking_note: str = ""
+    """思考挡位的如实说明（恒开型：不可关闭、成本不可控；空 = 无需说明）。"""
 
 
 # 思考挡位预填说明（挡位清单 2026-10-14 查证各供应商官网；**默认挡位改为"关闭"由用户
@@ -86,6 +88,14 @@ class ProviderPreset:
 #   裁决同时要求"恒开型默认 low"，但那要以"官网 + 锁定版本实测确认该供应商接受
 #   reasoning_effort=low"为前提；未实测就不发送任何参数（延续"查不到就不猜"的规矩），
 #   并在 crw config 回显里如实说明"该模型思考不可关闭，成本不可控"。
+#: 恒开型供应商的如实说明（官方口径 thinking.type=disabled 直接报错；未查证到可用的
+#: reasoning_effort 通道并经实测确认，因此不预填、不发送任何参数——但必须让用户看得见）
+_THINKING_NOTE_ALWAYS_ON = (
+    "思考不可关闭（官方口径 thinking.type=disabled 报错）：该模型的成本不可控；"
+    "未查证到并经实测确认可用的挡位通道，故不预填、不发送任何思考参数"
+)
+
+
 _THINKING_DEEPSEEK = {"levels": ["off", "none", "low", "high", "max"], "selected": "off"}
 _THINKING_OPENAI = {"levels": ["none", "low", "medium", "high"], "selected": "none"}
 _THINKING_QWEN = {"levels": ["enabled", "enable-off"], "selected": "enable-off"}
@@ -134,24 +144,28 @@ PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
         "https://api.z.ai/api/coding/paas/v4",
         ("glm-5.3", "glm-5.3-flash"),
         "CRW_ZAI_API_KEY",
+        thinking_note=_THINKING_NOTE_ALWAYS_ON,
     ),
     ProviderPreset(
         "Z.ai API",
         "https://api.z.ai/api/paas/v4",
         ("glm-5.3", "glm-5.3-flash"),
         "CRW_ZAI_API_KEY",
+        thinking_note=_THINKING_NOTE_ALWAYS_ON,
     ),
     ProviderPreset(
         "BigModel Coding Plan",
         "https://open.bigmodel.cn/api/coding/paas/v4",
         ("glm-5.3", "glm-5.3-flash"),
         "CRW_ZHIPUAI_API_KEY",
+        thinking_note=_THINKING_NOTE_ALWAYS_ON,
     ),
     ProviderPreset(
         "BigModel API",
         "https://open.bigmodel.cn/api/paas/v4",
         ("glm-5.3", "glm-5.3-flash"),
         "CRW_ZHIPUAI_API_KEY",
+        thinking_note=_THINKING_NOTE_ALWAYS_ON,
     ),
 )
 
@@ -383,6 +397,14 @@ def importable_providers(data: Mapping[str, Any]) -> list[dict[str, Any]]:
             item["api_key"] = api_key
         result.append(item)
     return result
+
+
+def thinking_note_for(provider: str) -> str:
+    """供应商预设里的思考说明（恒开型用来如实回显）；无说明返回空串。"""
+    for preset in PROVIDER_PRESETS:
+        if preset.name == provider:
+            return preset.thinking_note
+    return ""
 
 
 def env_var_for_provider(name: str) -> str:

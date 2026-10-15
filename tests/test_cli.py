@@ -10,6 +10,7 @@ import argparse
 import importlib.metadata
 import io
 import json
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -21,6 +22,7 @@ from support import read_sample, sample_path
 
 import crw.cli
 import crw.render
+from crw import agents as agents_mod
 from crw import config as config_mod
 from crw.cli import build_parser, main
 from crw.workflow import engine as engine_mod
@@ -206,6 +208,14 @@ def test_review_accepts_paths_and_options() -> None:
     assert args.out == "report.md"
     assert args.as_json is True
     assert args.no_exec is True
+    assert args.per_file is False  # 缺省走整项目一次会话
+
+
+def test_review_accepts_the_per_file_fallback_switch() -> None:
+    """``--per-file`` 是显式回退开关（整项目形态的质量对照与安全阀）。"""
+    args = build_parser().parse_args(["review", "--per-file", "tests"])
+
+    assert args.per_file is True
 
 
 def test_review_accepts_model_overrides() -> None:
@@ -851,6 +861,11 @@ def test_run_writes_nothing_to_the_real_user_directory(
 # ---- crw review：单 Agent 审查（Design §8.1 / §6.4）----
 
 
+def _user_prompt(model: object, index: int = 0) -> str:
+    """第 ``index`` 次请求的用户消息文本（假模型记录下来的那份）。"""
+    return str(model.requests[index][-1].content)
+
+
 def test_review_file_prints_conclusion_and_never_creates_a_run(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
@@ -955,28 +970,466 @@ def test_review_writes_markdown_report(
     assert "报告已写入" in capsys.readouterr().err
 
 
-def test_review_directory_expands_first_level_text_files(
+def test_review_directory_runs_one_session_over_a_listing(
     tmp_path: Path,
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """目录入参：展开第一层文本文件，跳过隐藏文件与二进制文件（Design §8.1）。"""
+    """目录目标 = **整项目一次会话**：任务里只给清单，不给正文（Design §8.1）。"""
     configured_provider()
     (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
-    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\nprint(3)\n", encoding="utf-8")
     (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
     (tmp_path / "bin.dat").write_bytes(b"\x00\x01\x02")
-    fake_chat_model.load([fakes.ai_text("审查结论一。"), fakes.ai_text("审查结论二。")])
+    fake_chat_model.load([fakes.ai_text("整项目审查结论。")])
 
     assert main(["review", str(tmp_path)]) == 0
 
     captured = capsys.readouterr()
-    assert "a.py" in captured.out and "b.py" in captured.out  # 多文件逐个带标题
-    assert "审查结论一。" in captured.out and "审查结论二。" in captured.out
+    assert captured.out.strip() == "整项目审查结论。"
+    assert len(fake_chat_model.requests) == 1  # 一次会话覆盖全工程
     assert "SECRET=1" not in captured.out and "SECRET=1" not in captured.err
     assert "已跳过二进制文件" in captured.err
+    prompt = _user_prompt(fake_chat_model)
+    assert "a.py（1 行）" in prompt and "b.py（2 行）" in prompt
+    assert "顺着 import / 调用链" in prompt
+    assert "必查项" in prompt
+    assert "location" in prompt and "pkg/util.py:7" in prompt  # location 口径：相对路径:行号
+    # 清单形态不内联正文：内容留给审查者自己按清单读取
+    assert "print(2)" not in prompt
+    assert "无需再调用工具读取" not in prompt
+
+
+def test_review_multiple_paths_runs_one_session_over_a_listing(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """多于一个路径 = 同样一次会话（哪怕都是文件）。"""
+    configured_provider()
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("print(1)\n", encoding="utf-8")
+    second.write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("一次会话的结论。")])
+
+    assert main(["review", str(first), str(second)]) == 0
+
+    assert len(fake_chat_model.requests) == 1
+    assert "一次会话的结论。" in capsys.readouterr().out
+
+
+def test_review_listing_paths_resolve_against_the_common_parent(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """单一上下文根 = 各目标的公共父目录，清单里的相对路径因此只指向一个文件。
+
+    用例的形状是"根取第一个目标所在目录"会解析错的那一类：两个目标分处两个兄弟目录，
+    审查者按清单去读 `pkg/util.py` 时，只有公共父目录当根才读得到。
+    """
+    configured_provider()
+    (tmp_path / "app").mkdir()
+    (tmp_path / "pkg").mkdir()
+    entry = tmp_path / "app" / "main.py"
+    entry.write_text("import pkg.util\n", encoding="utf-8")
+    (tmp_path / "pkg" / "util.py").write_text("MARKER_UNIQUE = 1\n", encoding="utf-8")
+    fake_chat_model.load(
+        [
+            fakes.ai_tool_call("read_file", path="pkg/util.py"),
+            fakes.ai_text("跨文件结论。"),
+        ]
+    )
+
+    assert main(["review", str(entry), str(tmp_path / "pkg" / "util.py")]) == 0
+
+    prompt = _user_prompt(fake_chat_model)
+    assert "app/main.py（1 行）" in prompt and "pkg/util.py（1 行）" in prompt
+    tool_reply = str(fake_chat_model.requests[1][-1].content)
+    assert "MARKER_UNIQUE" in tool_reply
+    assert "错误：" not in tool_reply
+
+
+def test_review_without_a_common_parent_falls_back_to_per_file(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """公共父目录算不出来（跨盘符那类）：一行说明 + 退回逐文件形态，不静默换语义。"""
+    configured_provider()
+    first = tmp_path / "x"
+    second = tmp_path / "y"
+    first.mkdir()
+    second.mkdir()
+    (first / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (second / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("结论一。"), fakes.ai_text("结论二。")])
+
+    def _no_common_path(paths: object) -> str:
+        raise ValueError("Can't mix paths on different drives")
+
+    monkeypatch.setattr(os.path, "commonpath", _no_common_path)
+
+    assert main(["review", str(first / "a.py"), str(second / "b.py")]) == 0
+
+    captured = capsys.readouterr()
+    assert "公共父目录" in captured.err
+    assert "退回逐文件" in captured.err
+    assert len(fake_chat_model.requests) == 2  # 旧形态：每文件一次会话
+    assert "===== " in captured.out
+
+
+def test_review_directory_scans_recursively_and_reports_every_skip(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """目录改为递归扫描：嵌套文件进清单，隐藏 / 二进制 / 忽略名单目录跳过并逐项说明。"""
+    configured_provider()
+    deep = tmp_path / "pkg" / "inner"
+    deep.mkdir(parents=True)
+    (deep / "nested.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "cached.py").write_text("print(2)\n", encoding="utf-8")
+    (tmp_path / ".private").mkdir()
+    (tmp_path / ".private" / "hidden.py").write_text("print(3)\n", encoding="utf-8")
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01")
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert "已跳过忽略名单与数据目录：__pycache__" in captured.err
+    assert "已跳过隐藏文件与目录：.private" in captured.err
+    assert "已跳过二进制文件：blob.bin" in captured.err
+    prompt = _user_prompt(fake_chat_model)
+    assert "pkg/inner/nested.py（1 行）" in prompt
+    assert "cached.py" not in prompt and "hidden.py" not in prompt
+
+
+def test_review_listing_gate_prints_unlisted_files(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """规模闸门不得静默丢文件：未列入清单的文件逐个打印，并写进任务里。"""
+    configured_provider()
+    monkeypatch.setattr(crw.cli, "_REVIEW_MAX_FILES", 2)
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text("print(1)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert "已跳过超出清单规模上限的文件" in captured.err
+    assert str(tmp_path / "c.py") in captured.err
+    prompt = _user_prompt(fake_chat_model)
+    assert "未列入清单" in prompt and "c.py" in prompt
+
+
+def test_review_listing_bytes_gate_is_not_silent(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """总字节闸门同样如实打印（超出的不是"看不到"，而是"本次不覆盖"）。"""
+    configured_provider()
+    monkeypatch.setattr(crw.cli, "_REVIEW_MAX_BYTES", 40)
+    (tmp_path / "small.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "big.py").write_text("x" * 200 + "\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert "big.py" in captured.err
+    assert "未列入清单" in _user_prompt(fake_chat_model)
+
+
+def test_review_size_gates_and_round_budget_are_the_admitted_values() -> None:
+    """闸门与轮次预算是定稿值，改动须过评审（数字在这里锁住）。"""
+    assert crw.cli._REVIEW_MAX_FILES == 200
+    assert crw.cli._REVIEW_MAX_BYTES == 8 * 1024 * 1024
+    assert crw.cli._REVIEW_PROJECT_TOOL_ROUNDS == 30
+    assert agents_mod.MAX_TOOL_ROUNDS == 10
+
+
+def test_review_project_mode_uses_the_raised_tool_round_budget(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """整项目形态把工具轮次预算抬到 30；内联快审不抬（缺省仍是 10）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    real = crw.cli.agents_mod.build_review_runtime
+    seen: list[dict[str, object]] = []
+
+    def _spy(**kwargs: object) -> object:
+        seen.append(dict(kwargs))
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(crw.cli.agents_mod, "build_review_runtime", _spy)
+    fake_chat_model.load([fakes.ai_text("一。"), fakes.ai_text("二。")])
+
+    assert main(["review", str(tmp_path)]) == 0
+    assert seen[0]["max_tool_rounds"] == crw.cli._REVIEW_PROJECT_TOOL_ROUNDS
+
+    seen.clear()
+    assert main(["review", str(tmp_path / "a.py")]) == 0
+    assert "max_tool_rounds" not in seen[0]
+
+
+def test_review_per_file_option_keeps_the_old_shape(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--per-file``：显式回退到逐文件形态（调用次数 = 文件数，输出与报告按文件分节）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("结论一。"), fakes.ai_text("结论二。")])
+    target = tmp_path / "report.md"
+
+    assert main(["review", "--per-file", "-o", str(target), str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
     assert len(fake_chat_model.requests) == 2
+    assert "===== " in captured.out
+    assert "未列入清单" not in captured.err
+    report = target.read_text(encoding="utf-8")
+    assert "## " in report and "审查形态：整项目一次会话" not in report
+
+
+def test_review_single_file_stays_inline(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """单个文件仍是内联快审：正文在任务里，不要求审查者再去读。"""
+    configured_provider()
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", str(sample_path("divide_by_zero.py"))]) == 0
+
+    prompt = _user_prompt(fake_chat_model)
+    assert "无需再调用工具读取" in prompt
+    assert "def average" in prompt
+    assert "顺着 import / 调用链" not in prompt
+
+
+def test_review_stdin_stays_inline(
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdin 不参与整项目形态（单次、内容已在手）。"""
+    configured_provider()
+    monkeypatch.setattr("sys.stdin", io.StringIO("STDIN_MARKER = 1\n"))
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", "-"]) == 0
+
+    prompt = _user_prompt(fake_chat_model)
+    assert "STDIN_MARKER" in prompt
+    assert "无需再调用工具读取" in prompt
+    assert len(fake_chat_model.requests) == 1
+
+
+def test_review_project_failure_exits_2_without_a_partial_conclusion(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """整项目形态只有一次调用：失败即整批失败（退出 2、stdout 不留半截结论）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([RuntimeError("模型连接中断")])
+
+    assert main(["review", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "整项目审查失败" in captured.err
+    assert "模型连接中断" in captured.err
+    assert len(fake_chat_model.requests) == 1
+
+
+def test_review_project_invalid_json_exits_2(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--json`` 输出不合契约：一行可读原因 + 退出码 2，不输出残缺 JSON。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("这不是 JSON")])
+
+    assert main(["review", "--json", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "结构化输出无效" in captured.err
+
+
+def test_review_project_json_keeps_every_file_entry_and_flags_severe(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """一次调用的多条 ``files[]`` 全部采纳，顶层 summary 用审查者自己写的那份。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    report = {
+        "files": [
+            {
+                "file": "a.py",
+                "findings": [fakes.finding(severity="建议", location="a.py:1")],
+                "summary": "a 干净。",
+            },
+            {
+                "file": "b.py",
+                "findings": [fakes.finding(severity="严重", location="b.py:1")],
+                "summary": "b 有除零。",
+            },
+        ],
+        "summary": "整体看 b 需要修。",
+    }
+    fake_chat_model.load([fakes.ai_text(json.dumps(report, ensure_ascii=False))])
+
+    assert main(["review", "--json", str(tmp_path)]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["file"] for entry in payload["files"]] == ["a.py", "b.py"]
+    assert payload["summary"] == "整体看 b 需要修。"
+    assert len(fake_chat_model.requests) == 1
+
+
+def test_review_project_json_summary_falls_back_to_merged_file_summaries(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """审查者没写顶层 summary 时按逐文件摘要归并（``files[]`` 仍是那一份，不重拼）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    report = {
+        "files": [
+            {"file": "a.py", "findings": [], "summary": "a 干净。"},
+            {"file": "b.py", "findings": [], "summary": "b 干净。"},
+        ]
+    }
+    fake_chat_model.load([fakes.ai_text(json.dumps(report, ensure_ascii=False))])
+
+    assert main(["review", "--json", str(tmp_path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "a.py：a 干净。" in payload["summary"] and "b.py：b 干净。" in payload["summary"]
+
+
+def test_review_project_json_report_is_still_one_document(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """``--json`` 与 ``-o`` 同用在整项目形态下也是一份报告（结构化结论 + 目标与文件数标题）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    report = {
+        "files": [
+            {
+                "file": "a.py",
+                "findings": [fakes.finding(severity="严重", location="a.py:1")],
+                "summary": "a 有除零。",
+            },
+            {"file": "b.py", "findings": [], "summary": "b 干净。"},
+        ],
+        "summary": "整体只有 a 需要修。",
+    }
+    fake_chat_model.load([fakes.ai_text(json.dumps(report, ensure_ascii=False))])
+    target = tmp_path / "report.md"
+
+    assert main(["review", "--json", "-o", str(target), str(tmp_path)]) == 1
+
+    text = target.read_text(encoding="utf-8")
+    assert text.count("# crw 审查报告") == 1  # 一份文件里不叠两个报告标题
+    assert "整项目一次会话，共 2 个文件" in text
+    assert "## a.py" in text and "## b.py" in text  # 结构化条目原样进报告
+    assert "整体只有 a 需要修。" in text
+
+
+def test_review_project_interrupt_reports_usage_and_exits_2(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """整项目形态被中断：一行提示 + 退出码 2，已花掉的用量照旧回显。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    fake_chat_model.load(
+        [
+            fakes.ai_tool_call(
+                "read_file",
+                path="a.py",
+                usage=fakes.call_usage(input_tokens=900, output_tokens=90),
+            ),
+            KeyboardInterrupt(),
+        ]
+    )
+
+    assert main(["review", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "已中断" in captured.err
+    assert "[用量]" in captured.err
+
+
+def test_review_project_writes_a_single_report(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-o`` 在整项目形态输出**一份**报告：标题含被审目标与文件数，正文是那一次结论。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("跨文件问题：签名对不上。")])
+    target = tmp_path / "report.md"
+
+    assert main(["review", "-o", str(target), str(tmp_path)]) == 0
+
+    text = target.read_text(encoding="utf-8")
+    assert text.startswith("# crw 审查报告")
+    assert f"> 审查对象：{tmp_path.as_posix()}" in text.replace("\\", "/")
+    assert "整项目一次会话，共 2 个文件" in text
+    assert "跨文件问题：签名对不上。" in text
+    assert text.count("# crw 审查报告") == 1
+    assert "报告已写入" in capsys.readouterr().err
 
 
 def test_review_reads_stdin(
@@ -1009,6 +1462,22 @@ def test_review_no_exec_hides_the_execution_tool(
     assert bound and "run_python" not in bound
 
 
+def test_review_project_no_exec_tells_the_reviewer_static_only(
+    tmp_path: Path,
+    configured_provider: Callable[[], dict[str, object]],
+    fake_chat_model: object,
+) -> None:
+    """整项目形态的 ``--no-exec`` 同样落到任务文本（静态审查口径一致）。"""
+    configured_provider()
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("print(2)\n", encoding="utf-8")
+    fake_chat_model.load([fakes.ai_text("结论。")])
+
+    assert main(["review", "--no-exec", str(tmp_path)]) == 0
+
+    assert "--no-exec" in _user_prompt(fake_chat_model)
+
+
 def test_review_missing_path_is_a_run_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["review", "no/such/file.py"]) == 2
 
@@ -1029,6 +1498,31 @@ def test_review_reports_model_failure_with_exit_code_2(
     assert main(["review", str(sample_path("syntax_error.py"))]) == 2
 
     assert "审查失败" in capsys.readouterr().err
+
+
+def test_review_directory_without_text_files_is_a_run_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """目录里只有隐藏与二进制文件：给可读原因，不发起任何调用。"""
+    (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01")
+
+    assert main(["review", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "没有可审查的文本文件" in captured.err
+
+
+def test_review_empty_directory_is_a_run_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """空目录不是可审查目标：退出 2（不进入模型调用）。"""
+    assert main(["review", str(tmp_path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "没有可审查的文本文件" in captured.err
 
 
 # ---- crw config：供应商配置与连通性自检（Design §8.3）----
@@ -1360,6 +1854,122 @@ def test_config_menu_sets_model_thinking_levels(
         "name": "deepseek-flash",
         "thinking": {"levels": ["off", "low", "high"], "selected": "high"},
     }
+
+
+def test_config_menu_can_follow_the_preset_default(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """菜单 6 输入「跟随默认」：默认挡位取预设的关闭档，而不是停在供应商出厂的"思考开、high"。"""
+    config_mod.save_raw(
+        {
+            "providers": [
+                {
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "placeholder-key",
+                    "models": [
+                        {
+                            "name": "deepseek-flash",
+                            "thinking": {"levels": ["off", "high"], "selected": "high"},
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    answers = iter(["6", "1", "1", "", "跟随默认", "0"])
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    models = config_mod.load_raw()["providers"][0]["models"]
+    assert models[0]["thinking"] == {"levels": ["off", "high"], "selected": "off"}
+    assert "将按预设默认挡位设为 off" in capsys.readouterr().out
+
+
+def test_config_menu_warns_when_clearing_an_always_thinking_provider(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """「清空」不再等于"省"：它退回供应商默认（DeepSeek 是思考开、high），必须提醒。"""
+    config_mod.save_raw(
+        {
+            "providers": [
+                {
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "placeholder-key",
+                    "models": [
+                        {
+                            "name": "deepseek-flash",
+                            "thinking": {"levels": ["off", "high"], "selected": "high"},
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    answers = iter(["6", "1", "1", "清空", "0"])
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "清空后不发送任何思考参数" in out
+    assert "跟随默认" in out
+
+
+def test_adding_a_preset_provider_carries_the_off_default(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """按预设添加供应商：模型条目自带"关闭思考"的默认挡位（产品默认=不发散输出）。"""
+    answers = iter(
+        [
+            "1",  # 添加供应商
+            "2",  # 类型：DeepSeek 预设
+            "",  # 接入点：官方
+            "",  # 模型清单：用预填
+            "placeholder-key",
+            "1",  # key 存明文
+            "0",  # 退出
+        ]
+    )
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    models = config_mod.load_raw()["providers"][0]["models"]
+    assert models[0]["thinking"]["selected"] == "off"
+    assert models[1]["thinking"]["selected"] == "off"
+
+
+def test_config_shows_the_always_on_thinking_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """恒开型供应商在配置顶部如实回显：思考不可关闭、成本不可控、未预填挡位。"""
+    config_mod.save_raw(
+        {
+            "providers": [
+                {
+                    "name": "Z.ai API",
+                    "base_url": "https://api.z.ai/api/paas/v4",
+                    "api_key": "placeholder-key",
+                    "models": ["glm-5.3"],
+                }
+            ]
+        }
+    )
+    answers = iter(["0"])
+    monkeypatch.setattr(crw.cli, "_ask", lambda prompt: next(answers, None))
+    monkeypatch.setattr(crw.cli, "_read_key", lambda prompt: next(answers, ""))
+
+    assert main(["config"]) == 0
+
+    out = capsys.readouterr().out
+    assert "思考不可关闭" in out
+    assert "成本不可控" in out
 
 
 def test_config_menu_thinking_clears_when_told_to(

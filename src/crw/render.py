@@ -1084,10 +1084,14 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
     return text
 
 
+#: ``crw review`` 各形态报告的标题（同一份文件里不得出现两个标题，拼装时按它去重）
+REVIEW_REPORT_TITLE = "# crw 审查报告"
+
+
 def review_json_report(merged: Mapping[str, Any]) -> str:
     """``crw review --json`` 的 Markdown 报告（``-o`` 与 ``--json`` 可同时使用）。"""
     stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    lines = ["# crw 审查报告", "", f"> 生成时间：{stamp}（--json 模式）", ""]
+    lines = [REVIEW_REPORT_TITLE, "", f"> 生成时间：{stamp}（--json 模式）", ""]
     for entry in merged.get("files") or []:
         # 展示层不做契约假设：条目缺字段时给占位，不让报告端直接 KeyError
         lines += [
@@ -1122,7 +1126,7 @@ def review_text_report(files: Sequence[tuple[str, str]], answers: Sequence[str |
     """
     stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        "# crw 审查报告",
+        REVIEW_REPORT_TITLE,
         "",
         f"> 生成时间：{stamp}",
         f"> 审查对象：{', '.join(name for name, _ in files)}",
@@ -1131,3 +1135,37 @@ def review_text_report(files: Sequence[tuple[str, str]], answers: Sequence[str |
     for (display_name, _), answer in zip(files, answers, strict=True):
         lines += [f"## {display_name}", "", answer or "[该文件审查失败，结论不可用]", ""]
     return "\n".join(lines)
+
+
+def review_project_report(*, targets: Sequence[str], file_count: int, body: str) -> str:
+    """整项目一次会话的 Markdown 报告：**一份**报告，标题含被审目标与文件数，正文是那一次结论。
+
+    单独成函数而不在 :func:`review_text_report` 里加分支：逐文件形态的"每文件一段"对
+    整项目形态没有意义——结论出自同一位审查者的同一次判断，不按文件切分。
+
+    正文自带标题与生成时间时（``--json`` 复用 :func:`review_json_report` 的渲染）在外层
+    去重：一份文件里出现两个 ``# 报告标题`` 会被读成两份报告拼在一起。
+    """
+    stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        REVIEW_REPORT_TITLE,
+        "",
+        f"> 生成时间：{stamp}",
+        f"> 审查对象：{', '.join(targets)}",
+        f"> 审查形态：整项目一次会话，共 {file_count} 个文件",
+        "",
+        _strip_report_header(body) or "（本次会话未产出结论正文）",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _strip_report_header(text: str) -> str:
+    """去掉正文开头自带的报告标题与其后的生成时间行（外层已给）。"""
+    body = text.strip()
+    if body.startswith(REVIEW_REPORT_TITLE):
+        body = body[len(REVIEW_REPORT_TITLE) :].lstrip()
+    if body.startswith("> 生成时间："):
+        _, _, rest = body.partition("\n")
+        body = rest.lstrip()
+    return body

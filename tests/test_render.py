@@ -637,6 +637,44 @@ def test_review_json_report_keeps_the_overall_section_for_multiple_files() -> No
     assert "a.py：干净。；b.py：也干净。" in text
 
 
+def test_review_project_report_is_one_document_for_the_whole_project() -> None:
+    """整项目一次会话的报告：标题含被审目标与文件数，正文是那一次结论（不分文件切分）。"""
+    text = render.review_project_report(
+        targets=["pkg"], file_count=7, body="跨文件问题：main.py 与 util.py 签名对不上。"
+    )
+
+    assert text.startswith("# crw 审查报告")
+    assert text.count("# crw 审查报告") == 1
+    assert "> 审查对象：pkg" in text
+    assert "整项目一次会话，共 7 个文件" in text
+    assert "跨文件问题：main.py 与 util.py 签名对不上。" in text
+    assert "## pkg" not in text  # 不套用逐文件形态的分节标题
+
+
+def test_review_project_report_marks_an_empty_body_readably() -> None:
+    """正文为空也要成文：如实标注没有结论，而不是交出一份空报告。"""
+    text = render.review_project_report(targets=["pkg"], file_count=1, body="   ")
+
+    assert "未产出结论正文" in text
+
+
+def test_review_project_report_does_not_stack_two_report_headers() -> None:
+    """``--json`` 的正文来自 review_json_report（自带标题与时间戳）：拼装后仍是一份文件。"""
+    inner = render.review_json_report(
+        {
+            "files": [{"file": "a.py", "findings": [], "summary": "干净。"}],
+            "summary": "干净。",
+        }
+    )
+
+    text = render.review_project_report(targets=["pkg"], file_count=3, body=inner)
+
+    assert text.count(render.REVIEW_REPORT_TITLE) == 1
+    assert text.count("> 生成时间：") == 1
+    assert "整项目一次会话，共 3 个文件" in text
+    assert "## a.py" in text
+
+
 def test_streamed_text_without_trailing_newline_is_not_glued_to_the_stage_line() -> None:
     """流式正文末尾没有换行时，紧随其后的阶段行另起一行（实测模型正文有时不以换行收尾）。"""
     renderer, _, err = make_stream_renderer(True)
