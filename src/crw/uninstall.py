@@ -447,9 +447,12 @@ def _cleanup_registered_env_vars(io: UninstallIO, names: Sequence[str]) -> bool:
 def _data_dir_block_reason(data_dir: Path, home_override: str) -> str | None:
     """数据目录删除的放行判定；返回拒绝原因（``None`` = 允许删除）。
 
-    两道保险（Design §6.2 #8）：① 目录名必须是默认的 ``.crw``，或 ``CRW_HOME`` 被显式
+    三道保险（Design §6.2 #8）：① 目录名必须是默认的 ``.crw``，或 ``CRW_HOME`` 被显式
     设置（只有用户主动指定的目录才算数）；② 绝不删除仓库目录——即使命中第 ① 条，含
-    ``.git`` 的目录与当前工作目录及其上级也一律拒绝，防误删代码仓库。
+    ``.git`` 的目录与当前工作目录及其上级也一律拒绝，防误删代码仓库；③ 绝不删除
+    **文件系统根**——第 ① 条把"设了 CRW_HOME"当成用户意图，而 `CRW_HOME=/` 这类误配
+    恰好是"设了但指错了"，主目录与上级两道拦不住跨盘的根（Windows 上主目录在另一块盘时
+    `home.is_relative_to(根)` 为假），确认前必须拦下。
     """
     if data_dir.name != config_mod.DEFAULT_HOME_NAME and not home_override.strip():
         return (
@@ -460,6 +463,8 @@ def _data_dir_block_reason(data_dir: Path, home_override: str) -> str | None:
         target = data_dir.resolve()
     except OSError:
         target = data_dir
+    if target.parent == target:
+        return "该目录是文件系统根目录（本程序绝不删除）"
     if (target / ".git").exists():
         return "该目录是一个 Git 仓库（本程序绝不删除仓库目录）"
     try:

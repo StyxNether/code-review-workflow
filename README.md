@@ -141,7 +141,7 @@ $ uv run crw chat
 | `crw review <路径...> \| -` | 单 Agent 快速审查（只查不改）：**目录或多于一个路径 = 整项目一次会话**（给文件清单，审查者按需 `read_file` 并顺 import / 调用链读同项目其他文件）；单个文件与 `-`（stdin）为内联快审；`--per-file` 回退到逐文件形态；`-o, --out <文件>` 输出 Markdown 报告，`--json` 结构化输出，`--no-exec` 关闭执行，`--model / --provider` 临时覆盖 |
 | `crw config [test]` | 模型供应商配置 / 连通性自检 / 思考挡位 / 运行默认值（轮次默认与上限） |
 | `crw graph [-o, --out <文件>] [--parallel-review]` | 导出工作流 mermaid 流程图（节点 / 边集合与实现一致，由快照测试锁定；默认输出 stdout） |
-| `crw uninstall` | 卸载：分级确认后清理程序 / 垫片 → PATH 条目 → 登记的环境变量 → 用户数据（确认前零删除） |
+| `crw uninstall` | 卸载：分级确认后清理程序 / 垫片 → PATH 条目 → 登记的环境变量 → 用户数据（确认前零删除；数据目录删除有放行保险——文件系统根、Git 仓库、用户主目录与当前工作目录的上级一律拒绝并提示手工删除） |
 | `crw --version` | 版本号 |
 
 `crw run` 选项：

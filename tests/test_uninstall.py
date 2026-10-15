@@ -510,3 +510,19 @@ def test_data_dir_guard_refuses_home_and_its_ancestors() -> None:
     assert uninstall._data_dir_block_reason(home, str(home)) is not None
     root = Path(home.anchor)
     assert uninstall._data_dir_block_reason(root, str(root)) is not None
+
+
+def test_data_dir_guard_refuses_every_filesystem_root() -> None:
+    """文件系统根由专门那道保险拦下（Windows 跨盘时"主目录的上级"拦不住别的盘的根）。"""
+    own_root = Path(Path.cwd().anchor)
+    assert (
+        uninstall._data_dir_block_reason(own_root, str(own_root))
+        == "该目录是文件系统根目录（本程序绝不删除）"
+    )
+    if os.name == "nt":
+        for letter in ("C", "D", "E", "F"):
+            other = Path(f"{letter}:\\")
+            assert (
+                uninstall._data_dir_block_reason(other, str(other))
+                == "该目录是文件系统根目录（本程序绝不删除）"
+            )
