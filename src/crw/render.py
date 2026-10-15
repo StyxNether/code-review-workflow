@@ -431,9 +431,15 @@ class RunRenderer:
             self._end_stage(node, keep_open=True)
 
     def discard_text(self, node: str | None = None) -> None:
-        """丢弃缓存的正文与过滤器状态（契约重试时前次输出不再渲染）。"""
+        """丢弃缓存的正文与过滤器状态（契约重试时前次输出不再渲染）。
+
+        未指定节点时与 :meth:`flush_text` 同口径遍历两类暂存：只流式写出、没有缓冲的节点
+        其过滤器里仍可能暂扣行首片段或待闭合围栏，漏掉它会把上一阶段的残留带进下一阶段。
+        """
         with self._lock:
-            targets = [node] if node is not None else list(self._buffers)
+            targets = (
+                [node] if node is not None else list(self._buffers.keys() | self._filters.keys())
+            )
             for name in targets:
                 self._buffers.pop(name, None)
                 self._filters.pop(name, None)

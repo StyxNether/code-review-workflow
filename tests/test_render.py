@@ -537,6 +537,21 @@ def test_no_stream_buffers_text_until_the_stage_ends() -> None:
     assert err.getvalue().index("第一段第二段") < err.getvalue().index("[审查] 第 1 轮")
 
 
+def test_discard_text_without_node_clears_streaming_nodes_too() -> None:
+    """``discard_text()`` 未指定节点时与 ``flush_text`` 同口径遍历两类暂存。
+
+    流式写出的节点只有过滤器状态、没有缓冲；只遍历缓冲会让它暂扣的行首片段活到下一阶段。
+    """
+    renderer, _, err = make_stream_renderer(True)
+
+    renderer.on_delta("review", "```python")  # 行首像围栏标记，被暂扣
+    renderer.discard_text()
+    renderer.on_delta("review", "\n正文内容")
+
+    assert "```" not in err.getvalue()
+    assert "正文内容" in err.getvalue()  # 旧口径下围栏状态残留，这段会被当成围栏内容吞掉
+
+
 def test_retried_text_is_not_rendered_again() -> None:
     """契约重试：重试后的正文不再渲染（前次已流出，重复渲染只会让人看到两段叙述）。"""
     renderer, _, err = make_stream_renderer(True)
