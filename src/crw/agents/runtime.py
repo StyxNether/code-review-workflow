@@ -43,7 +43,7 @@ from langchain_core.tools import StructuredTool, tool
 
 from .. import config, llm
 from .. import usage as usage_mod
-from ..tools import ERROR_PREFIX, EXEC_TOOL_NAME, Tool, ToolRegistry
+from ..tools import ERROR_PREFIX, EXEC_TOOL_NAME, Tool, ToolRegistry, arguments_preview
 
 #: 单个节点任务允许的最大工具轮次，超过则强制要求模型给出结论
 MAX_TOOL_ROUNDS = 10
@@ -284,7 +284,11 @@ class _ToolBridgeMiddleware(AgentMiddleware):
     def _emit_tool_event(self, name: str, arguments: str) -> None:
         sink, node = self.callbacks or (None, "")
         if sink is not None:
-            sink({"node": node, "event": "tool", "detail": f"{name}({arguments})"})
+            # 参数用预览形态：write_file 的完整正文可达数十 KB，事件 detail 是
+            # 可读线索（终端工具行与日志消费同一份），不是产物的副本
+            sink(
+                {"node": node, "event": "tool", "detail": f"{name}({arguments_preview(arguments)})"}
+            )
 
     def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], Any]) -> Any:
         """模型通道错误前缀归一：框架合成的错误提示（如畸形 JSON 参数）不经工具层，

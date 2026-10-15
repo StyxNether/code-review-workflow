@@ -83,6 +83,32 @@ class TestRuntimeBasics:
         assert tools and tools[0]["node"] == "review"
         assert "read_file" in tools[0]["detail"] and "code_v1.py" in tools[0]["detail"]
 
+    def test_tool_event_detail_is_a_truncated_preview(self, workspace: Path) -> None:
+        events: list[dict[str, Any]] = []
+        body = "".join(f"value_{index} = {index}\n" for index in range(200))
+        model = fakes.ScriptedChatModel(
+            responses=[
+                fakes.ai_tool_call("write_file", path="big.py", content=body),
+                fakes.ai_text("已写回。"),
+            ]
+        )
+        runtime = make_runtime(model, emit=events.append)
+
+        runtime.run(
+            node="fix",
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt="修复",
+            registry=build_registry([workspace]),
+        )
+
+        tools = [event for event in events if event["event"] == "tool"]
+        assert len(tools) == 1
+        detail = str(tools[0]["detail"])
+        # 事件 detail 是可读线索而非产物副本：整份正文不进事件（终端与日志消费同一份）
+        assert detail.startswith("write_file({") and detail.endswith("…)")
+        assert len(detail) <= 200
+        assert "value_199" not in detail
+
     def test_forwards_text_deltas(self, workspace: Path) -> None:
         deltas: list[tuple[str, str]] = []
         model = fakes.ScriptedChatModel(responses=[fakes.ai_text("一。二。三。")])
