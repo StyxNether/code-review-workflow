@@ -1,6 +1,7 @@
 """结构化交接契约：审查 findings 与修复 fixes 的定义、校验与 id 追溯。
 
-契约对象为普通数据结构，校验规则见 Design §5.2；校验失败的反馈经节点重试接缝回传。
+契约对象为普通数据结构：每个入口只做"抽取 + 逐条校验 + 归一"，校验失败时把可读错误清单
+经节点重试接缝回传给模型重试一次。
 """
 
 from __future__ import annotations
@@ -14,31 +15,31 @@ from typing import Any
 
 from .state import Finding
 
-#: severity 枚举（Design §5.2）
+#: severity 枚举：阻塞判定与报告只认这三个取值
 SEVERE = "严重"
 MODERATE = "一般"
 ADVICE = "建议"
 SEVERITIES: tuple[str, ...] = (SEVERE, MODERATE, ADVICE)
 
-#: fixes.status 枚举（Design §5.2）
+#: fixes.status 枚举：标记 skipped 时必须附理由
 FIX_STATUSES: tuple[str, ...] = ("fixed", "partial", "skipped")
 
-#: 代码围栏可接受的语言标签（Design §4.2.1：python / py 不区分大小写）
+#: 代码围栏可接受的语言标签（python / py 不区分大小写）
 CODE_LABELS: tuple[str, ...] = ("python", "py")
 JSON_LABELS: tuple[str, ...] = ("json",)
 
-#: 版本量级上限（Design §4.2.2：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB）
+#: 版本量级上限：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB
 MAX_VERSION_FILES = 20
 MAX_FILE_BYTES = 256 * 1024
 MAX_VERSION_BYTES = 1024 * 1024
 
-# 围栏 info 允许空格分隔的多个词（`` ```python file=<相对路径> ``，Design §4.2.2），
+# 围栏 info 允许空格分隔的多个词（`` ```python file=<相对路径> ``），
 # 但不得含反引号 / 波浪号：闭合标记行靠"info 为空"识别，info 里出现围栏字符会破坏该判据
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?:[ \t]*(?P<info>[^`~]*?))?[ \t]*$")
 
 
 class ContractViolation(ValueError):
-    """契约校验失败：携带逐条可读错误清单（Design §5.2 的重试接缝输入）。"""
+    """契约校验失败：携带逐条可读错误清单，清单即节点重试的反馈输入。"""
 
     def __init__(self, errors: Sequence[str]) -> None:
         self.errors: tuple[str, ...] = tuple(errors)
@@ -58,7 +59,7 @@ class ReviewResult:
 
 @dataclass(frozen=True)
 class FixResult:
-    """一轮修复的校验后结果（写盘形态，Design §4.2.2 / M5a B 项）。
+    """一轮修复的校验后结果（写盘形态）。
 
     修复节点用 ``write_file`` 只写改动的文件，产物内容因此**不经过本契约**——这里只
     承载处置清单与删除申请；版本目录的实际文件集合由引擎按磁盘内容校验与重算。
@@ -66,13 +67,13 @@ class FixResult:
 
     fixes: list[dict[str, Any]]
     unknown_ids: tuple[str, ...]
-    """未知 finding_id（Design §5.2：忽略并在报告标注）。"""
+    """未知 finding_id：忽略该条，仅在报告中标注。"""
 
     deleted: tuple[str, ...] = ()
-    """修复 Agent **提出**删除的路径（执行前须用户确认，Design §4.2.2）。"""
+    """修复 Agent **提出**删除的路径：执行前须用户确认。"""
 
     extra_fences: int = 0
-    """被忽略的多余围栏数（Design §4.2.1：其余围栏忽略并记 log）。"""
+    """被忽略的多余围栏数：其余围栏忽略但记入日志。"""
 
 
 @dataclass(frozen=True)
@@ -87,7 +88,7 @@ class CodeFence:
 
 
 def extract_fence(text: str, labels: Sequence[str]) -> list[str]:
-    """按 Markdown 语义抽取指定语言标签的围栏内容（Design §4.2.1）。
+    """按 Markdown 语义抽取指定语言标签的围栏内容。
 
     闭合行需同种字符且长度不短于开启行（可写更长的反引号包住内容）；语言标签大小写
     不敏感；未闭合的围栏整块丢弃（内容不完整，抽取失败交给重试处理）。
@@ -106,7 +107,7 @@ def scan_fences(text: str) -> list[tuple[str, str]]:
 
 
 def scan_file_fences(text: str, labels: Sequence[str] = CODE_LABELS) -> list[CodeFence]:
-    """抽取带语言标签的代码围栏及其 ``file=`` 声明（Design §4.2.2 的产出契约）。
+    """抽取带语言标签的代码围栏及其 ``file=`` 声明（版本产出契约的入口）。
 
     语言标签不区分大小写；``file=`` 参数取 info 中最后一个 ``file=`` 词，可带成对引号
     （路径含空格时的声明写法）；未声明 ``file=`` 时 :attr:`CodeFence.file` 为 ``None``。
@@ -122,7 +123,7 @@ def scan_file_fences(text: str, labels: Sequence[str] = CODE_LABELS) -> list[Cod
 def _scan_fence_blocks(text: str) -> list[tuple[str, str, str]]:
     """围栏扫描的单一实现：按出现顺序返回 ``(标签, info 原文, 内容)``。
 
-    闭合行需同种字符且长度不短于开启行、info 为空（Design §4.2.1）；未闭合的围栏整块
+    闭合行需同种字符且长度不短于开启行、info 为空；未闭合的围栏整块
     丢弃（内容不完整，抽取失败交给重试处理）。
     """
     blocks: list[tuple[str, str, str]] = []
@@ -175,8 +176,8 @@ def _file_argument(info: str) -> str | None:
 def validate_version_path(raw: str) -> str:
     """校验"版本内相对路径"并归一为 posix 风格；违规抛 :class:`ContractViolation`。
 
-    拒绝绝对路径、盘符、``~`` 展开、越出版本的 ``..`` 段与空路径——版本目录是产物边界
-    （Design §4.2.2），声明路径必须落在它内部。反斜杠按 Windows 心智归一为 ``/``。
+    拒绝绝对路径、盘符、``~`` 展开、越出版本的 ``..`` 段与空路径——版本目录是产物
+    边界，声明路径必须落在它内部。反斜杠按 Windows 心智归一为 ``/``。
     """
     text = raw.replace("\\", "/").strip()
     if not text:
@@ -197,7 +198,7 @@ def parse_review_output(
     files: Sequence[str],
     has_tool_evidence: bool = True,
 ) -> ReviewResult:
-    """抽取并校验审查契约对象（Design §5.2 的多文件形态）。
+    """抽取并校验审查契约对象（多文件形态）。
 
     Args:
         text: 审查节点交回的原始文本，应含恰好一个 ```json 围栏。
@@ -206,7 +207,7 @@ def parse_review_output(
         files: 当前版本的权威文件清单（版本内相对路径；节点若给出 ``files`` 必须一致）。
         has_tool_evidence: 本轮是否已有成功工具事件或内联送达记录（执行有效性门禁）。
             假节点 / 注入桩没有工具调用，调用方传 ``True``——契约文本本身就是"内联送达
-            记录"；工具事件的真实判定由 Agent 运行时统计（Design §5.2 的同一门禁）。
+            记录"；工具事件的真实判定由 Agent 运行时统计，两处是同一门禁。
 
     Returns:
         :class:`ReviewResult`；契约非法时抛 :class:`ContractViolation`（附错误清单）。
@@ -249,7 +250,7 @@ def parse_review_output(
         errors.append("summary 必须为字符串")
         summary = ""
 
-    # 执行有效性门禁（Design §5.2）：空 findings 必须是"确实审查过"的结论，而非未执行的逃逸。
+    # 执行有效性门禁：空 findings 必须是"确实审查过"的结论，而非未执行的逃逸。
     if not findings and (not has_tool_evidence or not summary.strip()):
         errors.append("findings 为空且缺少执行证据（工具事件 / summary）：视为审查未执行")
 
@@ -257,7 +258,7 @@ def parse_review_output(
         raise ContractViolation(errors)
 
     contract: dict[str, Any] = dict(raw)
-    # 旧单文件契约的顶层键已被 files 取代（Design §4.2.2）：残留的 "file" 不进落盘对象，
+    # 旧单文件契约的顶层键已被 files 取代：残留的 "file" 不进落盘对象，
     # 避免 show / 报告两类消费方读到两种口径
     contract.pop("file", None)
     contract.update(
@@ -273,11 +274,11 @@ def parse_review_output(
 
 
 def collect_version_files(text: str, *, require_path: bool) -> tuple[dict[str, str], int, int]:
-    """抽取产出契约的版本文件表：路径 → 内容（Design §4.2.2）。
+    """抽取产出契约的版本文件表：路径 → 内容。
 
     每个文件一个 python 围栏，围栏 info 必须声明 ``file=<版本内相对路径>``；重复路径取
     最后一个并计数（阶段摘要记"已忽略重复声明"）。同时执行量级上限：文件数、单文件与
-    版本总字节数超限按契约违规重试（Design §4.2.2）。
+    版本总字节数超限按契约违规重试。
 
     Args:
         text: 节点交回的原始文本。
@@ -329,7 +330,7 @@ def parse_fix_output(
     findings: Sequence[Mapping[str, Any]],
     current_files: Sequence[str],
 ) -> FixResult:
-    """校验修复产出：fixes 处置清单与删除申请（Design §4.2.2 / §5.2 的写盘形态）。
+    """校验修复产出：fixes 处置清单与删除申请（写盘形态）。
 
     fixes 必须覆盖上一轮 findings 的 id 全集（缺项即违规，交重试处理）；重复 id 取最后
     一条；未知 id 忽略并在报告标注；``skipped`` 必须给出理由。删除在同一围栏里以
@@ -423,7 +424,7 @@ def parse_fix_output(
 def _deleted_paths(
     raw: Mapping[str, Any], current_files: Sequence[str], errors: list[str]
 ) -> list[str]:
-    """解析 fixes 围栏里的 ``{"deleted": […]}`` 删除声明（Design §4.2.2）。
+    """解析 fixes 围栏里的 ``{"deleted": […]}`` 删除声明。
 
     声明路径必须都在当前版本内；重复路径去重保序。错误并入调用方的同一份清单，
     重试一次就能拿到全部问题，少一轮往返。
@@ -451,7 +452,7 @@ def _deleted_paths(
 
 
 def version_size_errors(files: Mapping[str, str]) -> list[str]:
-    """版本量级上限（Design §4.2.2：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB）。
+    """版本量级上限：文件数 ≤ 20、单文件 ≤ 256 KB、版本总计 ≤ 1 MB。
 
     编码围栏产出与修复节点的写盘结果共用这一把尺子：两条产出路径的超限语义必须一致。
     """
@@ -474,7 +475,7 @@ def version_size_errors(files: Mapping[str, str]) -> list[str]:
 
 
 def judge_clean(findings: Sequence[Mapping[str, Any]], *, severe_only: bool = False) -> bool:
-    """干净判定（Design §4.4）：默认【严重】与【一般】都阻塞；``severe_only`` 放宽为只阻塞【严重】。"""
+    """干净判定：默认【严重】与【一般】都阻塞；``severe_only`` 放宽为只阻塞【严重】。"""
     return blocking_count(findings, severe_only=severe_only) == 0
 
 
@@ -500,7 +501,7 @@ def _severity_rank(value: Any) -> int:
 def merge_findings(
     groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
 ) -> list[Finding]:
-    """并行双视角审查的 findings 合并（Design §12.2 的汇合规则）。
+    """并行双视角审查的 findings 汇合规则。
 
     - 去重键 = ``(location, issue)``：同一问题被两个视角都报出时只留一条；
     - 取**较严重**者：``severity`` 按 严重 < 一般 < 建议 的次序取更严重的一个，随它一起
@@ -523,7 +524,7 @@ def merge_findings(
                 merged[key] = {
                     # 首次入表也走同一套归一：枚举外的 severity 一律按【建议】处理，
                     # 否则它会原样落进结果、在 blocking_count 里"既不计严重也不计一般"
-                    # 而静默绕过干净判定（Design §4.4 的判据必须只看枚举内取值）
+                    # 而静默绕过干净判定——判据只能看枚举内取值
                     "severity": _severity_name(item.get("severity")),
                     "location": key[0],
                     "issue": key[1],
@@ -547,7 +548,7 @@ def merge_findings(
 
 
 def finding_keys(findings: Sequence[Mapping[str, Any]]) -> frozenset[tuple[str, str]]:
-    """findings 的 ``(location, issue)`` 集合（未收敛判定用，Design §4.4）。
+    """findings 的 ``(location, issue)`` 集合（未收敛判定用）。
 
     非 Mapping 的条目（损坏记录 / 手改过的 review_N.json）跳过——判定读的是展示数据，
     不该因一条残缺条目整体失败。
@@ -559,14 +560,14 @@ def finding_keys(findings: Sequence[Mapping[str, Any]]) -> frozenset[tuple[str, 
     )
 
 
-# ---- crw review 的报告契约（前作 files[] 形态，Design §6.4）----
+# ---- crw review 的报告契约（files[] 形态）----
 
 
 def review_report_errors(data: Any) -> list[str]:
     """``crw review --json`` 报告的 schema 校验；返回错误清单（空 = 通过）。
 
-    沿用前作的 ``files[]`` 形态（Design §6.4：保持既有消费方式）：顶层
-    ``{"files": [{file, findings, summary}], "summary"}``。**会就地补全** ``uncertain``
+    报告形态固定为顶层 ``{"files": [{file, findings, summary}], "summary"}``，
+    消费方（终端展示与脚本）只按这一种结构读。**会就地补全** ``uncertain``
     缺省值（`False`）——本函数既校验也归一，调用方拿到的是补全后的同一对象；``files``
     为空是唯一允许的空数组例外（表示"没有可用的审查结果"，由
     :func:`merge_review_reports` 产出，不是模型输出）。
@@ -688,7 +689,7 @@ def residual_severe(findings: Sequence[Mapping[str, Any]]) -> int:
 
 
 def manifest_payload(*, version: int, files: Mapping[str, str]) -> dict[str, Any]:
-    """版本 manifest 的载荷（Design §4.2.2：文件清单 + sha256 + 行数）。
+    """版本 manifest 的载荷：文件清单 + sha256 + 行数。
 
     "本轮未产生改动"的整版本比较即对比两份 manifest 的 ``路径 → sha256`` 映射；
     行数供报告与展示层直接取用。路径按字典序排列，保证同内容同清单。

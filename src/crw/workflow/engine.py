@@ -1,7 +1,7 @@
 """运行驱动：工作区建立、图执行、节点边界事件与快照、报告生成与退出码确定。
 
-状态载体是图执行上下文本身，本模块只做生命周期组织，不维护第二份内存正本（Design §3.1、§4.5）。
-节点输出经本模块的契约包装层校验、重试与落盘：节点自身不接触文件、不打印、不写日志（Design §3.1、§4.2.1）。
+状态载体是图执行上下文本身，本模块只做生命周期组织，不维护第二份内存正本。
+节点输出经本模块的契约包装层校验、重试与落盘：节点自身不接触文件、不打印、不写日志。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from .graph import NodeFn
 from .records import RoundReport, RunRecordError
 from .state import RunState
 
-#: 内置默认修复轮次上限（Design §4.4）
+#: 内置默认修复轮次上限
 DEFAULT_MAX_ITERATIONS = 3
 
 #: 节点名 → 显示名（终端阶段面板、报告、详情与退出码文案共用一处口径）
@@ -43,7 +43,7 @@ NODE_LABELS: dict[str, str] = {
     "fix": "修复",
 }
 
-#: 失败信息与事件 detail 的显示上限（沿用 Design §8.2 的 400 字符惯例）
+#: 失败信息与事件 detail 的显示上限（与日志预览同一把尺子，400 字符）
 MAX_ERROR_CHARS = 400
 
 #: 未提供模型配置时的模型标识占位（仅程序化调用会走到）
@@ -58,7 +58,7 @@ Timer = Callable[[], float]
 RunIdFactory = Callable[[], str]
 #: 缺省节点装配所需的运行时工厂：收到事件 / 增量回调，返回单任务 Agent 运行时
 RuntimeFactory = Callable[[agents_mod.EventSink, agents_mod.DeltaSink], agents_mod.AgentRuntime]
-#: 删除确认闸门（Design §4.2.2）：入参为待删清单（``path`` + 对应 findings 的理由），
+#: 删除确认闸门：入参为待删清单（``path`` + 对应 findings 的理由），
 #: 返回是否确认删除。``None`` = 非交互（一律保留并标注"待确认删除（未执行）"）。
 DeletionConfirmer = Callable[[Sequence[Mapping[str, Any]]], bool]
 
@@ -69,7 +69,7 @@ def local_now() -> str:
 
 
 class PersistenceError(RuntimeError):
-    """运行记录落盘失败（Design §4.6：按运行失败处理，退出码 2）。"""
+    """运行记录落盘失败：按运行失败处理，退出码 2。"""
 
 
 class _NodeFailure(RuntimeError):
@@ -96,7 +96,7 @@ class _NodeFailure(RuntimeError):
 
 
 class RunObserver(Protocol):
-    """运行过程观察者（渲染层实现，Design §6.2 #6）；缺省不输出。"""
+    """运行过程观察者（由渲染层实现）；缺省不输出。"""
 
     def on_event(self, event: Mapping[str, Any]) -> None:
         """节点 / 引擎事件（比 log.jsonl 多带渲染所需附加键，如运行号）。"""
@@ -157,20 +157,20 @@ class _NullObserver:
 
 @dataclass(frozen=True)
 class RunRequest:
-    """一次运行的输入与选项（会话模式复用同一结构，M4 追加会话字段）。"""
+    """一次运行的输入与选项（一次性运行与会话轮次复用同一结构）。"""
 
     requirement: str | None = None
     source_path: Path | None = None
     source_text: str | None = None
     source_dir: Path | None = None
-    """既有版本目录（resume / 会话审查轮次：复制为新运行的起始版本目录，Design §4.2.2）。"""
+    """既有版本目录（resume / 会话审查轮次：复制为新运行的起始版本目录）。"""
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_iterations_source: str = state_mod.SOURCE_DEFAULT
     rounds_mode: str = rounds_mod.ROUNDS_UP_TO
     severe_only: bool = False
     no_exec: bool = False
     parallel_review: bool = False
-    """并行双视角审查（Design §12.2 的扩展示例）：两个审查视角同超级步并行、汇合后判干净。"""
+    """并行双视角审查：两个审查视角同超级步并行、汇合后判干净。"""
     resolved: config_mod.ResolvedModel | None = None
     """本次运行的模型连接（命令面经 ``config.resolve`` 解析）。
 
@@ -182,16 +182,16 @@ class RunRequest:
     session_id: str | None = None
     round_index: int | None = None
     start_version: int = 1
-    """本次运行的起始版本号（会话轮次跨轮连续递增，Design §4.7）；一次性运行恒为 1。"""
+    """本次运行的起始版本号（会话轮次跨轮连续递增）；一次性运行恒为 1。"""
     prior_files: Mapping[str, str] | None = None
     """既有实现的文件内容（会话轮次的编码上下文）：引擎放进状态瞬态键 ``prior_files``，
-    编码节点把它内联进任务提示词（"按新需求修改"的依据，Design §4.7）。"""
+    编码节点把它内联进任务提示词（"按新需求修改"的依据）。"""
     agent_memory: Mapping[str, Sequence[Mapping[str, str]]] | None = None
     """三 Agent 各自的会话记忆（``agent → [{"role", "text"}]``）：引擎放进状态瞬态键
-    ``agent_memory``，各节点把它作为历史消息交给运行时（Design §4.7 的追加式记忆）。"""
+    ``agent_memory``，各节点把它作为历史消息交给运行时（追加式，只增不改）。"""
 
     def input_descriptor(self) -> state_mod.InputDescriptor:
-        """本次运行的输入描述（Design §4.3 的 ``input`` 字段）。
+        """本次运行的输入描述（写入状态的 ``input`` 字段）。
 
         有需求文本时以它为准（会话轮次"在既有版本上按新需求继续开发"即此形态：既要走
         编码起步，又要记下既有代码的来源）；否则 ``-f`` 记原文件路径、续跑记父运行的
@@ -214,7 +214,7 @@ class RunRequest:
 
     @property
     def model_label(self) -> str:
-        """模型标识（写入 ``state["model"]``，Design §4.3）：``供应商/模型名``。"""
+        """模型标识（写入 ``state["model"]``）：``供应商/模型名``。"""
         return self.resolved.label() if self.resolved is not None else UNRESOLVED_MODEL_LABEL
 
 
@@ -235,7 +235,7 @@ class RunResult:
     interrupted: bool
     state: Mapping[str, Any]
     report_written: bool = False
-    """是否已产出 report.md（中断收尾按 §4.6 的写盘序列不做报告，命令面据此提示）。"""
+    """是否已产出 report.md（中断收尾的写盘序列不含报告，命令面据此提示）。"""
 
     @property
     def succeeded(self) -> bool:
@@ -262,7 +262,7 @@ class _Listing:
 
 
 class WorkflowEngine:
-    """运行驱动：组织运行目录、事件、快照、报告与退出码（Design §3.1）。
+    """运行驱动：组织运行目录、事件、快照、报告与退出码。
 
     Args:
         nodes: 节点覆盖表（逐键替换缺省装配），测试与真实装配共用同一接缝。
@@ -272,7 +272,7 @@ class WorkflowEngine:
         timer: 单调计时源（毫秒耗时）；默认 :func:`time.monotonic`。
         run_id_factory: 运行号生成器；默认按注入时钟的日期 + ``records.new_run_id`` 碰撞重试。
         observer: 过程观察者；默认不输出。
-        confirm_deletions: 删除确认闸门（Design §4.2.2）：修复提出删除时引擎先打印待删
+        confirm_deletions: 删除确认闸门：修复提出删除时引擎先打印待删
             清单并经它征询 ``y/N``；``None``（非交互 / 管道 / CI）或它抛异常 / 被中断时
             一律**保留文件**并标注"待确认删除（未执行）"。
     """
@@ -344,7 +344,7 @@ class WorkflowEngine:
     def execute(self, request: RunRequest) -> RunResult:
         """驱动一次完整运行：建目录 → 初始快照 → 图执行 → 收尾报告与退出码。
 
-        错误与中断语义见 Design §4.6：节点失败 / 落盘失败 → ``status=failed`` + 退出码 2；
+        错误与中断语义：节点失败 / 落盘失败 → ``status=failed`` + 退出码 2；
         Ctrl+C → 追加 interrupt 事件 → 原子写 ``state.json`` → 退出码 2（第二次 Ctrl+C 放弃写盘）。
         """
         try:
@@ -462,7 +462,7 @@ class WorkflowEngine:
 
         运行时只在确需缺省装配时构建：完全注入节点的测试不触碰模型与配置。并行形态多出的
         汇合节点由本层提供（纯函数、无模型、无 IO），其余节点仍来自 agents 层——依赖方向
-        不变（workflow → agents，Design §3.1）。
+        不变（workflow 层依赖 agents 层，反向不成立）。
         """
         names = graph_mod.node_names(parallel_review=self._parallel_review)
         if self._nodes and set(names) <= set(self._nodes):
@@ -537,7 +537,7 @@ class WorkflowEngine:
             return {}
 
     def _emit(self, event: Mapping[str, Any]) -> None:
-        """落盘一条事件并转交观察者（Design §5.1）；log 写入失败按运行失败处理。
+        """落盘一条事件并转交观察者；log 写入失败按运行失败处理。
 
         节点级事件（``encode`` / ``review`` / ``fix``）缺 ``iteration`` 时按当前节点轮次
         补齐——运行时只知道自己服务于哪个节点，轮次口径由引擎掌握（工具事件据此可归轮）。
@@ -558,7 +558,7 @@ class WorkflowEngine:
         self._notify_observer(lambda: self._observer.on_event(record))
 
     def _wrap_node(self, name: str, fn: NodeFn) -> NodeFn:
-        """节点包装：事件、契约校验与重试、产物落盘、history 追加（Design §3.1、§4.6）。"""
+        """节点包装：事件、契约校验与重试、产物落盘、history 追加。"""
 
         def wrapped(state: Mapping[str, Any]) -> Mapping[str, Any]:
             round_number = self._round_of(name, state)
@@ -568,7 +568,7 @@ class WorkflowEngine:
             try:
                 update, summary, artifacts, listing = self._produce(name, fn, state)
             except PersistenceError:
-                # 落盘失败按落盘失败归因（Design §4.6）：交 execute 的持久化失败分支处理，
+                # 落盘失败按落盘失败归因：交 execute 的持久化失败分支处理，
                 # 不在这里被归为"节点自身失败"——两者都退出 2，但原因定位必须准确。
                 self._end_node(name)
                 raise
@@ -616,7 +616,7 @@ class WorkflowEngine:
         """按节点种类执行契约包装：调用 → 抽取 → 校验（失败重试一次）→ 产物落盘。
 
         种类由节点名决定（``encode`` / ``fix`` / ``review``（含并行视角分支）/ 汇合），两种图
-        形态共用同一套包装逻辑——扩展形态只在"谁来写权威字段"上不同（Design §12.2）。
+        形态共用同一套包装逻辑——扩展形态只在"谁来写权威字段"上不同。
         """
         if name == "encode":
             return self._produce_encode(fn, state)
@@ -631,10 +631,10 @@ class WorkflowEngine:
     def _produce_encode(
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """编码节点：抽取 1..n 个文件 → 落盘起始版本目录（Design §4.2.2）。
+        """编码节点：抽取 1..n 个文件 → 落盘起始版本目录。
 
         目录号取 ``code_version(state)``：一次性运行为 ``code_v1/``；会话轮次沿用跨轮
-        连续递增的起始版本号（第 2 轮的编码产物从上一轮结束后的下一号起，Design §4.7）。
+        连续递增的起始版本号（第 2 轮的编码产物从上一轮结束后的下一号起）。
         """
         output = _call_node(fn, state, retry_feedback=None)
         try:
@@ -666,10 +666,10 @@ class WorkflowEngine:
         node_name: str = "review",
         view: str | None = None,
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """审查节点：契约校验 → ``workspace/review_N[_<视角>].json`` 落盘 → clean 判定（Design §5.2）。
+        """审查节点：契约校验 → ``workspace/review_N[_<视角>].json`` 落盘 → clean 判定。
 
         一次审查覆盖版本内**全部文件**（文件清单来自状态的 ``version_files``，location 一律
-        版本内相对路径，Design §4.2.2）。执行有效性门禁由审查节点交回的 ``review_evidence``
+        版本内相对路径）。执行有效性门禁由审查节点交回的 ``review_evidence``
         决定（本轮是否至少一次成功工具事件）；不返回该键的节点（脚本化假节点 / 注入桩）按
         "内联送达记录"视为满足。并行双视角下每个视角只写自己的**独立 key**
         （``findings_<视角>``）：审查轮次推进与 clean 判定归汇合节点，否则同一超级步的
@@ -744,7 +744,7 @@ class WorkflowEngine:
     def _produce_merge(
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
-        """汇合节点：合并双视角 findings → ``review_N.json`` → 当轮 clean 判定（Design §12.2）。
+        """汇合节点：合并双视角 findings → ``review_N.json`` → 当轮 clean 判定。
 
         ``findings`` 由本步**显式覆盖、无条件写**（未运行分支的旧值不得残留）；分支原始结论
         已分别落 ``review_N_<视角>.json``，合并结果落 ``review_N.json``——"这条结论由谁提出"
@@ -802,7 +802,7 @@ class WorkflowEngine:
     def _convergence_tail(
         self, state: Mapping[str, Any], findings: Sequence[Mapping[str, Any]]
     ) -> str:
-        """未收敛标注（Design §4.4）：与上一轮问题集合一致时在阶段摘要标注，不提前中止。"""
+        """未收敛标注：与上一轮问题集合一致时在阶段摘要标注，不提前中止。"""
         previous = state.get("findings") or []
         if not isinstance(previous, list) or not previous or not findings:
             return ""
@@ -814,10 +814,10 @@ class WorkflowEngine:
         self, fn: NodeFn, state: Mapping[str, Any]
     ) -> tuple[dict[str, Any], str, list[str], _Listing | None]:
         """修复节点：复制上一版本为新版本目录 → 节点用 ``write_file`` 只写改动文件 →
-        引擎按目录实际内容校验并重算 manifest（Design §4.2.2 / §5.2 的写盘形态）。
+        引擎按目录实际内容校验并重算 manifest（写盘形态）。
 
-        整版本不可变快照、逐字节比较判"本轮未产生改动"、删除确认闸门、``resume`` 与
-        ``--out`` 的产物语义全部不变；变的是产物**怎么产生**——不再要求模型把未改动的
+        对外语义不变：整版本不可变快照、逐字节比较判"本轮未产生改动"、删除确认闸门、
+        ``resume`` 与 ``--out`` 的产物形态。产物由节点写盘，而不是把未改动的
         文件整份重贴（重贴既花输出 token，也有"顺手改坏"的真实风险）。写盘结果按契约
         校验（缺文件 / 空文件 / 超量级 / 声称已修复却无改动），违规重试一次。
         """
@@ -851,7 +851,7 @@ class WorkflowEngine:
                 # 本轮产物（写盘形态特有的失败模式——产物不在契约文本里，重试看不到旧输出）
                 self._write_version(new_version, base_files)
                 output = self._retry("fix", round_number, fn, fix_state, str(exc))
-        # 删除确认闸门（Design §4.2.2）：确认前零删除；确认的文件此刻才从新版本目录移除
+        # 删除确认闸门：确认前零删除；确认的文件此刻才从新版本目录移除
         deleted_confirmed = self._resolve_deletions(result.deleted, findings)
         for path in deleted_confirmed:
             files.pop(path, None)
@@ -888,7 +888,7 @@ class WorkflowEngine:
         if pending:
             parts.append(f"（待确认删除（未执行）：{', '.join(sorted(pending))}）")
         if result.extra_fences:
-            # Design §4.2.1：多余围栏忽略但留痕（写进阶段摘要即进 log.jsonl 与时间线）
+            # 多余围栏忽略但留痕（写进阶段摘要即进 log.jsonl 与时间线）
             parts.append(f"（已忽略 {result.extra_fences} 个多余围栏）")
         summary = "".join(parts)
         if result.unknown_ids:
@@ -916,7 +916,7 @@ class WorkflowEngine:
         current_files: Sequence[str],
         base_files: Mapping[str, str],
     ) -> dict[str, str]:
-        """按目录**实际内容**校验修复写盘结果，返回归一化后的文件表（Design §4.2.2）。
+        """按目录**实际内容**校验修复写盘结果，返回归一化后的文件表。
 
         整版本快照的完整性由这里兜底：文件不得丢（模型没有删除能力，丢了就是写坏了路径）、
         不得为空、量级不超限；另外把"处置声称已修复但目录内容一个字节没变"也列为违规——
@@ -954,7 +954,7 @@ class WorkflowEngine:
     def _resolve_deletions(
         self, deleted: Sequence[str], findings: Sequence[Mapping[str, Any]]
     ) -> list[str]:
-        """落实删除确认：返回已确认删除的路径（确认前零删除，Design §4.2.2）。
+        """落实删除确认：返回已确认删除的路径（确认前零删除）。
 
         确认闸门（``confirm_deletions``）缺失 / 返回否 / 抛异常时一律返回空表——删除
         永不静默发生；未确认的文件本来就在新版本目录里（引擎复制自上一版本），无须回填。
@@ -992,7 +992,7 @@ class WorkflowEngine:
     # ---- 收尾 ----
 
     def _finish(self, latest: Mapping[str, Any]) -> RunResult:
-        """正常收尾：判定状态与退出码、写最终状态与报告（Design §4.4、§8.1）。"""
+        """正常收尾：判定状态与退出码、写最终状态与报告。"""
         state = dict(latest)
         clean = bool(state.get("clean"))
         fix_rounds = int(state.get("fix_rounds", 0))
@@ -1010,7 +1010,7 @@ class WorkflowEngine:
                 state_mod.NEXT_FIX_AGAIN,
             )
         else:
-            # 条件边只有"干净"与"达限"两条出口（Design §4.4）：走到这里说明编排自检不通过，
+            # 条件边只有"干净"与"达限"两条出口：走到这里说明编排自检不通过，
             # 如实按运行失败处理，而不是编一个假的收尾结论。
             raise RuntimeError(
                 f"工作流在未达轮次上限（{max_iterations}）且未干净时收尾：编排状态自检失败。"
@@ -1026,7 +1026,7 @@ class WorkflowEngine:
         return self._finalize(state, exit_code)
 
     def _handle_node_failure(self, latest: Mapping[str, Any], failure: _NodeFailure) -> RunResult:
-        """节点失败收尾（Design §4.6）：写 status/error + 时间线条目 + 报告，退出码 2。"""
+        """节点失败收尾：写 status/error + 时间线条目 + 报告，退出码 2。"""
         state = dict(latest)
         entry = state_mod.NodeEvent(
             node=failure.node,
@@ -1066,10 +1066,10 @@ class WorkflowEngine:
         return {"usage": usage_mod.merge_by_node(state.get("usage"), additions)}
 
     def _handle_interrupt(self, latest: Mapping[str, Any]) -> RunResult:
-        """中断收尾（Design §4.6 / §8.2）：interrupt 事件 → 原子写 state.json → 退出码 2。
+        """中断收尾：interrupt 事件 → 原子写 state.json → 退出码 2。
 
-        会话轮次的状态写 ``interrupted``（§8.2 的会话轮次口径：中断的本轮可被会话识别为
-        "被打断"而不是"运行失败"）；一次性运行按 §4.6 保持 ``failed`` + ``error.node=interrupt``。
+        会话轮次的状态写 ``interrupted``（中断的这一轮要能被会话识别为
+        "被打断"而不是"运行失败"）；一次性运行保持 ``failed`` + ``error.node=interrupt``。
         第二次 Ctrl+C 放弃写盘（"尽力"语义），仍按中断结论返回退出码 2。
         """
         state = dict(latest)
@@ -1103,7 +1103,7 @@ class WorkflowEngine:
         return self._result(state, _EXIT_ERROR, interrupted=True)
 
     def _handle_persistence_failure(self, latest: Mapping[str, Any], exc: Exception) -> RunResult:
-        """落盘失败收尾（Design §4.6）：status=failed + 可读原因 + 已保留产物路径，退出码 2。
+        """落盘失败收尾：status=failed + 可读原因 + 已保留产物路径，退出码 2。
 
         失败归因固定为引擎级（``node="engine"``）：磁盘故障不是某个节点的产出问题，
         报成"审查节点失败"会把排查方向带偏。
@@ -1127,10 +1127,10 @@ class WorkflowEngine:
         return self._result(state, _EXIT_ERROR)
 
     def _finalize(self, state: Mapping[str, Any], exit_code: int) -> RunResult:
-        """统一收尾写盘：state.json → report.md → 引擎 end 事件（Design §8.2）。
+        """统一收尾写盘：state.json → report.md → 引擎 end 事件。
 
         收尾写盘**再被打断**（如失败收尾途中第二次 Ctrl+C）不改变本次运行的结论：
-        按 §4.6 的"尽力"语义返回既有状态（写没写盘由磁盘上的记录为准），不让
+        按"尽力"语义返回既有状态（写没写盘以磁盘上的记录为准），不让
         BaseException 带着裸 traceback 逃出引擎。
         """
         report_written = False
@@ -1153,7 +1153,7 @@ class WorkflowEngine:
         return self._result(state, exit_code, report_written=report_written)
 
     def _write_report(self, state: Mapping[str, Any]) -> None:
-        """生成 report.md（结构见 Design §4.5）；写入失败按运行失败处理。"""
+        """生成 report.md（摘要 → 时间线 → 逐轮问题清单 → 产物清单）；写入失败按运行失败处理。"""
         run_dir = self._run_dir_path()
         # report.md 自身尚不存在，与已落盘产物一起列出（设计口径：产物清单含报告）
         artifacts = [run_dir / "report.md", *records.run_artifacts(run_dir)]
@@ -1172,7 +1172,7 @@ class WorkflowEngine:
             ) from exc
 
     def _parent_residual(self, state: Mapping[str, Any]) -> str | None:
-        """续跑来源的残留摘要（Design §4.4 的报告口径）：读父运行的 state.json，读不到则留空。
+        """续跑来源的残留摘要（报告里标注"从哪一版接着跑、当时还剩什么"）：读父运行的 state.json，读不到则留空。
 
         报告是收尾产物：父运行记录被清理 / 损坏时只是少一行标注，不得影响本次运行的结论。
         """
@@ -1204,7 +1204,7 @@ class WorkflowEngine:
     def _materialize_input_version(self, request: RunRequest, initial: RunState) -> None:
         """把运行输入物化为起始版本目录（``-f`` 单文件包成目录，续跑 / 会话轮次复制既有版本）。
 
-        目录名取 ``request.start_version``（Design §4.7 的跨轮连续递增）：会话第 2 轮从
+        目录名取 ``request.start_version``（会话轮次的版本号跨轮连续递增）：会话第 2 轮从
         上一轮的版本号继续，报告里的"第几版"在会话内始终指向同一份代码。
         需求文本输入没有初始版本（编码节点产出起始版本目录），此处不动作。
 
@@ -1244,7 +1244,7 @@ class WorkflowEngine:
         """落盘一个版本目录：全部文件（原子写）→ ``manifest.json``，返回目录路径。
 
         manifest 最后写：它是"该版本包含哪些文件"的权威声明，出现半写文件比缺文件更误导。
-        落盘失败按持久化失败处理（Design §4.6），不产生半更新的状态引用。
+        落盘失败按持久化失败处理，不产生半更新的状态引用。
         """
         version_dir = self._workspace_path() / rounds_mod.code_version_dir_name(version)
         # 纵深防御：路径在契约层已校验过（拒绝绝对路径 / 盘符 / `..`），这里落盘前再验一次——
@@ -1274,7 +1274,7 @@ class WorkflowEngine:
         return sorted(f"workspace/{dir_name}/{path}" for path in files)
 
     def _default_run_id_factory(self) -> str:
-        """默认运行号生成：按注入时钟的日期 + 碰撞重试（Design §4.3）。"""
+        """默认运行号生成：按注入时钟的日期 + 碰撞重试。"""
         day = "".join(self._clock()[:10].split("-"))
         if len(day) != 8 or not day.isdigit():
             raise RunRecordError(f"时钟返回值无法解析出日期：{self._clock()!r}")
@@ -1307,7 +1307,7 @@ class WorkflowEngine:
         raise RunRecordError(f"运行号连续碰撞，无法创建运行目录：{last_error}")
 
     def _persist_state(self, state: Mapping[str, Any]) -> None:
-        """原子写 state.json（节点边界与失败时各一次，Design §8.2）。"""
+        """原子写 state.json（节点边界与失败时各一次）。"""
         self._persist_state_text(state_mod.dumps(state))
 
     def _persist_state_text(self, text: str) -> None:
@@ -1320,7 +1320,7 @@ class WorkflowEngine:
     def _write_artifact(self, path: Path, text: str) -> None:
         """原子写节点产物（代码版本 / 审查结论 / 修复处置）。
 
-        与 state.json / report.md 同口径：落盘失败按"落盘失败"报告（Design §4.6），
+        与 state.json / report.md 同口径：落盘失败按"落盘失败"报告，
         而不是被归为节点自身的失败——两者都退出 2，但原因定位必须准确。
         """
         try:
@@ -1333,7 +1333,7 @@ class WorkflowEngine:
 
         渲染是呈现层：终端已关闭 / 下游退出（``BrokenPipeError`` 等 ``OSError``）时无处可报，
         运行记录（state.json / log.jsonl）仍是真相来源——这类故障不得改变运行结论，也不得
-        被误报为节点失败（Design §4.6 只把落盘失败列为运行失败）。渲染器自身的编码缺陷
+        被误报为节点失败（只有落盘失败列为运行失败）。渲染器自身的编码缺陷
         （非 ``OSError``）照常抛出，不在此掩盖。
         """
         try:
@@ -1344,7 +1344,7 @@ class WorkflowEngine:
     def _retry(
         self, node: str, round_number: int, fn: NodeFn, state: Mapping[str, Any], feedback: str
     ) -> Mapping[str, Any]:
-        """契约校验失败后的重试（Design §4.6）：发 retry 事件、附错误清单重试一次。"""
+        """契约校验失败后的重试：发 retry 事件、附错误清单重试一次。"""
         self._emit(
             {
                 "node": node,
@@ -1356,7 +1356,7 @@ class WorkflowEngine:
         return _call_node(fn, state, retry_feedback=feedback)
 
     def _render_listing(self, listing: _Listing | None) -> None:
-        """把清单载荷交给观察者渲染（node end 事件之后，Design §6.2 #6 的阶段序列）。"""
+        """把清单载荷交给观察者渲染（在 node end 事件之后，与阶段面板的顺序一致）。"""
         if listing is None:
             return
         if listing.kind == "review":
@@ -1399,7 +1399,7 @@ class WorkflowEngine:
     def _start_detail(self, request: RunRequest) -> str:
         """运行开始事件的 detail：输入摘要 + 轮次上限与来源（log 预览与渲染头行共用）。
 
-        ``-f`` 输入额外标注"原文件名 → 工作区名"映射（Design §4.5 的报告口径）；续跑、
+        ``-f`` 输入额外标注"原文件名 → 工作区名"映射；续跑、
         会话轮次与并行审查各加一句，使终端头行与日志能一眼看出这一轮是怎么起的。
         """
         descriptor = request.input_descriptor()
@@ -1416,7 +1416,7 @@ class WorkflowEngine:
             summary = state_mod.summarize_input(descriptor, limit=80)
             source = str(descriptor.get("source_path") or "")
             if source:
-                # 会话轮次：需求驱动编码起步、既有代码来自上一版本或用户文件（Design §4.7）；
+                # 会话轮次：需求驱动编码起步、既有代码来自上一版本或用户文件；
                 # 沿用输入摘要的公开口径，让"版本目录 / 文件"两种来源在头行上一眼可分
                 label = state_mod.summarize_input(
                     {"kind": state_mod.INPUT_FILE, "source_path": source}, limit=120
@@ -1477,7 +1477,7 @@ def build_report(
     artifacts: Sequence[Path],
     parent_residual: str | None = None,
 ) -> str:
-    """生成运行报告（结构见 Design §4.5）：摘要 → 时间线 → 逐轮问题清单 → 产物清单。"""
+    """生成运行报告：摘要 → 时间线 → 逐轮问题清单 → 产物清单。"""
     status = str(state.get("status") or "")
     review_round = int(state.get("review_round", 0))
     fix_rounds = int(state.get("fix_rounds", 0))
@@ -1595,7 +1595,7 @@ def build_report(
 
 
 def _append_notices(summary: str, notices: Sequence[str]) -> str:
-    """把运行时的护栏触达记录并入阶段摘要（进 log.jsonl 与时间线，Design §4.6）。"""
+    """把运行时的护栏触达记录并入阶段摘要（进 log.jsonl 与时间线）。"""
     if not notices:
         return summary
     return f"{summary}（{'；'.join(notices)}，结论可能不完整）"
@@ -1642,9 +1642,9 @@ def _cell(value: Any) -> str:
 
 
 def _round_section(item: RoundReport, *, status: str, not_converged: bool = False) -> list[str]:
-    """单轮问题清单：标题固定为"第 i 轮审查（基于 code_vi/）"，问题按文件分组（Design §4.5）。
+    """单轮问题清单：标题固定为"第 i 轮审查（基于 code_vi/）"，问题按文件分组。
 
-    ``not_converged`` 为真时插入"未收敛"标注（Design §4.4）：问题集合与上一轮一致说明
+    ``not_converged`` 为真时插入"未收敛"标注：问题集合与上一轮一致说明
     修复没有改变问题清单——如实标出，但不改变流程与退出码。
     """
     lines: list[str] = [f"### 第 {item.round_number} 轮审查（基于 `{item.version_label}`）", ""]
@@ -1694,7 +1694,7 @@ def _round_section(item: RoundReport, *, status: str, not_converged: bool = Fals
 
 
 def _group_by_file(findings: Sequence[Any], files: Sequence[str]) -> list[tuple[str, list[Any]]]:
-    """findings 按文件分组（Design §4.2.2 的"逐轮清单按文件分组"）。
+    """findings 按文件分组（逐轮清单的分组口径）。
 
     分组键 = location 的文件部分（``相对路径:行号`` 的 ``:`` 前段，或整文件级 location）；
     版本文件清单给出分组次序，location 对不上清单的条目归入末尾的"其他"组（清单为空时
@@ -1724,7 +1724,7 @@ def _group_by_file(findings: Sequence[Any], files: Sequence[str]) -> list[tuple[
 
 
 def _deletion_notes(item: RoundReport) -> list[str]:
-    """删除处置的报告标注（Design §4.2.2）：已确认删除 / 待确认删除（未执行）。"""
+    """删除处置的报告标注：已确认删除 / 待确认删除（未执行）。"""
     if not isinstance(item.fixes, Mapping):
         return []
     deleted = item.fixes.get("deleted")
@@ -1823,7 +1823,7 @@ def status_label(status: str) -> str:
 
 
 def source_label(source: Any) -> str:
-    """轮次取值来源的显示名（Design §4.4 的来源枚举）；缺失时给可读占位而非 ``None``。"""
+    """轮次上限取值来源的显示名；缺失时给可读占位而非 ``None``。"""
     if source is None or not str(source).strip():
         return "（未记录）"
     return {
@@ -1841,7 +1841,7 @@ def node_label(node: Any) -> str:
 
 
 def not_converged(previous: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
-    """未收敛判定（Design §4.4）：两份审查契约的 ``(location, issue)`` 集合完全相同。
+    """未收敛判定：两份审查契约的 ``(location, issue)`` 集合完全相同。
 
     Args:
         previous / current: ``review_N.json`` 形态的契约对象（含 ``findings`` 数组）。
@@ -1873,11 +1873,11 @@ def _normalize_code(code: str) -> str:
 
 
 def read_version_files(directory: Path) -> dict[str, str]:
-    """读出版本目录的代码文件：以 ``manifest.json`` 清单为准（Design §4.2.2）。
+    """读出版本目录的代码文件：以 ``manifest.json`` 清单为准。
 
     manifest 是引擎落盘时写的权威清单；按它读而不是全目录递归，才能把"审查 / 修复
     Agent 执行代码时落进版本目录的副产物"（`__pycache__`、被测程序自己写出的
-    数据文件等，真实演示暴露）挡在版本内容之外——否则 resume 复制、指纹比较与
+    数据文件等）挡在版本内容之外——否则 resume 复制、指纹比较与
     修复覆盖检查都会把副产物当版本文件。缺 manifest（旧目录 / 手工介入）时退回
     全目录读取，并排除字节码与隐藏 / 临时文件。
 
@@ -1889,7 +1889,7 @@ def read_version_files(directory: Path) -> dict[str, str]:
 
 
 def read_written_files(directory: Path) -> dict[str, str]:
-    """按**目录实际内容**读版本文件（修复写盘后重算清单用，Design §4.2.2）。
+    """按**目录实际内容**读版本文件（修复写盘后重算清单用）。
 
     这里刻意不看 manifest：修复节点可以用 ``write_file`` 新增文件，而 manifest 还是
     引擎复制上一版本时写下的旧清单；副产物（字节码 / 隐藏 / 临时文件）由目录扫描的
@@ -1955,7 +1955,7 @@ def _version_base_of(state: Mapping[str, Any]) -> int:
 
 
 def _fingerprint(files: Mapping[str, str]) -> dict[str, str]:
-    """版本指纹：``路径 → sha256``（"本轮未产生改动"的整版本比较口径，Design §4.2.2）。"""
+    """版本指纹：``路径 → sha256``（"本轮未产生改动"的整版本比较口径）。"""
     return {
         path: hashlib.sha256(content.encode("utf-8")).hexdigest() for path, content in files.items()
     }
@@ -1968,7 +1968,7 @@ def _finding_in_file(finding: Mapping[str, Any], path: str) -> bool:
 
 
 def _node_text(output: Mapping[str, Any], key: str) -> str:
-    """读取节点交回的原始文本（节点输出协议的暂存键，Design §3.1）。"""
+    """读取节点交回的原始文本（节点输出协议的暂存键）。"""
     value = output.get(key) if isinstance(output, Mapping) else None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"节点未按协议返回 {key}（应为非空字符串）")
@@ -1995,7 +1995,7 @@ def _accepts_retry_feedback(fn: NodeFn) -> bool:
 
 
 def _readable_error(exc: Exception) -> str:
-    """异常 → 可读报错（常量截断，避免 traceback 成为唯一线索，Design §4.6）。"""
+    """异常 → 可读报错（常量截断，避免 traceback 成为唯一线索）。"""
     if isinstance(exc, RecursionError) or "recursion limit" in str(exc).lower():
         return "工作流超出递归护栏（recursion_limit）：可能存在未收敛的循环。"
     text = f"{type(exc).__name__}: {exc}"

@@ -1,7 +1,7 @@
 """脚本化假节点：确定性行为用例（假节点只作测试注入，不进生产装配）。
 
-用例内容与 M1 一致，仅把节点实现从 ``crw.workflow.graph`` 迁到测试支持模块 ``tests/fakes.py``
-——生产路径的缺省装配已是 agents 层的真实 Agent 节点（M2）。
+假节点实现在测试支持模块 ``tests/fakes.py``：生产路径的缺省装配是 agents 层的真实
+Agent 节点，假节点只用于把引擎与命令面的行为钉成确定值。
 """
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ def test_fake_fix_covers_every_finding_id() -> None:
 
 
 def test_fake_fix_writes_only_the_repaired_file(tmp_path: Path) -> None:
-    """假修复节点与真实节点同形态：改动写回版本目录，只交回一个 fixes 围栏（§4.2.2）。"""
+    """假修复节点与真实节点同形态：改动写回版本目录，只交回一个 fixes 围栏。"""
     code = '"""示例模块。"""\n\n\ndef greet(name)\n    print(name)\n'
     other = '"""另一个模块。"""\n'
     version_dir = write_version(tmp_path, {"main.py": code, "util.py": other})

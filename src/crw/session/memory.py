@@ -1,4 +1,4 @@
-"""会话记忆：三 Agent 各自的追加式记忆文件（落盘 / 载入 / 阈值压缩，Design §4.7）。
+"""会话记忆：三 Agent 各自的追加式记忆文件（落盘 / 载入 / 阈值压缩）。
 
 只追加、绝不改写——记忆是模型请求的前缀，原地改写会让供应商的前缀缓存整体失效；
 接近上下文预算时做一次显式压缩（:meth:`AgentMemory.compact`）：追加一条
@@ -63,7 +63,7 @@ def memory_file(session_dir: Path, agent: str) -> Path:
 
 
 class AgentMemory:
-    """单个 Agent 的追加式记忆：只追加、可载入、按阈值压缩（Design §4.7）。
+    """单个 Agent 的追加式记忆：只追加、可载入、按阈值压缩。
 
     为什么追加式：记忆以"前缀稳定"的方式喂给模型来摊薄供应商缓存成本；压缩不改写
     旧行，而是追加一条 compaction 行，由 :meth:`effective_lines` 判定旧行不再参与

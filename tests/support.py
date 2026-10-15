@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-#: 预埋缺陷样例目录（README 快速开始与 Design §3 引用同一路径；ruff 已排除该目录）
+#: 预埋缺陷样例目录（README 快速开始用的同一路径；ruff 已排除该目录）
 BUGGY_SAMPLES = Path(__file__).parent / "fixtures" / "buggy_samples"
 
 

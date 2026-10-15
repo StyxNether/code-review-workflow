@@ -1,7 +1,7 @@
 """命令面的流程控制面：续跑（resume）/ 图导出（graph）/ 降级展示（show）/ 并行审查开关。
 
 与 test_cli.py 的分工：那边覆盖参数面与 run / runs / show / review / config 的主路径，
-这里覆盖 M3 新增的三条命令面与两个开关，两者都用假模型驱动真实装配（无真实网络）。
+这里覆盖 resume / graph / show 三条命令面与两个开关，两者都用假模型驱动真实装配（无真实网络）。
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def test_resume_of_a_pre_severe_only_record_judges_strictly(
 ) -> None:
     """旧记录没有 ``severe_only`` 字段：按缺省 False（加严）解释——口径统一，不是缺陷。
 
-    同一条记录续跑时判据比它当初更严（Design §8.2 记一句），测试把这条预期钉住：
+    同一条记录续跑时判据比它当初更严，测试把这条预期钉住：
     不得因为字段缺席就退回"只数【严重】"的旧默认。
     """
     run_dir = write_parent_record()
@@ -236,7 +236,7 @@ def test_graph_exports_the_parallel_shape_on_request(capsys: pytest.CaptureFixtu
 def test_show_degrades_and_exits_2_when_state_is_corrupt(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """§8.2 降级展示 + §8.1"记录损坏 → 退出 2"：人读拿得到信息，脚本消费能察觉异常。"""
+    """记录损坏时降级展示 + 退出码 2：人读拿得到信息，脚本消费能察觉异常。"""
     run_dir = write_parent_record("r-20261012-0002")
     records.append_log_event(
         run_dir / "log.jsonl",
@@ -312,7 +312,7 @@ def test_run_parallel_review_records_the_shape_and_branch_artifacts(
 def test_config_can_import_the_previous_tool_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """零配置时提示导入前作 ``~/.cra/models.json``：显式同意才写本配置（不改前作文件）。"""
+    """零配置时提示导入旧工具的配置（``~/.cra/models.json``）：显式同意才写本配置（不改旧文件）。"""
     legacy = tmp_path / "legacy-models.json"
     legacy.write_text(
         json.dumps(
@@ -338,12 +338,12 @@ def test_config_can_import_the_previous_tool_configuration(
     assert main(["config"]) == 0
 
     captured = capsys.readouterr()
-    assert "检测到前作配置" in captured.out
+    assert "检测到 code-review-agent 的配置" in captured.out
     assert "已导入 1 个供应商。" in captured.out
     data = config_mod.load_raw()
     assert [entry["name"] for entry in data["providers"]] == ["LegacyProvider"]
     assert data["default"] == "LegacyProvider/legacy-model"
-    assert legacy.read_text(encoding="utf-8").count("api_key") == 1  # 前作文件原样保留
+    assert legacy.read_text(encoding="utf-8").count("api_key") == 1  # 旧配置文件原样保留
 
 
 def test_config_import_is_skipped_when_the_user_declines(
@@ -369,10 +369,10 @@ def test_config_import_is_skipped_when_the_user_declines(
 def test_config_import_rejects_a_self_conflicting_legacy_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """前作配置本身违反本工具的配置规则（此处为供应商重名）时不产生半导入状态。
+    """旧工具配置本身违反本工具的配置规则（此处为供应商重名）时不产生半导入状态。
 
     真冲突场景（同名供应商回退到同一 key 变量）只有在两边都无 key 时成立，而导入本身也要求
-    本工具当前零供应商——可复现的冲突形态是"前作文件内部自相矛盾"（重名 / 撞变量）：
+    本工具当前零供应商——可复现的冲突形态是"旧配置文件内部自相矛盾"（重名 / 撞变量）：
     整表校验先行，失败即给逐条原因且一个供应商都不写盘。
     """
     legacy = tmp_path / "legacy-models.json"
@@ -394,7 +394,7 @@ def test_config_import_rejects_a_self_conflicting_legacy_config(
     assert main(["config"]) == 0
 
     captured = capsys.readouterr()
-    assert "检测到前作配置" in captured.out
+    assert "检测到 code-review-agent 的配置" in captured.out
     assert "导入失败" in captured.err
     assert "供应商名重复" in captured.err  # 逐条原因，不是笼统的"不符合规则"
     assert not config_mod.config_path().exists()  # 一个都没写盘（无半导入状态）
@@ -418,14 +418,14 @@ def test_uninstall_command_wires_through_the_injected_io(
 def test_import_hint_appears_when_nothing_is_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """零配置 + 存在前作配置：运行指引里补一行导入提示（Design §6.2 #2）。"""
+    """零配置 + 存在旧工具配置：运行指引里补一行导入提示。"""
     legacy = tmp_path / "legacy-models.json"
     legacy.write_text(json.dumps({"providers": []}), encoding="utf-8")
     monkeypatch.setattr(config_mod, "legacy_config_path", lambda: legacy)
 
     assert main(["run", "写一个计算器"]) == 2
 
-    assert "检测到前作配置" in capsys.readouterr().err
+    assert "检测到 code-review-agent 的配置" in capsys.readouterr().err
 
 
 def test_resume_inherits_the_parallel_review_shape(
@@ -467,7 +467,7 @@ def test_resume_falls_back_to_default_when_inherited_rounds_is_out_of_range(
 ) -> None:
     """继承来的轮次上限同样要过 0–10 的硬闸；越界即**回退内置默认**（不是夹到上限 10）。
 
-    手改过的 ``state.json`` 写 999 不得绕过"防无界循环与无界费用"的护栏（Design §4.4）。
+    手改过的 ``state.json`` 写 999 不得绕过"防无界循环与无界费用"的护栏。
     """
     write_parent_record(max_iterations=999)
     configured_provider()

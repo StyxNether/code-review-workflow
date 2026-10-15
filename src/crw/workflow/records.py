@@ -1,6 +1,7 @@
 """运行记录文件 IO：原子写、列表、加载、选择与结构自检。
 
-原子写采用临时文件 + 替换；列表 / 加载忽略临时文件与非目录项，并对损坏记录降级（Design §8.2）。
+原子写采用临时文件 + 替换；列表 / 加载忽略临时文件与非目录项，并对损坏记录降级——
+坏记录必须仍能列出、仍能给出可读标识，而不是让列表页整体报错。
 """
 
 from __future__ import annotations
@@ -22,11 +23,11 @@ from ..config import data_dir
 from . import contracts
 from . import state as state_mod
 
-#: 运行号白名单：``r-YYYYMMDD-`` + 4 位小写十六进制（Design §4.3/§4.5）。
+#: 运行号白名单：``r-YYYYMMDD-`` + 4 位小写十六进制。
 #: 运行号直接拼进路径，白名单（而非仅剥离分隔符）使任何合法编号都只能是单个路径成分。
 RUN_ID_PATTERN = re.compile(r"^r-[0-9]{8}-[0-9a-f]{4}$")
 
-#: 会话号与轮次目录名白名单（Design §4.7）：本层只扫这两级目录，同样走白名单防穿越。
+#: 会话号与轮次目录名白名单：本层只扫这两级目录，同样走白名单防穿越。
 #: 会话号格式与 ``session.state`` 同源，此处独立声明——扫描方必须自己校验看到的名字，
 #: 不依赖上游生成器"应该只产出合法名"。
 SESSION_ID_PATTERN = re.compile(r"^s-[0-9]{8}-[0-9a-f]{4}$")
@@ -41,13 +42,13 @@ _INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
 _REVIEW_NAME_PATTERN = re.compile(r"^review_([0-9]+)\.json$")
 _CODE_VERSION_DIR_PATTERN = re.compile(r"^code_v([0-9]+)$")
 
-#: 旧单文件格式的产物名（M3.5 起版本 = 目录；该形态记录只用于识别并提示"记录来自旧格式"）
+#: 旧单文件格式的产物名（版本形态已是目录；该形态只用于识别并提示"记录来自旧格式"）
 _LEGACY_CODE_NAME_PATTERN = re.compile(r"^code_v([0-9]+)\.py$")
 
-#: 事件 detail 只存截断预览（Design §8.2）
+#: 事件 detail 只存截断预览（日志是可读线索，不是产物副本）
 DETAIL_PREVIEW_CHARS = 400
 
-#: 陈旧 running 判定阈值：判据 = max(mtime(state.json), mtime(log.jsonl)) 超过 30 分钟（Design §8.2）
+#: 陈旧 running 判定阈值：判据 = max(mtime(state.json), mtime(log.jsonl)) 超过 30 分钟
 STALE_RUNNING_SECONDS = 30 * 60
 
 _RUN_ID_ATTEMPTS = 8
@@ -59,7 +60,7 @@ class RunRecordError(RuntimeError):
 
 @dataclass(frozen=True)
 class RunSummary:
-    """运行列表的一行（含降级派生结果，Design §8.2）。"""
+    """运行列表的一行（含降级派生结果）。"""
 
     run_id: str
     created_at: str
@@ -69,11 +70,11 @@ class RunSummary:
     residual_severe: int | None
     path: Path
     stale: bool = False
-    """``status=running`` 且长时间无更新：可能已中断（Design §8.2，只标注不改状态）。"""
+    """``status=running`` 且长时间无更新：可能已中断（只标注，绝不自动改状态）。"""
     model: str = ""
-    """本次运行的模型标识（``供应商/模型名（思考：…）``口径，Design §8.3 的回显要求）。"""
+    """本次运行的模型标识（``供应商/模型名（思考：…）``口径）。"""
     session_id: str = ""
-    """所属会话号（会话轮次非空，Design §4.7 的 runs 列表「会话」列）。"""
+    """所属会话号（会话轮次非空，供 runs 列表的「会话」列）。"""
 
 
 @dataclass(frozen=True)
@@ -93,8 +94,8 @@ class RoundReport:
 class RunDetail:
     """单条运行记录的完整视图。
 
-    ``degraded`` 为真表示 ``state.json`` 不可读，摘要字段取自日志与产物清单（Design §8.2
-    的降级展示）；此时 ``state`` 为空映射，逐轮审查表仍来自 ``workspace/review_*.json``。
+    ``degraded`` 为真表示 ``state.json`` 不可读，摘要字段取自日志与产物清单；
+    此时 ``state`` 为空映射，逐轮审查表仍来自 ``workspace/review_*.json``。
     """
 
     summary: RunSummary
@@ -107,12 +108,12 @@ class RunDetail:
 
 
 def runs_root() -> Path:
-    """运行记录根目录：``data_dir()/runs``（经 ``CRW_HOME`` 解析，Design §8.3）。"""
+    """运行记录根目录：``data_dir()/runs``（数据目录经 ``CRW_HOME`` 解析）。"""
     return data_dir() / "runs"
 
 
 def sessions_root() -> Path:
-    """会话根目录：``data_dir()/sessions``（会话轮次记录在其下，Design §4.7）。"""
+    """会话根目录：``data_dir()/sessions``（会话轮次记录在其下）。"""
     return data_dir() / "sessions"
 
 
@@ -150,7 +151,7 @@ def iter_session_round_dirs() -> list[Path]:
     """枚举会话轮次记录目录（``sessions/<会话号>/rounds/round-<i>/``）。
 
     会话目录与轮次目录都走白名单：本函数是"扫描方"，不依赖上游只产出合法名。
-    不可读的目录跳过（坏记录不拖垮列表页，Design §8.2）。
+    不可读的目录跳过——坏记录不拖垮列表页。
     """
     found: list[Path] = []
     for session_path in _iter_dir(sessions_root()):
@@ -186,7 +187,7 @@ def find_run_dir(run_id: str) -> Path | None:
 
 
 def new_run_id(*, day: str, hex_factory: Callable[[], str] | None = None) -> str:
-    """生成运行号 ``r-YYYYMMDD-xxxx``；与既有记录碰撞时重新抽取（Design §4.3）。
+    """生成运行号 ``r-YYYYMMDD-xxxx``；与既有记录碰撞时重新抽取。
 
     碰撞检查覆盖两处记录（``runs/`` 与会话轮次）：运行号在全局唯一，跨两处重名会让
     ``crw show`` 无从分辨。
@@ -230,7 +231,7 @@ def create_run_dir(run_id: str, *, parent: Path | None = None) -> Path:
 
 
 def create_run_dir_at(path: Path) -> Path:
-    """在指定目录创建一条运行记录（会话轮次按 ``round-<i>`` 命名，Design §4.7）。
+    """在指定目录创建一条运行记录（会话轮次目录按 ``round-<i>`` 命名）。
 
     目录已存在即抛 ``FileExistsError``：既有轮次记录不得被覆盖（运行号进不去目录名，
     重试换号解决不了这个问题，故由调用方按可读错误处理）。
@@ -241,7 +242,7 @@ def create_run_dir_at(path: Path) -> Path:
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
-    """原子写文本：临时文件 ``.<名称>.tmp`` + 替换（Design §8.2，POSIX 尽力 0600）。
+    """原子写文本：临时文件 ``.<名称>.tmp`` + 替换（POSIX 尽力 0600）。
 
     写入失败（含中断）不留半写目标文件，临时文件尽力清理。
     """
@@ -261,7 +262,7 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
 
 
 def append_log_event(path: Path, event: Mapping[str, Any]) -> None:
-    """追加一条事件到 ``log.jsonl``（逐事件 append + flush，Design §8.2）。
+    """追加一条事件到 ``log.jsonl``（逐事件 append + flush）。
 
     只落盘 schema 声明的键（``ts`` / ``node`` / ``event`` / ``iteration`` / ``detail``）：
     渲染层需要的附加信息（如运行号）不进入日志；``detail`` 只存截断预览。
@@ -282,7 +283,7 @@ def append_log_event(path: Path, event: Mapping[str, Any]) -> None:
 
 
 def read_events(log_path: Path) -> list[dict[str, Any]]:
-    """读取事件流；空行与损坏行（含最后一条写一半的行）跳过（Design §8.2）。"""
+    """读取事件流；空行与损坏行（含最后一条写一半的行）跳过。"""
     try:
         text = log_path.read_text(encoding="utf-8")
     except OSError:
@@ -306,7 +307,7 @@ def read_state(run_path: Path) -> dict[str, Any] | None:
 
 
 def read_rounds(run_path: Path) -> list[RoundReport]:
-    """逐轮读取 ``review_N.json`` 与配对的 ``fixes_N.json``（Design §4.5）。"""
+    """逐轮读取 ``review_N.json`` 与配对的 ``fixes_N.json``（报告与 `crw show` 的数据源）。"""
     workspace = run_path / "workspace"
     rounds: list[RoundReport] = []
     for path in _iter_dir(workspace):
@@ -336,7 +337,7 @@ def read_rounds(run_path: Path) -> list[RoundReport]:
 def run_artifacts(run_path: Path) -> list[Path]:
     """运行目录内可见产物：顶层文件、工作区文件与版本目录内的全部文件。
 
-    版本目录（``workspace/code_v*/``，Design §4.2.2）逐文件展开——产物清单要能直接
+    版本目录（``workspace/code_v*/``）逐文件展开——产物清单要能直接
     指到具体文件；其余子目录不展开。临时文件与隐藏文件一律忽略。
     """
     artifacts: list[Path] = []
@@ -372,9 +373,9 @@ def _version_dir_files(version_dir: Path) -> list[Path]:
 
 
 def is_legacy_record(state: Mapping[str, Any]) -> bool:
-    """是否旧单文件格式的记录（M3.5 前的 ``current_code`` 形态，Design §4.2.2）。
+    """是否旧单文件格式的记录（代码存于 ``current_code`` 字段、没有版本目录）。
 
-    旧记录已按用户指示清理、不做迁移：show / resume 遇到时给一行可读提示并按
+    旧记录不做迁移：show / resume 遇到时给一行可读提示并按
     "记录不可用"退出，而不是崩溃或静默出错。
     """
     return "current_code" in state and "current_version_dir" not in state
@@ -383,9 +384,9 @@ def is_legacy_record(state: Mapping[str, Any]) -> bool:
 def list_runs(*, root: Path | None = None) -> list[RunSummary]:
     """列出运行记录（按开始时间倒序）；非目录项 / 非法名称 / 临时文件一律忽略。
 
-    默认跨两处聚合（Design §4.7）：``runs/`` 与 ``sessions/*/rounds/round-*/``；给出
+    默认跨两处聚合：``runs/`` 与 ``sessions/*/rounds/round-*/``；给出
     ``root`` 时只扫该目录（测试与"只看一次性运行"的调用方用）。
-    单条记录损坏不拖垮列表页：缺失字段按 Design §8.2 的降级派生链回退
+    单条记录损坏不拖垮列表页：缺失字段按降级派生链回退
     （修复轮数 → 工作区版本文件数；残留严重数 → 最新可解析审查结论；状态 → 日志末条事件）。
     """
     if root is not None:
@@ -408,10 +409,10 @@ def is_valid_run_ref(run_id: str) -> bool:
 def load_detail(run_id: str) -> RunDetail:
     """按运行号加载完整记录；引用非法 / 记录不存在抛 :class:`RunRecordError`。
 
-    查找跨两处记录（``runs/`` 与会话轮次，Design §4.7）。``state.json`` 损坏时**降级
-    返回**（Design §8.2）：摘要与时间线改由 ``log.jsonl`` 与产物清单派生，``degraded``
+    查找跨两处记录（``runs/`` 与会话轮次）。``state.json`` 损坏时**降级
+    返回**：摘要与时间线改由 ``log.jsonl`` 与产物清单派生，``degraded``
     置真并附可读原因——记录坏了不代表这一条运行不可查，命令面据此提示并按"记录损坏"
-    给退出码（Design §8.1 的 ``crw show`` 行）。
+    给非零退出码。
     """
     if not is_valid_run_ref(run_id):
         raise RunRecordError(
@@ -462,7 +463,7 @@ def select_run(
     ask: Callable[[str], str | None],
     show: Callable[[str], None],
 ) -> RunSummary | None:
-    """列表 + 数字选择；回车 / 取消 / 非法序号返回 ``None``（Design §6.2 #7 的选择 UX）。
+    """列表 + 数字选择；回车 / 取消 / 非法序号返回 ``None``。
 
     Args:
         runs: 候选运行记录（调用方已排序）。
@@ -479,7 +480,7 @@ def select_run(
 def is_stale_running(
     state: Mapping[str, Any] | None, run_path: Path, *, now: float | None = None
 ) -> bool:
-    """陈旧 ``running`` 判定（Design §8.2）：判据 = ``max(mtime(state.json), mtime(log.jsonl))``
+    """陈旧 ``running`` 判定：判据 = ``max(mtime(state.json), mtime(log.jsonl))``
     超过 30 分钟。只用于展示标注，绝不自动改状态。"""
     if not state or str(state.get("status") or "") != state_mod.STATUS_RUNNING:
         return False
@@ -497,7 +498,7 @@ def _summarize(path: Path) -> RunSummary:
     """单条运行的摘要（含降级派生）；不抛异常——坏记录也要能在列表页出现。
 
     会话轮次的运行号取自 ``state.json``（目录名是 ``round-<i>``）；状态快照不可读时
-    用 ``<会话号>/round-<i>`` 作展示标识（仍可被 ``crw show`` 定位，Design §8.2 的降级口径）。
+    用 ``<会话号>/round-<i>`` 作展示标识（仍可被 ``crw show`` 定位）。
     """
     state = read_state(path)
     session_id = _state_str(state, "session_id") or _session_of(path)
@@ -534,7 +535,7 @@ def _summarize(path: Path) -> RunSummary:
 
 
 def _display_run_id(path: Path, state: Mapping[str, Any] | None, session_id: str) -> str:
-    """列表 / 详情的展示标识（降级口径，Design §8.2）。
+    """列表 / 详情的展示标识（降级时仍给出可定位的引用）。
 
     正常记录取 ``state.json`` 里的运行号；会话轮次目录名是 ``round-<i>``，状态快照不可读时
     用 ``<会话号>/round-<i>`` 作标识（``crw show`` 也能按它定位）；一次性运行的目录名就是
@@ -558,7 +559,7 @@ def _session_of(path: Path) -> str:
 
 
 def _infer_status(path: Path) -> str:
-    """状态派生（state.json 不可读时）：日志末条事件推断，推断不出记 ``unknown``（Design §8.2）。"""
+    """状态派生（state.json 不可读时）：日志末条事件推断，推断不出记 ``unknown``。"""
     known = (
         state_mod.STATUS_RUNNING,
         state_mod.STATUS_SUCCESS,
@@ -599,7 +600,7 @@ def _latest_review_severe(path: Path) -> int | None:
 
 
 def _iter_dir(path: Path) -> list[Path]:
-    """目录内容（排序）；不可读 / 不存在时返回空表——列表页不因坏目录整体报错（Design §8.2）。"""
+    """目录内容（排序）；不可读 / 不存在时返回空表——列表页不因坏目录整体报错。"""
     try:
         return sorted(path.iterdir())
     except OSError:
@@ -630,7 +631,7 @@ def _mtime_text(path: Path) -> str:
 def _read_json_object(path: Path) -> dict[str, Any] | None:
     """读一个 JSON 对象；文件缺失 / 非 UTF-8 / 损坏 / 顶层非对象一律返回 ``None``。
 
-    解析复用 ``state.loads``（Design §3.1：解析归 state、文件 IO 归本模块），失败口径统一为
+    解析复用 ``state.loads``（解析归 state、文件 IO 归本模块），失败口径统一为
     ``ValueError``（``JSONDecodeError`` 亦属其子类）。
     """
     try:

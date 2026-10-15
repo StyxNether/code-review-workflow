@@ -1,11 +1,11 @@
 """会话态：会话号与目录、跨轮的会话状态（轮次链 / 当前设置 / 记忆索引）与落盘。
 
-会话态是**跨轮存活**的那一层（Design §3.1）：单轮运行状态仍由 ``StateGraph`` 托管、
+会话态是**跨轮存活**的那一层：单轮运行状态仍由 ``StateGraph`` 托管、
 engine 不感知会话态；本模块只做 schema、纯序列化/反序列化与 ``session.json`` 的文件 IO
 （原子写复用 :mod:`crw.workflow.records` 的既有原语），时序（何时创建、何时落盘、何时收尾）
 归 :mod:`crw.session.chat`。
 
-会话目录（Design §4.7）::
+会话目录::
 
     ~/.crw/sessions/<会话号>/
     ├── session.json         # 会话档案（本模块的读写对象）
@@ -31,7 +31,7 @@ from ..workflow import records
 SESSION_STATUS_ACTIVE = "active"
 SESSION_STATUS_ENDED = "ended"
 
-#: 会话号白名单：``s-YYYYMMDD-`` + 4 位小写十六进制（Design §4.7）。
+#: 会话号白名单：``s-YYYYMMDD-`` + 4 位小写十六进制。
 #: 与 ``records.SESSION_ID_PATTERN`` 同源但独立声明：本模块是生成 / 落盘方，
 #: records 是扫描方，两侧各自校验自己看到的名字（防穿越靠白名单而不是上游自觉）。
 SESSION_ID_PATTERN = re.compile(r"^s-[0-9]{8}-[0-9a-f]{4}$")
@@ -76,11 +76,11 @@ _ROUND_FIELDS: tuple[str, ...] = (
 
 
 class SessionState(TypedDict, total=False):
-    """会话状态（``session.json`` 的内容，Design §4.7 的"会话档案"）。
+    """会话状态（``session.json`` 的内容，即会话档案）。
 
     轮次链（``rounds``）是逐轮追加的记录摘要；``settings`` 是**当前轮次设置**（下一轮
-    的默认值，来源优先级见 Design §4.4）；``memory`` 是记忆索引（agent → 相对路径），
-    内容本体在 ``memory/<agent>.jsonl``（session.memory 负责）。
+    的默认值，取值优先级为命令行显式 > 消息提取 > 配置默认）；``memory`` 是记忆索引
+    （agent → 相对路径），内容本体在 ``memory/<agent>.jsonl``（session.memory 负责）。
     """
 
     session_id: str
@@ -108,11 +108,11 @@ class SessionSummary:
     path: Path
     model: str = ""
     degraded: bool = False
-    """``session.json`` 不可读（轮次数与状态取自轮次目录，Design §8.2 的降级口径）。"""
+    """``session.json`` 不可读（轮次数与状态改由轮次目录派生，列表页据此标"记录损坏"）。"""
 
 
 def sessions_root() -> Path:
-    """会话根目录：``data_dir()/sessions``（经 ``CRW_HOME`` 解析，Design §8.3）。"""
+    """会话根目录：``data_dir()/sessions``（经 ``CRW_HOME`` 解析）。"""
     return data_dir() / "sessions"
 
 
@@ -184,7 +184,7 @@ def new_session_state(
 
 
 def snapshot(state: Mapping[str, Any]) -> dict[str, Any]:
-    """会话状态 → 可持久化的档案（字段白名单 + 轮次条目字段白名单，Design §8.2 口径）。"""
+    """会话状态 → 可持久化的档案（字段白名单 + 轮次条目字段白名单两层过滤）。"""
     data: dict[str, Any] = {}
     for name in _PERSISTED_FIELDS:
         if name == "rounds":
@@ -250,7 +250,7 @@ def list_sessions() -> list[SessionSummary]:
     """列出会话（按创建时间倒序）；非目录项与非法名称忽略。
 
     单条会话损坏不拖垮列表页：``session.json`` 不可读时轮次数改数轮次目录、
-    状态标"（记录损坏）"（Design §8.2 的降级口径）。
+    状态标"（记录损坏）"。
     """
     root = sessions_root()
     try:
@@ -310,7 +310,7 @@ def _round_dirs(path: Path) -> list[Path]:
 
 
 def next_version(state: Mapping[str, Any]) -> int:
-    """下一轮运行的起始版本号 = 当前版本 + 1（会话内跨轮连续递增，Design §4.7）。"""
+    """下一轮运行的起始版本号 = 当前版本 + 1（会话内跨轮连续递增）。"""
     value = state.get("current_version")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 1
@@ -345,8 +345,8 @@ def record_round(
     """把一轮的结果追加进轮次链并返回该条目（调用方随后落盘档案）。
 
     只记**结构化摘要**：用户消息预览、运行号、结论句与轮次计数——完整的运行详情在
-    ``rounds/round-<i>/`` 的运行记录里（Design §4.7 的"每轮一条完整运行记录"）；
-    ``note`` 记本轮的标注（如消息轮次被按上限夹取，Design §4.4）。
+    ``rounds/round-<i>/`` 的运行记录里（每轮一条，与 ``crw run`` 同构）；
+    ``note`` 记本轮的标注（如消息轮次被按上限夹取）。
     """
     entry: dict[str, Any] = {
         "index": index,
@@ -372,7 +372,7 @@ def record_round(
 
 
 def memory_index(paths: Mapping[str, str]) -> dict[str, str]:
-    """记忆索引（agent → 相对会话目录的路径，posix 风格，Design §4.7）。"""
+    """记忆索引（agent → 相对会话目录的路径，统一 posix 分隔符）。"""
     return {str(agent): str(value).replace("\\", "/") for agent, value in paths.items()}
 
 

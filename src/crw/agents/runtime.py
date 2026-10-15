@@ -1,23 +1,23 @@
 """Agent 运行时：LangChain ``create_agent`` 封装、工具轮次限制、错误协议与过程事件回调。
 
-**单任务节点语义**（Design §6.2 #5）：一次 :meth:`AgentRuntime.run` 只服务一个节点任务，
-运行时不持有跨轮对话正本——跨轮记忆由会话层按 Agent 分别持有（Design §4.7 / D12），
+**单任务节点语义**：一次 :meth:`AgentRuntime.run` 只服务一个节点任务，
+运行时不持有跨轮对话正本——跨轮记忆由会话层按 Agent 分别持有，
 经 ``history`` 参数以历史消息形式进入本次请求，运行时不落盘、不解释其内容。
 
 LangChain / LangGraph 类型（消息、图对象、流事件）不越出本模块：对上层只返回
-:class:`TaskResult` 与字符串回调（Design §3.1）。
+:class:`TaskResult` 与字符串回调。
 
 框架映射：
 - 模型客户端由 :func:`crw.llm.create_model` 构建（OpenAI 兼容）；SDK / 框架异常经
   :func:`crw.llm.translate_failure` 翻译为 ``LLMError``，本模块不 import SDK 类型；
 - 工具经 ``StructuredTool`` 桥接注册表：模型可见 schema 与注册表逐字段一致（保真），
   执行统一委托 ``registry.dispatch``（``错误：`` 结构化回传协议不变），成功执行次数
-  计入 :attr:`TaskResult.tool_events`——这是审查契约"执行有效性门禁"的依据（Design §5.2）；
+  计入 :attr:`TaskResult.tool_events`——这是审查契约"执行有效性门禁"的依据；
 - 工具轮次上限与上下文预算护栏由 middleware 实现（达限对下一次模型调用去工具并注入
   收尾指令；框架内建 Limit 类 middleware 的 exit 语义不等价，不采用），并显式传
   ``recursion_limit`` 作崩溃护栏；
 - 护栏触达的事实经 :meth:`AgentRuntime.drain_notices` 交给上层（引擎把它并入阶段摘要，
-  进 log.jsonl 与时间线，Design §4.6）。
+  进 log.jsonl 与时间线）。
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ DeltaSink = Callable[[str, str], None]
 #: agents 不向上 import workflow，故此处自带别名）
 NodeFn = Callable[..., Mapping[str, Any]]
 
-#: 审查节点交回引擎的执行证据键（Design §5.2 的执行有效性门禁；不在状态 schema 内）
+#: 审查节点交回引擎的执行证据键（执行有效性门禁；不在状态 schema 内）
 REVIEW_EVIDENCE_KEY = "review_evidence"
 
 #: ToolNode 对参数校验失败等分支的兜底文案前缀（langgraph prebuilt）；仅用于改写时剥离
@@ -88,7 +88,7 @@ class TaskResult:
     """模型给出的最终正文（节点把它作为暂存键交回引擎）。"""
 
     tool_events: int = 0
-    """成功执行的工具调用次数（审查契约"执行有效性门禁"的依据，Design §5.2）。"""
+    """成功执行的工具调用次数（审查契约"执行有效性门禁"的依据）。"""
 
     truncated: bool = False
     """正文是否因达到输出长度上限被截断。"""
@@ -174,10 +174,10 @@ def _final_answer(final_state: Mapping[str, Any] | None) -> _Answer:
 
 
 def history_from_state(state: Mapping[str, Any], agent: str) -> list[dict[str, str]]:
-    """从运行状态的瞬态键取该 Agent 的会话记忆（Design §4.7）；缺失 / 形态不符返回空表。
+    """从运行状态的瞬态键取该 Agent 的会话记忆；缺失 / 形态不符返回空表。
 
     记忆由会话层按 Agent 落盘并随 ``RunRequest`` 注入状态（引擎只做搬运，不解释内容）；
-    一次性运行没有该键，行为与 M3 一致。
+    一次性运行没有该键，因此也就没有历史消息。
     """
     memory = state.get("agent_memory")
     if not isinstance(memory, Mapping):
@@ -199,7 +199,7 @@ def history_from_state(state: Mapping[str, Any], agent: str) -> list[dict[str, s
 def _history_messages(history: Sequence[Mapping[str, str]]) -> list[BaseMessage]:
     """会话记忆 → 历史消息：``user`` → HumanMessage、``assistant`` → AIMessage。
 
-    记忆是"该 Agent 自己的历史"（Design §4.7）：以消息序列而非拼接文本进入请求，
+    记忆是"该 Agent 自己的历史"：以消息序列而非拼接文本进入请求，
     追加式前缀（系统提示词 + 历史）逐轮稳定，供应商的上下文缓存才能命中。
     """
     messages: list[BaseMessage] = []
@@ -233,7 +233,7 @@ def _rounds_this_task(messages: Sequence[BaseMessage]) -> int:
     """本次任务的工具轮数：带 ``tool_calls`` 的 AI 消息记一轮。
 
     会话记忆（历史消息）只有正文、不带 ``tool_calls``，因此全量计数天然只覆盖本次任务
-    的工具轮次（Design §4.6 的工具轮次上限按"任务"计数，不按会话累计）。
+    的工具轮次（工具轮次上限按"任务"计数，不按会话累计）。
     """
     return sum(1 for message in messages if isinstance(message, AIMessage) and message.tool_calls)
 
@@ -324,7 +324,7 @@ class _ToolBridgeMiddleware(AgentMiddleware):
 
 
 class _GuardrailMiddleware(AgentMiddleware):
-    """任务级护栏：工具轮次上限与上下文预算（Design §4.6）。
+    """任务级护栏：工具轮次上限与上下文预算。
 
     触达任一上限后，对**后续每一次模型调用**去工具并注入收尾指令（保留已达结论，并在
     结论中标注可能不完整）；触达事实经 ``notices`` 交给上层写入阶段摘要。官方
@@ -371,7 +371,7 @@ class AgentRuntime:
         resolved: 配置层解析出的连接参数；缺省时走环境变量回退（``llm.create_model``）。
         emit: 过程事件回调（工具调用等）；缺省不输出。
         on_delta: 正文增量回调 ``(节点名, 文本)``；缺省不回调。
-        max_tool_rounds: 单任务工具轮次上限（Design §4.6 的工具轮次限制）。
+        max_tool_rounds: 单任务工具轮次上限。
         max_context_tokens: 单任务上下文预算；缺省取 ``CRW_MAX_CONTEXT_TOKENS``。
     """
 
@@ -430,9 +430,9 @@ class AgentRuntime:
             system_prompt: 该节点的系统提示词（常量，缓存前缀友好）。
             user_prompt: 本次任务的用户消息（含本轮上下文与输出契约）。
             registry: 该节点的工具注册表（``--no-exec`` 时其中不含 ``run_python``）。
-            history: 该 Agent 的会话记忆（``[{"role", "text"}]``，Design §4.7）：作为
+            history: 该 Agent 的会话记忆（``[{"role", "text"}]``）：作为
                 **历史消息**放在本轮 user 之前——追加式记忆的前缀逐轮稳定，供应商的
-                上下文缓存因此可以命中已发送部分；空表（一次性运行）时行为与 M3 一致。
+                上下文缓存因此可以命中已发送部分；空表（一次性运行）时只有本次任务的消息。
 
         Raises:
             LLMError: 模型调用失败（已翻译为可读中文，不含 SDK 类型）。
@@ -482,7 +482,7 @@ class AgentRuntime:
             if attempt == _ANSWER_RETRY_ATTEMPTS:
                 raise llm.LLMError(problem)
             # "正文里带回工具调用标记 / 收官回答为空"是协议层的偶发故障（实测 DeepSeek 系），
-            # 不是内容问题：重发一次，并把这次重发记进事件流（Design §8.2 的 retry 事件）。
+            # 不是内容问题：重发一次，并把这次重发记进事件流（与节点的契约重试同为 retry 事件）。
             self._emit({"node": node, "event": "retry", "detail": problem})
         truncated = answer.message is not None and _finish_reason(answer.message) == "length"
         text = answer.text
@@ -545,7 +545,7 @@ class AgentRuntime:
 
         ``stream_mode="messages"`` 提供正文增量（工具轮伴随的少量文本同样渲染，已知
         取舍）；``"values"`` 提供每步后的状态快照，末次即最终状态。护栏经 config 位置
-        参数传入——kwargs 会被框架吞进废弃参数桶而静默失效（M1 实测）。
+        参数传入——kwargs 会被框架吞进废弃参数桶而静默失效（实测过该行为）。
 
         每次模型调用落进状态的新 AI 消息都记一笔用量（并即时发出 usage 事件，与工具
         事件在同一时间线上交错）：输入 / 缓存命中 / 输出 token 只有在**调用当时**拿得到，

@@ -1,4 +1,4 @@
-"""结构化契约：围栏抽取、审查 / 修复输出校验与干净判定（Design §4.2.2、§5.2）。"""
+"""结构化契约：围栏抽取、审查 / 修复输出校验与干净判定。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def parse_review(payload: object, **kwargs: object):
     return contracts.parse_review_output(review_text(payload), **defaults)  # type: ignore[arg-type]
 
 
-# ---- 围栏抽取（Design §4.2.1 / §4.2.2）----
+# ---- 围栏抽取 ----
 
 
 def test_extract_fence_accepts_python_and_py_case_insensitively() -> None:
@@ -63,7 +63,7 @@ def test_extract_fence_skips_nested_foreign_blocks() -> None:
 
 
 def test_scan_file_fences_parses_the_file_declaration() -> None:
-    """`` ```python file=<相对路径> `` 的声明被解析为版本内相对路径（Design §4.2.2）。"""
+    """`` ```python file=<相对路径> `` 的声明被解析为版本内相对路径。"""
     text = (
         "```python file=main.py\nprint(1)\n```\n\n"
         "```PY file=pkg/util.py\nprint(2)\n```\n\n"
@@ -115,7 +115,7 @@ def test_validate_version_path_rejects_paths_leaving_the_version(raw: str) -> No
         contracts.validate_version_path(raw)
 
 
-# ---- 审查契约（Design §5.2）----
+# ---- 审查契约 ----
 
 
 def test_review_contract_generates_ids_in_order_and_fills_defaults() -> None:
@@ -132,7 +132,7 @@ def test_review_contract_generates_ids_in_order_and_fills_defaults() -> None:
 
 
 def test_review_contract_keeps_unknown_fields() -> None:
-    """未知字段忽略并原样保留（Design §5.2）。"""
+    """未知字段忽略并原样保留。"""
     result = parse_review(
         {
             "findings": [finding(confidence=0.9)],
@@ -164,7 +164,7 @@ def test_review_contract_accepts_matching_files_and_version() -> None:
 
 
 def test_review_contract_drops_the_legacy_file_key() -> None:
-    """旧单文件契约的顶层 ``file`` 被 files 取代：残留键不进落盘对象（Design §4.2.2）。"""
+    """旧单文件契约的顶层 ``file`` 被 files 取代：残留键不进落盘对象。"""
     result = parse_review({"file": "code_v1.py", "findings": [], "summary": "干净"})
 
     assert "file" not in result.contract
@@ -227,7 +227,7 @@ def test_review_contract_rejects_non_object_top_level() -> None:
 
 
 def test_review_contract_requires_execution_evidence_for_empty_findings() -> None:
-    """空 findings 且无成功工具事件时视为"审查未执行"（Design §5.2 门禁）。"""
+    """空 findings 且无成功工具事件时视为"审查未执行"（执行有效性门禁）。"""
     with pytest.raises(contracts.ContractViolation, match="视为审查未执行"):
         contracts.parse_review_output(
             review_text({"findings": [], "summary": "没有发现问题"}),
@@ -262,7 +262,7 @@ def test_review_contract_accepts_empty_findings_with_summary() -> None:
     ],
 )
 def test_judge_clean(severities: list[str], severe_only: bool, expected: bool) -> None:
-    """默认判据把【一般】也当阻塞（Design §4.4）；``severe_only`` 才是旧的"只数【严重】"。"""
+    """默认判据把【一般】也当阻塞；``severe_only`` 才是旧的"只数【严重】"。"""
     findings = [finding(severity) for severity in severities]
 
     assert contracts.judge_clean(findings, severe_only=severe_only) is expected
@@ -276,7 +276,7 @@ def test_severity_counts_and_residual_severe() -> None:
     assert list(contracts.severity_counts(findings)) == list(contracts.SEVERITIES)
 
 
-# ---- 修复契约：写盘形态（Design §4.2.2 / §5.2）----
+# ---- 修复契约：写盘形态 ----
 
 #: 修复契约的输入基准：上一轮审查的两条 findings（fixes 必须逐条对应它们的 id）
 _FIX_FINDINGS: list[dict[str, object]] = [{"id": "f-1"}, {"id": "f-2"}]
@@ -354,7 +354,7 @@ def test_fix_contract_covers_all_findings_in_order() -> None:
 
 
 def test_fix_contract_takes_the_last_entry_for_a_duplicate_id() -> None:
-    """重复 finding_id 取最后一条（Design §5.2 边界：后面的是修正过的结论）。"""
+    """重复 finding_id 取最后一条（后面那条是修正过的结论）。"""
     result = parse_fix(
         fix_text(
             [
@@ -369,7 +369,7 @@ def test_fix_contract_takes_the_last_entry_for_a_duplicate_id() -> None:
 
 
 def test_fix_contract_ignores_unknown_ids_but_reports_them() -> None:
-    """未知 id 忽略并在报告标注（Design §5.2 边界）。"""
+    """未知 id 忽略并在报告标注。"""
     result = parse_fix(
         fix_text([{"finding_id": "f-9", "status": "fixed", "note": "无中生有"}]), findings=[]
     )
@@ -467,7 +467,7 @@ def test_fix_contract_does_not_gate_version_contents() -> None:
 
 
 def test_fix_contract_parses_the_deleted_declaration() -> None:
-    """``{"deleted": […]}`` 是删除申请：解析出来交给引擎确认（Design §4.2.2）。"""
+    """``{"deleted": […]}`` 是删除申请：解析出来交给引擎确认。"""
     result = parse_fix(
         fix_text([], deleted=["legacy.py", "legacy.py", "extra.py"]),
         findings=[],
@@ -567,7 +567,7 @@ def test_fix_contract_uses_the_first_json_fence_only() -> None:
     assert result.extra_fences == 1
 
 
-# ---- 版本量级上限（Design §4.2.2：编码围栏抽取与引擎写盘校验共用）----
+# ---- 版本量级上限（编码围栏抽取与引擎写盘校验共用）----
 
 
 def test_version_size_errors_accepts_a_version_within_the_limits() -> None:
@@ -625,7 +625,7 @@ def test_version_size_errors_reports_the_total_size() -> None:
 
 
 def test_collect_version_files_enforces_the_size_limits() -> None:
-    """编码围栏抽取用同一把尺子（Design §4.2.2）：超限按契约违规重试。"""
+    """编码围栏抽取用同一把尺子：超限按契约违规重试。"""
     big = "x" * (contracts.MAX_FILE_BYTES + 1)
     with pytest.raises(contracts.ContractViolation, match="单文件上限"):
         contracts.collect_version_files(f"```python file=main.py\n{big}\n```\n", require_path=True)
@@ -680,7 +680,7 @@ def test_scan_fences_reports_labels_and_content_in_order() -> None:
 
 
 def test_manifest_payload_lists_files_with_hashes_in_order() -> None:
-    """manifest 是"路径 → sha256"的权威清单（整版本比较的基准，Design §4.2.2）。"""
+    """manifest 是"路径 → sha256"的权威清单（整版本比较的基准）。"""
     payload = contracts.manifest_payload(version=2, files={"b.py": "print(2)", "a.py": "print(1)"})
 
     assert payload["version"] == 2
@@ -690,7 +690,7 @@ def test_manifest_payload_lists_files_with_hashes_in_order() -> None:
     assert payload["files"][0]["sha256"] == hashlib.sha256(b"print(1)").hexdigest()
 
 
-# ---- crw review 报告契约（前作 files[] 形态，Design §6.4）----
+# ---- crw review 报告契约（files[] 形态）----
 
 
 def _report(**overrides: object) -> dict:
@@ -809,7 +809,7 @@ def test_merge_review_reports_single_and_multiple() -> None:
     assert contracts.merge_review_reports([])["files"] == []
 
 
-# ---- M3：并行双视角的汇合规则（Design §12.2）----
+# ---- 并行双视角的汇合规则 ----
 
 
 def test_merge_findings_dedupes_and_keeps_the_more_severe_one() -> None:

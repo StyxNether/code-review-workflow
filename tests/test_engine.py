@@ -1,4 +1,4 @@
-"""运行驱动：三条路径、落盘、报告、失败与中断（Design §4.4、§4.5、§4.6、§8.1、§8.2）。"""
+"""运行驱动：三条路径、落盘、报告、失败与中断。"""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def scripted_review(*responses: object) -> Callable[..., dict[str, str]]:
 def scripted_fix(code: str, fixes: Sequence[Mapping[str, Any]]) -> Callable[..., dict[str, str]]:
     """写盘形态的修复节点：把给定代码写回本轮版本目录的首个文件，只交回 fixes 围栏。
 
-    与真实修复节点同形态（Design §4.2.2）：产物走文件系统，不进契约文本。
+    与真实修复节点同形态（写盘形态）：产物走文件系统，不进契约文本。
     """
 
     def node(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
@@ -153,7 +153,7 @@ def test_requirement_run_is_clean_on_the_first_review(
 def test_requirement_run_persists_the_designed_directory_contract(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """运行目录与产物按 Design §4.5 落盘。"""
+    """运行目录与产物的落盘布局符合记录契约。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(
         engine_mod.RunRequest(requirement="写一个命令行计算器")
     )
@@ -265,7 +265,7 @@ def test_syntax_fixture_persists_fix_dispositions(
 def test_file_input_is_copied_into_the_workspace(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """-f 输入由命令面读取、引擎复制为 workspace/code_v1.py，原始路径记入 input（Design §4.2.1）。"""
+    """-f 输入由命令面读取、引擎复制为版本目录，原始路径记入 input。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(file_request("syntax_error.py"))
 
     state = read_state(result)
@@ -326,7 +326,7 @@ def test_divide_by_zero_hits_the_limit_and_reports_residual(
 def test_unchanged_round_is_annotated(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """修复未产生改动时不失败、继续复审，并在时间线与报告标注（Design §4.2）。"""
+    """修复未产生改动时不失败、继续复审，并在时间线与报告标注。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(
         file_request("divide_by_zero.py", max_iterations=2)
     )
@@ -355,7 +355,7 @@ def test_residual_report_lists_the_last_round_without_disposition(
 def test_max_iter_zero_reviews_once_without_fixing(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """--max-iter 0 = 只审不修（Design §4.4）。"""
+    """--max-iter 0 = 只审不修。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(
         file_request("divide_by_zero.py", max_iterations=0)
     )
@@ -373,7 +373,7 @@ def test_max_iter_zero_reviews_once_without_fixing(
 def test_injected_review_sequence_drives_the_loop(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """测试经 nodes= 注入固定 findings 序列（Design §9.1 的注入接缝）。"""
+    """测试经 nodes= 注入固定 findings 序列（引擎的节点注入接缝）。"""
     nodes = {"review": scripted_review([severe_finding()], [])}
 
     result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
@@ -401,7 +401,7 @@ def test_injected_review_sequence_can_force_residual(
 def test_moderate_findings_block_by_default(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """默认判据把【一般】也算阻塞；``--severe-only`` 才放宽回"只数【严重】"（Design §4.4）。"""
+    """默认判据把【一般】也算阻塞；``--severe-only`` 才放宽回"只数【严重】"。"""
     moderate = [{"severity": "一般", "location": "code_v1.py:3", "issue": "静默吞异常"}]
     nodes = {"review": scripted_review(moderate)}
 
@@ -448,7 +448,7 @@ def test_severe_only_residual_names_the_severe_findings(
     assert "仍有 1 项【严重】残留" in report_text(result)
 
 
-# ---- 修复写盘形态（write_file 只写改动文件，Design §4.2.2 / §5.2）----
+# ---- 修复写盘形态（write_file 只写改动文件）----
 
 
 def test_fix_that_claims_a_change_but_writes_nothing_is_retried_then_fails(
@@ -510,7 +510,7 @@ def test_fix_that_empties_a_version_file_is_rejected_by_name(
 def test_fix_over_the_size_limit_is_rejected(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """量级上限对写盘结果同样生效：单文件超限按契约违规收尾（Design §4.2.2）。"""
+    """量级上限对写盘结果同样生效：单文件超限按契约违规收尾。"""
 
     def huge_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
         directory = Path(str(state["current_version_dir"]))
@@ -607,7 +607,7 @@ def test_fix_retry_starts_from_a_restored_version_dir(
 def test_contract_violation_retries_once_with_feedback(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """契约校验失败 → 附错误清单重试一次（Design §4.6）；重试不计审查轮次。"""
+    """契约校验失败 → 附错误清单重试一次；重试不计审查轮次。"""
     seen: list[str | None] = []
 
     def review(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
@@ -645,7 +645,7 @@ def test_repeated_contract_violation_fails_the_node(
 def test_fix_contract_reports_unknown_ids_in_the_report(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """未知 finding_id 忽略并在报告标注（Design §5.2 边界）。"""
+    """未知 finding_id 忽略并在报告标注。"""
     nodes = {
         "review": scripted_review([severe_finding()], []),
         "fix": scripted_fix(
@@ -665,7 +665,7 @@ def test_fix_contract_reports_unknown_ids_in_the_report(
     assert "未识别的处置（已忽略）：f-9" in report_text(result)
 
 
-# ---- 失败与中断（Design §4.6）----
+# ---- 失败与中断 ----
 
 
 def test_node_failure_marks_run_failed_with_readable_diagnostics(
@@ -746,7 +746,7 @@ def test_recursion_limit_guard_actually_stops_a_non_converging_graph(
 def test_interrupt_writes_state_and_exits_two(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """Ctrl+C：log 追加 interrupt 事件 → 原子写 state.json → 退出码 2（Design §4.6）。"""
+    """Ctrl+C：log 追加 interrupt 事件 → 原子写 state.json → 退出码 2。"""
     nodes = {"review": failing_node("用户打断", KeyboardInterrupt)}
 
     result = make_engine(fixed_clock, run_id_sequence, nodes=nodes).execute(
@@ -761,7 +761,7 @@ def test_interrupt_writes_state_and_exits_two(
     assert state["error"]["node"] == "interrupt"
     assert state["finished_at"] == "2026-10-12T10:00:00+08:00"
     assert [event["event"] for event in read_events(result)][-1] == "interrupt"
-    assert result.report_written is False  # 中断只写 log + state（Design §4.6 的写盘序列）
+    assert result.report_written is False  # 中断只写 log + state（收尾写盘序列不含报告）
     assert result.run_dir is not None
     assert not (result.run_dir / "report.md").exists()
 
@@ -771,7 +771,7 @@ def test_second_interrupt_abandons_persistence(
     fixed_clock: Callable[[], str],
     run_id_sequence: Callable[[], str],
 ) -> None:
-    """第二次 Ctrl+C：放弃写盘（"尽力"语义），仍按中断结论退出 2（Design §4.6）。"""
+    """第二次 Ctrl+C：放弃写盘（"尽力"语义），仍按中断结论退出 2。"""
     real_write = records.atomic_write_text
     state_writes = {"count": 0}
 
@@ -921,7 +921,7 @@ def test_state_snapshot_is_written_at_every_node_boundary(
     fixed_clock: Callable[[], str],
     run_id_sequence: Callable[[], str],
 ) -> None:
-    """state.json 在每个节点结束与失败时各原子写一次（Design §8.2）。"""
+    """state.json 在每个节点结束与失败时各原子写一次。"""
     real_write = records.atomic_write_text
     snapshots: list[dict[str, Any]] = []
 
@@ -954,7 +954,7 @@ def test_state_snapshot_is_written_at_every_node_boundary(
 def test_run_id_collision_retries_with_a_new_id(
     fixed_clock: Callable[[], str],
 ) -> None:
-    """编号碰撞（目录已存在）时重新生成运行号（Design §4.3）。"""
+    """编号碰撞（目录已存在）时重新生成运行号。"""
     existing = "r-20261012-0001"
     records.create_run_dir(existing)
     ids = iter([existing, "r-20261012-0002"])
@@ -1015,10 +1015,10 @@ def test_max_iterations_source_is_recorded_verbatim(
     assert f"来源：{expected}" in report_text(result)
 
 
-def test_run_request_records_labels_for_future_milestones(
+def test_run_request_records_session_fields_and_model_label(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """会话字段与模型标识按入参写入（会话未实现，但记录结构须可扩展，Design §4.7）。"""
+    """会话字段与模型标识按入参写入运行记录。"""
     result = make_engine(fixed_clock, run_id_sequence).execute(
         engine_mod.RunRequest(
             requirement="写一个计算器",
@@ -1046,7 +1046,7 @@ def test_run_request_records_labels_for_future_milestones(
 def test_extra_fences_are_ignored_but_recorded(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """Design §4.2.1：修复输出的多余围栏忽略并记 log（写进阶段摘要即进 log.jsonl）。"""
+    """修复输出的多余围栏忽略并记 log（写进阶段摘要即进 log.jsonl）。"""
 
     def chatty_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
         directory = Path(str(state["current_version_dir"]))
@@ -1127,7 +1127,7 @@ def test_clean_stage_line_mentions_advice_only_when_present(
     assert "建议不影响判定" in advice_review["summary"]
 
 
-# ---- 护栏触达信息并入阶段摘要 / 失败原因（Design §4.6）----
+# ---- 护栏触达信息并入阶段摘要 / 失败原因 ----
 
 
 def test_notices_are_appended_to_the_stage_summary() -> None:
@@ -1173,7 +1173,7 @@ def test_the_runtime_is_rebuilt_for_every_run(
     assert len(built) == 2  # 第二次运行没有复用第一次的运行时
 
 
-# ---- M3：并行双视角审查（Design §12.2 的扩展示例）----
+# ---- 并行双视角审查 ----
 
 
 def make_parallel_engine(
@@ -1190,7 +1190,7 @@ def make_parallel_engine(
 def test_parallel_review_runs_two_views_and_merges_them(
     fixed_clock: Callable[[], str], run_id_sequence: Callable[[], str]
 ) -> None:
-    """两视角同轮并行、分支结论各落一份、汇合去重合并（Design §12.2 的汇合规则）。"""
+    """两视角同轮并行、分支结论各落一份、汇合去重合并。"""
     engine = make_parallel_engine(fixed_clock, run_id_sequence)
 
     # 以缺陷样例为输入：脚本化修复对语义型缺陷只会标注未采纳，代码逐轮不变，
@@ -1279,7 +1279,7 @@ def test_parallel_review_second_round_fans_out_again(
     assert (result.run_dir / "workspace" / "review_2.json").is_file()
 
 
-# ---- M3：未收敛标注（Design §4.4）----
+# ---- 未收敛标注 ----
 
 
 def test_unchanged_finding_set_is_flagged_as_not_converged(
@@ -1313,7 +1313,7 @@ def test_changed_finding_set_is_not_flagged(
     assert "**未收敛**" not in report_text(result)
 
 
-# ---- M3：续跑的父运行标注（Design §4.4 / §4.5）----
+# ---- 续跑的父运行标注 ----
 
 
 def test_resumed_run_records_parent_and_reports_parent_residual(
@@ -1388,7 +1388,7 @@ def test_report_survives_a_corrupt_parent_record(
     assert "| 父运行残留 |" not in report  # 读不出父状态 → 少一行标注，不影响报告
 
 
-# ---- M3.5：多文件版本与删除确认闸门（Design §4.2.2） ----
+# ---- 多文件版本与删除确认闸门 ----
 
 
 def two_file_encode(state: Mapping[str, Any]) -> dict[str, str]:
@@ -1401,7 +1401,7 @@ def two_file_encode(state: Mapping[str, Any]) -> dict[str, str]:
 
 
 def deleting_fix(state: Mapping[str, Any], retry_feedback: str | None = None) -> dict[str, str]:
-    """修复节点：改动写回 main.py，并提出删除 legacy.py（Design §4.2.2 的"申请-确认"）。"""
+    """修复节点：改动写回 main.py，并提出删除 legacy.py（"申请-确认"两段式）。"""
     directory = Path(str(state["current_version_dir"]))
     (directory / "main.py").write_text('"""入口。"""\n\nprint(1)\n', encoding="utf-8")
     payload = {
@@ -1515,7 +1515,7 @@ def test_version_reading_ignores_pycache_artifacts(
     assert sorted(path.name for path in copied.iterdir()) == ["divide_by_zero.py", "manifest.json"]
 
 
-# ---- M3.5 自审修复的回归 ----
+# ---- 输入物化与版本读取的边界回归 ----
 
 
 def test_source_text_only_request_is_recorded_as_file_input(
@@ -1573,8 +1573,8 @@ def test_version_read_follows_the_manifest(
 ) -> None:
     """版本读取以 manifest 清单为准：执行核实落进版本目录的副产物不进版本内容。
 
-    真实演示暴露：审查 Agent 跑被测程序时把数据文件写进了版本目录，resume 复制后
-    变成"版本里的文件"，修复覆盖检查随之失败。
+    审查 Agent 跑被测程序时会把数据文件写进版本目录；若按目录全量读，resume 复制后
+    它就成了"版本里的文件"，修复覆盖检查随之失败。
     """
     engine = make_engine(fixed_clock, run_id_sequence)
     parent = engine.execute(file_request("divide_by_zero.py", max_iterations=0))

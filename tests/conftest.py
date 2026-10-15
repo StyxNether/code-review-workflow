@@ -12,7 +12,7 @@ import pytest
 
 from crw import config as config_mod
 
-#: 固定时钟（引擎注入接缝，Design §9.1）：断言可复现
+#: 固定时钟（引擎的注入接缝）：断言可复现
 FIXED_TIME = "2026-10-12T10:00:00+08:00"
 
 #: 固定日期部分（由固定时钟派生，运行号前缀用；改 FIXED_TIME 即同步）
@@ -37,7 +37,7 @@ _SDK_ENV_VARS = (
 
 @pytest.fixture(autouse=True)
 def _isolate_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """把配置与运行记录根目录重定向到临时目录（Design §9.1）：测试不写真实用户目录。"""
+    """把配置与运行记录根目录重定向到临时目录：测试不写真实用户目录。"""
     monkeypatch.setenv("CRW_HOME", str(tmp_path / "crw-home"))
 
 
@@ -65,7 +65,7 @@ def _isolate_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 def configured_provider(tmp_path: Path) -> Callable[[str], dict[str, object]]:
     """写一份最小可用的 models.json（含默认供应商与占位 key），返回其内容。
 
-    测试里的"已配置"状态经真实配置层落地（走 ``config.resolve`` 的真实代码路径），
+    测试里的"已配置"状态由真实配置层读出来（走 ``config.resolve`` 的真实代码路径），
     而不是把 resolve 本身 mock 掉。
     """
 
@@ -108,7 +108,7 @@ def _block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """禁止测试内建连与域名解析（LLM 一律 mock，连通性验证走 crw config test）。
 
     拦截面为可替换的出站建连、解析与发送入口；已知漏口：子进程不继承本闸门
-    （M1 起 run_python 的子进程执行需另行约束），以及平台专有发送接口。
+    （``run_python`` 起的子进程要另行约束），以及平台专有发送接口。
     """
 
     def _forbidden(*args: object, **kwargs: object) -> None:
@@ -130,7 +130,7 @@ def _block_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def fixed_clock() -> Callable[[], str]:
-    """固定时钟：时间戳与运行号日期可断言（Design §9.1 的注入接口）。"""
+    """固定时钟：时间戳与运行号日期可断言（引擎的时钟注入接缝）。"""
 
     def _clock() -> str:
         return FIXED_TIME

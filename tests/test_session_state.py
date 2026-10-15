@@ -11,7 +11,7 @@ from crw.session import state as session_state
 
 
 def test_session_ids_follow_the_whitelist_and_retry_on_collision(tmp_path: Path) -> None:
-    """会话号形如 ``s-YYYYMMDD-xxxx``；与既有目录碰撞时重新抽取（Design §4.7）。"""
+    """会话号形如 ``s-YYYYMMDD-xxxx``；与既有目录碰撞时重新抽取。"""
     session_state.create_session_dir("s-20261012-abcd")
     candidates = iter(["abcd", "abcd", "0001"])
     session_id = session_state.new_session_id(day="20261012", hex_factory=lambda: next(candidates))
@@ -28,7 +28,7 @@ def test_session_dir_rejects_invalid_ids() -> None:
 
 
 def test_create_session_dir_builds_memory_and_rounds(tmp_path: Path) -> None:
-    """会话目录结构 = session.json 的落点 + memory/ + rounds/（Design §4.7）。"""
+    """会话目录结构 = session.json 的落点 + memory/ + rounds/。"""
     path = session_state.create_session_dir("s-20261012-0001")
 
     assert path.is_dir()
@@ -159,7 +159,7 @@ def test_list_sessions_orders_and_degrades_broken_archives(tmp_path: Path) -> No
 
 
 def test_next_version_advances_from_current() -> None:
-    """起始版本号 = 当前版本 + 1（会话内跨轮连续递增，Design §4.7）。"""
+    """起始版本号 = 当前版本 + 1（会话内跨轮连续递增）。"""
     assert session_state.next_version({}) == 1
     assert session_state.next_version({"current_version": 0}) == 1
     assert session_state.next_version({"current_version": 2}) == 3

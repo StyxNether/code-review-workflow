@@ -76,7 +76,7 @@ def create_model(
     base_url: str | None = None,
     thinking: str | None = None,
 ) -> ChatOpenAI:
-    """构建 OpenAI 兼容的 ChatOpenAI 客户端（配置思考挡位时注入对应参数，Design §8.3）。
+    """构建 OpenAI 兼容的 ChatOpenAI 客户端（配置思考挡位时注入对应参数）。
 
     显式校验 key 非空：SDK 在 ``api_key`` 为 None 时会回退读取 ``OPENAI_API_KEY``，
     可能把 OpenAI 的密钥发往 ``CRW_BASE_URL`` 指定的第三方接入点。

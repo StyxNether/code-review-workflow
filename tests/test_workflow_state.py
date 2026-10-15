@@ -1,4 +1,4 @@
-"""状态 schema 与序列化：字段齐全、快照投影、JSON 往返（Design §4.3、§9.1）。"""
+"""状态 schema 与序列化：字段齐全、快照投影、JSON 往返。"""
 
 from __future__ import annotations
 
@@ -31,12 +31,12 @@ def make_state(**overrides: object) -> dict[str, object]:
 
 
 def test_new_state_fills_every_persisted_field() -> None:
-    """初始状态字段与 Design §4.3 的持久化列表一一对应（不多不少）。
+    """初始状态字段与 ``PERSISTED_FIELDS`` 一一对应（不多不少）。
 
     例外（声明在 schema 内但**不进**运行记录）：并行双视角审查的分支 key
     （``findings_<视角>``）由汇合节点消费后以 ``findings`` 承载权威结论；
-    ``prior_files`` / ``agent_memory`` 是会话轮次的编码上下文与三 Agent 记忆
-    （Design §4.7），只在图执行内可见。
+    ``prior_files`` / ``agent_memory`` 是会话轮次的编码上下文与三 Agent 记忆，
+    只在图执行内可见。
     """
     state = make_state()
 
@@ -74,7 +74,7 @@ def test_new_state_records_optional_sources() -> None:
 def test_review_round_and_code_version_align_at_each_review_boundary(
     fix_rounds: int, expected_version: int
 ) -> None:
-    """审查边界上（review_round == fix_rounds）本轮审查序号 == 当前代码版本号（Design §4.4）。"""
+    """审查边界上（review_round == fix_rounds）本轮审查序号 == 当前代码版本号。"""
     state = make_state(fix_rounds=fix_rounds, review_round=fix_rounds)
 
     assert rounds_mod.code_version(state) == expected_version
@@ -83,7 +83,7 @@ def test_review_round_and_code_version_align_at_each_review_boundary(
 
 
 def test_artifact_names_follow_the_directory_contract() -> None:
-    """产物命名与 Design §4.5 的目录契约一致（版本 = 目录 + manifest，Design §4.2.2）。"""
+    """产物命名与目录契约一致（版本 = 目录 + manifest）。"""
     assert rounds_mod.code_version_dir_name(2) == "code_v2"
     assert state_mod.review_file_name(3) == "review_3.json"
     assert state_mod.fixes_file_name(3) == "fixes_3.json"
@@ -100,7 +100,7 @@ def test_version_dir_name_predicate_matches_the_generator() -> None:
 
 
 def test_snapshot_projects_only_persisted_fields() -> None:
-    """节点交回的暂存键与未来扩展键不进入运行记录（Design §3.1）。"""
+    """节点交回的暂存键与未来扩展键不进入运行记录。"""
     state = make_state(code_text="print('未落盘')", review_text="x", future_field=1)
 
     snapshot = state_mod.snapshot(state)

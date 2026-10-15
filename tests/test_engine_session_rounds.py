@@ -1,4 +1,4 @@
-"""引擎层与 M4 相关的接缝用例：起始版本号、exact 轮次语义、会话轮次的中断口径与运行目录。
+"""引擎层的会话接缝用例：起始版本号、exact 轮次语义、会话轮次的中断口径与运行目录。
 
 节点用脚本化假节点（确定性），引擎的真实包装层（契约、落盘、报告）照走。
 """
@@ -42,7 +42,7 @@ def _engine(**kwargs: Any) -> engine_mod.WorkflowEngine:
 
 
 def test_start_version_names_the_first_version_and_advances_fixes(tmp_path: Path) -> None:
-    """起始版本号 = 本次运行的第一个版本号（会话跨轮连续递增，Design §4.7）。"""
+    """起始版本号 = 本次运行的第一个版本号（会话跨轮连续递增）。"""
     result = _engine().execute(
         engine_mod.RunRequest(requirement="写一个计算器", start_version=3, max_iterations=1)
     )
@@ -98,7 +98,7 @@ def test_prior_files_reach_the_encode_node(tmp_path: Path) -> None:
 
 
 def test_exact_mode_runs_every_round_and_ends_with_a_review(tmp_path: Path) -> None:
-    """``exact``：跑满 n 轮修复 + n+1 次审查，即使中途干净（Design §4.4）。"""
+    """``exact``：跑满 n 轮修复 + n+1 次审查，即使中途干净。"""
     result = _engine().execute(
         engine_mod.RunRequest(
             requirement="写一个计算器",
@@ -145,7 +145,7 @@ def test_exact_mode_with_residual_reports_it(tmp_path: Path) -> None:
 
 
 def test_interrupt_in_a_session_round_is_recorded_as_interrupted(tmp_path: Path) -> None:
-    """会话轮次被中断 → ``status=interrupted``（一次性运行仍按 §4.6 记 failed）。"""
+    """会话轮次被中断 → ``status=interrupted``（一次性运行仍记 failed）。"""
 
     def interrupt(state: dict[str, Any]) -> dict[str, Any]:
         raise KeyboardInterrupt
@@ -169,7 +169,7 @@ def test_interrupt_in_a_session_round_is_recorded_as_interrupted(tmp_path: Path)
 
 
 def test_explicit_run_dir_is_used_with_the_round_name(tmp_path: Path) -> None:
-    """``run_dir`` 指定时按该目录建记录（会话轮次目录名 = ``round-<i>``，Design §4.7）。"""
+    """``run_dir`` 指定时按该目录建记录（会话轮次目录名 = ``round-<i>``）。"""
     rounds_dir = records_mod.sessions_root() / "s-20261012-0001" / "rounds"
     rounds_dir.mkdir(parents=True)
 
@@ -205,7 +205,7 @@ def test_existing_run_dir_is_not_overwritten(tmp_path: Path) -> None:
 
 
 def test_agent_memory_is_passed_through_without_persisting(tmp_path: Path) -> None:
-    """三 Agent 记忆经瞬态键到达节点，不落运行记录（Design §4.7）。"""
+    """三 Agent 记忆经瞬态键到达节点，不落运行记录。"""
     seen: dict[str, Any] = {}
 
     def capture_review(state: dict[str, Any]) -> dict[str, Any]:

@@ -1,21 +1,20 @@
 """工作流图组装：StateGraph 的节点、边、条件路由与复审循环。
 
 节点以“节点名 → 节点函数”的覆盖表注入，未覆盖的键使用调用方给出的缺省装配（生产路径
-为 agents 层的真实 Agent 节点，测试为脚本化假节点）；LangGraph 类型不越出本层
-（Design §3.1、§4.1、§12.2）。
+为 agents 层的真实 Agent 节点，测试为脚本化假节点）；LangGraph 类型不越出本层。
 
-节点输出协议（Design §3.1）：节点为纯函数 ``node(state) -> dict``，只返回增量字段；原始
+节点输出协议：节点为纯函数 ``node(state) -> dict``，只返回增量字段；原始
 文本经暂存键交回 workflow 层消费——``encode`` 用 ``code_text``、``review`` 用
 ``review_text``、``fix`` 用 ``fix_text``。暂存键不在状态 schema 内，不进入运行记录；
 阶段摘要是引擎按产物与契约结论自算的（节点不产出摘要文本）。
 
-审查节点额外可返回 ``review_evidence: bool``（本轮是否至少一次成功工具事件，Design §5.2
-的执行有效性门禁）；不返回该键的节点（脚本化假节点 / 注入桩）按"内联送达"视为满足门禁。
+审查节点额外可返回 ``review_evidence: bool``（本轮是否至少一次成功工具事件，即执行有效性
+门禁）；不返回该键的节点（脚本化假节点 / 注入桩）按"内联送达"视为满足门禁。
 
 两种图形态：
 
 - ``single``（缺省）：``encode → review → fix``（+ 复审循环），节点名见 :data:`SINGLE_NODE_NAMES`；
-- ``parallel``（扩展指南的落地示例，Design §12.2）：``encode → {review_correctness,
+- ``parallel``（并行扩展形态）：``encode → {review_correctness,
   review_security}``（同一超级步并行，各写**独立 key**）``→ merge_reviews``（按
   ``(location, issue)`` 去重取较严重者、统一重编号 id、推进审查轮次）``→`` 沿用同一条
   复审条件边与修复循环。汇合节点无条件覆盖 ``findings``（未运行分支的旧值不得残留）。
@@ -37,10 +36,10 @@ from . import contracts
 from . import state as state_mod
 from .state import RunState
 
-#: 默认（单视角）图的节点名（Design §4.1）
+#: 默认（单视角）图的节点名
 SINGLE_NODE_NAMES: tuple[str, ...] = ("encode", "review", "fix")
 
-#: 并行双视角图的节点名（Design §12.2 的扩展示例）
+#: 并行双视角图的节点名
 PARALLEL_NODE_NAMES: tuple[str, ...] = (
     "encode",
     "review_correctness",
@@ -62,7 +61,7 @@ REVIEW_NODE_FOR_VIEW: Mapping[str, str] = {
 #: 汇合节点名（引擎在缺省装配里补上本层的纯函数实现）
 MERGE_NODE = "merge_reviews"
 
-#: 节点函数类型：``(state[, retry_feedback=...]) -> Mapping[str, Any]``（Design §3.1）
+#: 节点函数类型：``(state[, retry_feedback=...]) -> Mapping[str, Any]``
 NodeFn = Callable[..., Mapping[str, Any]]
 
 
@@ -95,7 +94,7 @@ def resolve_nodes(
     defaults: Mapping[str, NodeFn] | None = None,
     parallel_review: bool = False,
 ) -> dict[str, NodeFn]:
-    """合并覆盖表与缺省装配：逐键替换、未给出的键用缺省（Design §12.2 第 3 步）。
+    """合并覆盖表与缺省装配：逐键替换、未给出的键用缺省。
 
     Args:
         nodes: 节点覆盖表（键为当前形态的节点名）；逐键替换缺省节点。
@@ -128,7 +127,7 @@ def build_graph(
     defaults: Mapping[str, NodeFn] | None = None,
     parallel_review: bool = False,
 ) -> CompiledStateGraph:
-    """组装并编译工作流图（Design §4.1 / §12.2）。
+    """组装并编译工作流图（两种形态共用同一套条件边与修复循环）。
 
     Args:
         nodes: 节点覆盖表；逐键替换缺省装配（测试与真实装配共用该接缝）。
@@ -165,7 +164,7 @@ def build_graph(
 
 
 def route_entry(state: Mapping[str, Any]) -> str:
-    """入口路由（只读纯函数）：需求文本从编码起步；代码文件直接进入审查（Design §4.4）。"""
+    """入口路由（只读纯函数）：需求文本从编码起步；代码文件直接进入审查。"""
     descriptor = state.get("input") or {}
     return "encode" if descriptor.get("kind") == state_mod.INPUT_REQUIREMENT else "review"
 
@@ -185,8 +184,9 @@ def route_entry_parallel(state: Mapping[str, Any]) -> list[str]:
 def route_after_review(state: Mapping[str, Any]) -> str:
     """复审条件边（只读纯函数）：干净 → 收尾；达修复轮次上限 → 收尾（残留）；否则进入修复。
 
-    干净判定与轮次口径见 Design §4.4；并行形态下判据作用于汇合后的 ``findings``（与单视角
-    同一口径）。两种轮次模式（§4.4）：``up-to`` 干净即早退；``exact`` 即使干净也继续跑满
+    干净判定与轮次口径见 :mod:`crw.rounds` 与 ``contracts.judge_clean``；并行形态下判据作用于
+    汇合后的 ``findings``（与单视角同一口径）。两种轮次模式：``up-to`` 干净即早退；
+    ``exact`` 即使干净也继续跑满
     n 轮修复（"精益求精"），因此**先判达限、再判干净**——末尾恒为一次审查。
     """
     if _state_int(state, "fix_rounds") >= _state_int(state, "max_iterations"):
@@ -216,7 +216,7 @@ def _state_int(state: Mapping[str, Any], key: str) -> int:
 def merge_review_node(state: Mapping[str, Any]) -> Mapping[str, Any]:
     """汇合节点（本层纯函数，无模型、无 IO）：合并两个视角的 findings。
 
-    多写者规则见 Design §12.2：按轮替换语义的字段（``findings``）由汇合节点**显式覆盖、
+    并行形态的多写者规则：按轮替换语义的字段（``findings``）由汇合节点**显式覆盖、
     无条件写**——两个分支写的是各自的独立 key，此处统一重编号 id（``f-1``…）并把来源
     视角并进每条 finding 的 ``views``（可审计：这条结论是谁提的）。
 
@@ -236,7 +236,7 @@ def merge_review_node(state: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def recursion_limit(*, max_iterations: int, parallel_review: bool = False) -> int:
-    """崩溃护栏上限（Design §4.4）：按图形态复算，护栏必须留足正常收尾的余量。
+    """崩溃护栏上限：按图形态复算，护栏必须留足正常收尾的余量。
 
     串行形态每轮 = 审查 + 修复两个超级步（``2n + 8``）；并行形态每轮 = 两视角（同一超级步）
     + 汇合 + 修复三个超级步（``3n + 8``）。数值是护栏而非预算：偏大只是更晚截停，偏小会把
@@ -247,7 +247,7 @@ def recursion_limit(*, max_iterations: int, parallel_review: bool = False) -> in
 
 
 def mermaid_flowchart(*, parallel_review: bool = False) -> str:
-    """规范化 mermaid 流程图（``crw graph`` 的导出内容，Design §8.1）。
+    """规范化 mermaid 流程图（``crw graph`` 的导出内容）。
 
     ``__start__`` / END 映射为可读的"开始 / 结束"标签，条件边给出中文分支标签；节点 / 边
     集合与 :func:`build_graph` 同源，由快照测试锁定。

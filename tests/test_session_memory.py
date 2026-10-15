@@ -1,4 +1,4 @@
-"""会话记忆：追加式落盘、载入降级、有效行与阈值压缩（Design §4.7）。"""
+"""会话记忆：追加式落盘、载入降级、有效行与阈值压缩。"""
 
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ def append_rounds(memory: AgentMemory, rounds: range, *, pad: str = "长" * 120)
 # ---- 路径与 agent 白名单 ----
 
 
-def test_memory_agents_and_constants_match_design() -> None:
-    """常量口径来自 Design §4.7（三 Agent 与压缩阈值），漂移即失败。"""
+def test_memory_agents_and_thresholds_are_pinned() -> None:
+    """记忆归属的三个 Agent 与压缩阈值是固定口径，漂移即失败。"""
     assert MEMORY_AGENTS == ("encoder", "reviewer", "fixer")
     assert COMPACTION_RATIO == 0.7
     assert MAX_MEMORY_TEXT_CHARS == 2000

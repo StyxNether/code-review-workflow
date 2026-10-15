@@ -1,9 +1,9 @@
 """模型调用用量：单次调用的 token 记账、按节点累计、命中率与展示文本。
 
-**为什么单独一层**：M4.5 起本产品在本地记账每次模型调用的输入 / 缓存命中 / 输出 token
-（Design §4.5 的运行目录与 §8.2 的记录格式相应新增 ``usage`` 与 ``event=usage`` 行）。
+**为什么单独一层**：每次模型调用的输入 / 缓存命中 / 输出 token 都在本地记账，落进运行目录
+的 ``state.json``（``usage`` 字段）与 ``log.jsonl``（``event=usage`` 行）。
 记账数据要从框架的消息对象里取，而 LangChain 类型不得越出 :mod:`crw.agents.runtime`
-（§3.1）——本模块因此只收**纯映射**（``usage_metadata`` 的形态）并只产出整数字典，
+——本模块因此只收**纯映射**（``usage_metadata`` 的形态）并只产出整数字典，
 runtime、engine、render、cli 四层共用同一套口径。
 
 字段（``FIELDS``，全部为非负整数；键名即 state.json 与 log.jsonl 里的键名）：
@@ -11,7 +11,7 @@ runtime、engine、render、cli 四层共用同一套口径。
 - ``calls``：观测到的模型调用次数（含未回报 usage 的调用）；
 - ``with_usage``：回报了 token 数的调用次数——与 ``calls`` 不等即"有调用没记账"；
 - ``input_tokens`` / ``output_tokens``：输入 / 输出 token 累计。**输出的计费口径已含思考**
-  （实测 DeepSeek：``completion_tokens=200`` 而其中 ``reasoning_tokens=166``，可见正文只
+  （DeepSeek 的一例：``completion_tokens=200`` 而其中 ``reasoning_tokens=166``，可见正文只
   有一句话）——``reasoning_tokens`` 是 ``output_tokens`` 的**分解**，不是加项；
 - ``reasoning_tokens``：思考（reasoning）token 累计；供应商不回报时为 0；
 - 正文 = ``output_tokens - reasoning_tokens``（见 :func:`body_tokens`），读数按这两列分列
@@ -105,8 +105,8 @@ def merge_by_node(
 ) -> dict[str, dict[str, int]]:
     """按节点合并两张账表（``节点名 → 账``）——LangGraph 状态里 ``usage`` 键的 reducer。
 
-    并行双视角的两个审查分支在同一个超级步里写同一个 ``usage`` 键（§12.2：同超级步多写者
-    必须有 reducer），分支各自写自己的节点名，故这里是"按键并入、同键相加"；
+    并行双视角的两个审查分支在同一个超级步里写同一个 ``usage`` 键——LangGraph 要求同一超级步
+    的多写者必须带 reducer，分支各自写自己的节点名，故这里是"按键并入、同键相加"；
     既有值形态不符（手改过的 state.json）按空账替换，不让坏数据把运行弄崩。
     """
     merged: dict[str, dict[str, int]] = {}
@@ -197,7 +197,7 @@ def body_tokens(record: Mapping[str, Any]) -> int:
     """正文输出 token（= 输出合计 − 思考）。
 
     供应商回报的 ``output_tokens`` 是**计费口径的合计**，``reasoning_tokens`` 是它的一部分
-    （实测 45 token 输入 → 输出 200、其中思考 166）。坏账（思考大于合计，手改过的记录可能
+    （如 45 token 输入 → 输出 200、其中思考 166）。坏账（思考大于合计，手改过的记录可能
     出现）按 0 处理：宁可少报正文，也不给出负数。
     """
     output = _as_int(record.get("output_tokens"), default=0) or 0
@@ -205,7 +205,7 @@ def body_tokens(record: Mapping[str, Any]) -> int:
     return max(0, output - reasoning)
 
 
-#: 思考 token 占输出达到该比例时，报告与回显附一句降本提示（实测 deepseek 思考挡位下常占七八成）
+#: 思考 token 占输出达到该比例时，报告与回显附一句降本提示（思考挡位下常占输出的七八成）
 THINKING_HINT_SHARE = 0.5
 
 

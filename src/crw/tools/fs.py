@@ -2,12 +2,12 @@
 
 所有 handler 返回字符串（错误也是字符串，数据封装，由注册表统一交给模型）：
 - 相对路径以**上下文根**解析（运行工作区；`crw review` 独立执行时为审查目标所在目录）；
-- 规范化后越出根（含 ``..``）、绝对路径、``~`` 展开一律结构化拒绝（Design §8.4）；
+- 规范化后越出根（含 ``..``）、绝对路径、``~`` 展开一律结构化拒绝；
 - 隐藏文件（任一路径成分以 ``.`` 开头）与数据目录内路径拒绝读写——防凭证类文件
   进入模型上下文与运行日志；
 - 行号口径（1-based、右对齐竖线分隔）与审查 prompt 的代码附行号方式一致；
 - ``write_file`` 自带原子写（临时文件 + ``os.replace``）：本层不得 import workflow 层
-  （依赖方向 §3.1），因此不复用 ``workflow.records`` 的写盘原语。
+  （依赖方向自上而下），因此不复用 ``workflow.records`` 的写盘原语。
 """
 
 from __future__ import annotations
@@ -235,9 +235,9 @@ def read_file(
 def write_file(roots: Sequence[Path], path: str, content: str) -> str:
     """把文本写入上下文根内的文件（原子写）；返回写入摘要。
 
-    路径解析与拒绝名单同 ``read_file``（Design §8.4）：越界 / 绝对路径 / ``~`` / 隐藏文件
+    路径解析与拒绝名单同 ``read_file``：越界 / 绝对路径 / ``~`` / 隐藏文件
     与数据目录一律拒绝——所以调用方给什么根就只能写进什么根。修复节点的根是本轮产出的
-    版本目录，写入因此天然限定在该目录之内（Design §4.2.2）。父目录不存在时按需创建
+    版本目录，写入因此天然限定在该目录之内。父目录不存在时按需创建
     （版本内的新文件可以是子目录里的新条目）；已有文件整份覆盖。
     """
     if not isinstance(path, str) or not path.strip():
@@ -253,7 +253,7 @@ def write_file(roots: Sequence[Path], path: str, content: str) -> str:
     if target.is_dir():
         return f"{ERROR_PREFIX}路径是目录，无法写入：{path!r}"
     if target.name == "manifest.json":
-        # manifest 是引擎落盘时写的权威文件清单（Design §4.2.2）：写它既会被重算覆盖，
+        # manifest 是引擎落盘时写的权威文件清单：写它既会被重算覆盖，
         # 也给了"把文件藏出清单"的可乘之机，直接在入口拒掉并说明原因
         return f"{ERROR_PREFIX}manifest.json 由引擎维护（版本的权威文件清单），不可写入"
     if content and not content.endswith("\n"):
@@ -280,7 +280,7 @@ def write_file(roots: Sequence[Path], path: str, content: str) -> str:
 def _atomic_write_text(path: Path, text: str) -> None:
     """原子写文本（临时文件 + ``os.replace``；失败尽力清理临时文件）。
 
-    与 ``workflow.records`` 的实现同语义但**自带一份**：工具层不得向上 import（§3.1），
+    与 ``workflow.records`` 的实现同语义但**自带一份**：工具层不得向上 import，
     而"不产生半写文件"是 write_file 对自己落盘的承诺，不能依赖调用方谨慎。临时名带 pid：
     并发（同一轮里两个写盘）不得互相踩同一个临时文件。
     """
@@ -353,7 +353,7 @@ def _relative_display(target: Path, roots: Sequence[Path]) -> str:
 def _is_skipped_entry(entry: Path) -> bool:
     """列表条目是否跳过：忽略名单目录与一切点开头的条目。
 
-    隐藏**文件**同样跳过：它们不可被 read_file 读取（Design §8.4 的拒绝名单），列出来只会
+    隐藏**文件**同样跳过：它们不可被 read_file 读取（在拒绝名单里），列出来只会
     引诱模型发起注定被拒的调用。
     """
     if entry.name.startswith("."):
@@ -362,7 +362,7 @@ def _is_skipped_entry(entry: Path) -> bool:
 
 
 def _data_dirs() -> list[Path]:
-    """需拒读的数据目录：``CRW_HOME`` / ``~/.crw`` / ``~/.cra``（Design §8.4）。"""
+    """需拒读的数据目录：``CRW_HOME`` / ``~/.crw`` / ``~/.cra``。"""
     candidates = [config.data_dir(), Path.home() / ".crw", Path.home() / ".cra"]
     resolved: list[Path] = []
     for item in candidates:

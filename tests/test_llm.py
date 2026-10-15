@@ -86,7 +86,7 @@ class TestTranslateFailure:
         ],
     )
     def test_context_length_400_is_translated_readably(self, message: str) -> None:
-        """模型端上下文超限：中文可读报错 + 可操作建议（Design §4.6）。"""
+        """模型端上下文超限：中文可读报错 + 可操作建议。"""
         translated = llm.translate_failure(_http_error(400, message))
 
         assert isinstance(translated, llm.LLMError)
@@ -215,10 +215,10 @@ class TestProbe:
 
 
 class TestThinkingParams:
-    """思考挡位 → 客户端构造参数（Design §8.3；构造不发请求，可离线断言落点）。"""
+    """思考挡位 → 客户端构造参数（构造不发请求，可离线断言落点）。"""
 
     def test_no_thinking_sends_no_params(self) -> None:
-        """未配置挡位：不发送任何思考参数（行为与 M3 一致）。"""
+        """未配置挡位：不发送任何思考参数。"""
         model = llm.create_model(
             "some-model", api_key=PLACEHOLDER_KEY, base_url="https://api.example.com/v1"
         )

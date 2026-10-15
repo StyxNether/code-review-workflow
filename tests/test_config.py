@@ -1,4 +1,4 @@
-"""配置层：models.json 读写校验、预设与变量名、key 回退链、解析优先级（Design §8.3）。"""
+"""配置层：models.json 读写校验、预设与变量名、key 回退链、解析优先级。"""
 
 from __future__ import annotations
 
@@ -175,7 +175,7 @@ class TestValidate:
         config.validate_config({"providers": [_provider()], "default": "DeepSeek/model-a"})
 
     def test_keyless_providers_sharing_a_variable_with_different_hosts_are_rejected(self) -> None:
-        """同一个回退变量 + 不同接入点主机 = key 串用，加载即报错（Design §8.3）。"""
+        """同一个回退变量 + 不同接入点主机 = key 串用，加载即报错。"""
         data = {
             "providers": [
                 _provider("DeepSeek", base_url="https://api.deepseek.com"),
@@ -387,7 +387,7 @@ def test_legacy_env_var_rejects_a_malformed_preset(monkeypatch: pytest.MonkeyPat
         config.legacy_env_var("X")
 
 
-# ---- 模型条目两态与思考挡位（Design §8.3 的 M3.5 规格） ----
+# ---- 模型条目两态与思考挡位 ----
 
 
 def _thinking_config(**overrides: object) -> dict:
@@ -469,7 +469,7 @@ class TestThinkingModelEntries:
         """纯字符串条目但模型在预设里：仍按预设默认关闭发送参数。
 
         "什么都不发"在 DeepSeek 侧等于"思考开、effort high"，所以默认关闭必须落到
-        显式参数上（用户裁决 2026-10-14）。
+        显式参数上。
         """
         data = _thinking_config()
         data["providers"][0]["models"] = ["deepseek-flash"]
@@ -513,7 +513,7 @@ def test_test_provider_survives_invalid_model_entries() -> None:
 
 
 def test_importable_providers_keeps_object_entries() -> None:
-    """前作配置导入：对象形态的模型条目原样沿用（结构同源口径），不再整条静默丢弃。"""
+    """导入旧工具配置：对象形态的模型条目原样沿用（结构同源口径），不整条静默丢弃。"""
     data = {
         "providers": [
             {
@@ -540,11 +540,11 @@ def _preset_levels(preset: config.ProviderPreset, model: str) -> list[str] | Non
     return payload["levels"] if payload else None
 
 
-def test_presets_prefill_thinking_levels_per_user_rulings() -> None:
-    """预设回填锁住 2026-10-14 的四项用户裁决。
+def test_presets_prefill_thinking_levels_per_provider() -> None:
+    """预设只按各供应商真实支持的挡位回填。
 
-    裁决：GLM 接受"不可关闭思考"→ 不预填；Kimi k2.6 新增 on 映射（thinking.type 开启）；
-    百炼新增 enable-off 映射（enable_thinking 关闭）；OpenAI 按 5.6 系列口径预填。
+    口径：GLM 不接受关闭思考 → 不预填；Kimi k2.6 额外支持 on（thinking.type 开启）；
+    百炼用 enable-off 映射（enable_thinking 关闭）；OpenAI 按 5.6 系列的挡位口径预填。
     """
     presets = {preset.name: preset for preset in config.PROVIDER_PRESETS}
 
@@ -564,7 +564,7 @@ def test_presets_prefill_thinking_levels_per_user_rulings() -> None:
         assert all(isinstance(item, str) for item in presets[name].models)
 
 
-# ---- settings.json：运行默认值（Design §8.3）----
+# ---- settings.json：运行默认值 ----
 
 
 def test_settings_defaults_when_the_file_is_missing() -> None:
@@ -591,7 +591,7 @@ def test_settings_round_trip_and_merge() -> None:
 
 
 def test_partial_rounds_block_is_rejected() -> None:
-    """给出 rounds 就必须给全两个键：配一半是歧义状态，按配置错误报出（Design §8.3）。"""
+    """给出 rounds 就必须给全两个键：配一半是歧义状态，按配置错误报出。"""
     config.settings_path().parent.mkdir(parents=True, exist_ok=True)
     config.settings_path().write_text('{"rounds": {"limit": 12}}', encoding="utf-8")
 
@@ -615,7 +615,7 @@ def test_partial_rounds_block_is_rejected() -> None:
     ],
 )
 def test_invalid_settings_are_config_errors(payload: object) -> None:
-    """违规按配置错误处理（退出码 2 的上游）；不静默夹取（Design §8.3）。"""
+    """违规按配置错误处理（退出码 2 的上游）；不静默夹取。"""
     config.settings_path().parent.mkdir(parents=True, exist_ok=True)
     config.settings_path().write_text(json.dumps(payload), encoding="utf-8")
 

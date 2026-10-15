@@ -1,4 +1,4 @@
-"""内置思考等级表（Design §8.3）：把挡位名映射为 OpenAI 兼容客户端的发送参数。
+"""内置思考等级表：把挡位名映射为 OpenAI 兼容客户端的发送参数。
 
 ``reasoning_effort`` 是 langchain-openai 的一等构造参数；``thinking`` /
 ``enable_thinking`` / ``thinking_budget`` 等非一等参数一律经 ``extra_body`` 透传，
@@ -66,16 +66,14 @@ def available_levels_text() -> str:
 def resolve_level_params(level: str) -> dict[str, Any]:
     """挡位名 → ChatOpenAI 构造参数；每次调用新建返回值，不共享可变对象。
 
-    通道设计依据 Design §8.3 内置等级表：关闭族有两个通道（``thinking.type=disabled``
-    与 ``reasoning_effort=none``），按名分派——``off`` / ``disabled`` 走前者（DeepSeek
-    等兼容层支持 Anthropic 风格参数），``none`` 走后者（OpenAI / DeepSeek 的
-    ``reasoning_effort`` 取值，``none`` 即关闭思考）；``on`` 是 ``off`` 的开启对偶
-    （``thinking.type=enabled``，Kimi k2.6 等用此通道开启）；minimal..high 走
-    ``reasoning_effort`` 一等参数；max 复合注入（effort 顶格 high，另以
+    关闭族有两个通道（``thinking.type=disabled`` 与 ``reasoning_effort=none``），按名分派
+    ——``off`` / ``disabled`` 走前者（DeepSeek 等兼容层支持 Anthropic 风格参数），
+    ``none`` 走后者（OpenAI / DeepSeek 的 ``reasoning_effort`` 取值，``none`` 即关闭思考）；
+    ``on`` 是 ``off`` 的开启对偶（``thinking.type=enabled``，Kimi k2.6 等用此通道开启）；
+    minimal..high 走 ``reasoning_effort`` 一等参数；max 复合注入（effort 顶格 high，另以
     ``thinking.type=enabled`` 声明开启）；enabled / enable-off 是 ``enable_thinking``
-    布尔开关的开与关（Qwen 系的百炼兼容层，用户裁决 2026-10-14 新增关闭对偶）；
-    budget:<n> 以 ``thinking_budget`` 传数值预算；其余名称视为用户自定义的供应商参数，
-    原样透传给兼容层解释。
+    布尔开关的开与关（Qwen 系的百炼兼容层）；budget:<n> 以 ``thinking_budget`` 传数值预算；
+    其余名称视为用户自定义的供应商参数，原样透传给兼容层解释。
     """
     name = level.strip()
     if not name:

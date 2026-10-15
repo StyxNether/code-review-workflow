@@ -119,7 +119,7 @@ def fake_review(state: Mapping[str, Any]) -> Mapping[str, Any]:
 def fake_fix(state: Mapping[str, Any]) -> Mapping[str, Any]:
     """假修复节点：只做可脚本化且可复核的修复（语法缺陷），其余逐条标记 skipped。
 
-    与真实修复节点同形态（Design §4.2.2 的写盘形态）：把**改动过的文件**写回本轮的版本
+    与真实修复节点同形态（写盘形态）：把**改动过的文件**写回本轮的版本
     目录（引擎已把上一版本复制进来），只交回 fixes 清单文本，未改动的文件不动。
     """
     files = read_version_files(state)
@@ -550,7 +550,7 @@ def ai_tool_call(name: str, *, usage: dict[str, Any] | None = None, **arguments:
 
 
 def file_fence(code: str, path: str = "main.py") -> str:
-    """编码 / 修复产出的代码围栏文本（``python file=<相对路径>``，Design §4.2.2）。"""
+    """编码 / 修复产出的代码围栏文本（``python file=<相对路径>``）。"""
     return f"实现说明。\n\n```python file={path}\n{code}\n```\n"
 
 
@@ -568,7 +568,7 @@ def review_fence(
 def fix_contract(fixes: Sequence[Mapping[str, Any]], *, deleted: Sequence[str] = ()) -> str:
     """修复轮的输出契约：恰好一个 ```json 围栏。
 
-    产物内容不在契约里——修复节点用 ``write_file`` 只写改动的文件（Design §4.2.2），
+    产物内容不在契约里——修复节点用 ``write_file`` 只写改动的文件，
     版本目录的实际内容由引擎按磁盘校验并重算 manifest。
     """
     payload: dict[str, Any] = {"fixes": list(fixes)}
@@ -681,7 +681,7 @@ def requirement_input_with_clean_reviews(
     return script
 
 
-# ---- 会话模式的脚本片段（编排节点 + 审查轮次；Design §5.4 / §4.7）----
+# ---- 会话模式的脚本片段（编排节点 + 审查轮次）----
 
 
 def orchestrator_reply(

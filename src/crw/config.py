@@ -1,8 +1,8 @@
 """供应商配置：``~/.crw/models.json`` 读写、内置预设、环境变量回退与解析。
 
 数据目录经 ``CRW_HOME`` 解析（默认 ``~/.crw``）；key 回退链 CRW_ → CRA_ → SE_CodeAgent，
-解析优先级为 ``--model/--provider`` > 配置文件 ``default`` > 环境变量（Design §8.3）。
-模型条目兼容字符串 / 对象两态（对象可带思考挡位配置，Design §8.3 的 M3.5 规格）。
+解析优先级为 ``--model/--provider`` > 配置文件 ``default`` > 环境变量。
+模型条目兼容字符串 / 对象两态（对象可带思考挡位配置）。
 本模块是 key 的唯一读取点——仓库内任何文件、日志、测试样例都不得出现真实密钥。
 """
 
@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 from . import thinking as thinking_mod
 
-#: 数据目录环境变量：测试与多环境隔离用（Design §9.1）
+#: 数据目录环境变量：测试与多环境隔离用
 HOME_ENV = "CRW_HOME"
 
 #: 默认数据目录名（用户主目录下）
@@ -30,13 +30,13 @@ DEFAULT_HOME_NAME = ".crw"
 DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 
-#: run_python 超时秒数默认值（Design §6.2 #3 保留 CRW_EXEC_TIMEOUT）
+#: run_python 超时秒数默认值（``CRW_EXEC_TIMEOUT`` 可覆盖）
 DEFAULT_EXEC_TIMEOUT = 10
 
-#: 单节点请求预算（Design §4.6 的任务级护栏）
+#: 单节点请求预算：一次节点请求的上下文规模护栏
 DEFAULT_MAX_CONTEXT_TOKENS = 100_000
 
-#: 与既有工具链兼容的历史变量（key 回退链末端，前作亦用它）
+#: key 回退链末端变量（与既有工具链兼容：本机已配置它时无需重复录入 key）
 LEGACY_KEY_ENV = "SE_CodeAgent"
 
 _KEY_PREFIX = "CRW_"
@@ -56,7 +56,7 @@ class ProviderPreset:
 
     预填项均可在交互中修改；模型名有时效性，``crw config test`` 可兜底验证。
     模型条目可为字符串（无思考挡位）或对象（``{"name": …, "thinking": {…}}``），
-    与 models.json 的两态一致（Design §8.3）。环境变量名与既有工具链的 ``CRA_*``
+    与 models.json 的两态一致。环境变量名与既有工具链的 ``CRA_*``
     一一对应，保证"零重配"。
     """
 
@@ -68,28 +68,27 @@ class ProviderPreset:
     """思考挡位的如实说明（恒开型：不可关闭、成本不可控；空 = 无需说明）。"""
 
 
-# 思考挡位预填说明（挡位清单 2026-10-14 查证各供应商官网；**默认挡位改为"关闭"由用户
-# 2026-10-14 裁决**——关键点是"关闭"必须**显式发送参数**：不发参数在 DeepSeek 侧等于
-# "思考开、effort high"，所以预设把 selected 预填到各供应商的关闭通道上，而不是留空。
-# 用户后来在菜单 6 手选过的条目（models.json 里有 selected）一律优先于这里的默认值。
-# 2026-10-14 那次预填是我们替用户填的、不是逐个手选的，因此本次调整不违背"显式配置优先"。）
-# 原查证说明（2026-10-14 查证各供应商官网；四项通道差异已由用户裁决，同日落地）：
-# - DeepSeek：thinking.type=enabled/disabled 与 reasoning_effort=none/low/high/max（V4 系档位
-#   为 low/high/max，medium 未列入文档 → 不预填），off 走 thinking.type、none 走 effort=none；
-# - Kimi：k2.6 支持 thinking.type=disabled，开启用 thinking.type=enabled（内置 on）→ 预填
-#   off/on（用户裁决 2026-10-14 新增 on 映射）；k3 无 thinking 参数、用 reasoning_effort
-#   （预填 low/high；max 的内置映射复合了 thinking.type → 不预填）；
-# - OpenAI：reasoning_effort=none/low/medium/high——按 5.6 系列（当代 GPT）口径预填
-#   （用户裁决："gpt 走 5.6 系列"；官网逐模型核实仍由用户按需进行，可随时在菜单 6 清空/修改）；
-# - 阿里云百炼：enable_thinking 布尔与 thinking_budget 走 extra_body（qwen3.8 混合思考模型），
-#   enabled / enable-off 与内置映射一致（关闭对偶为用户裁决 2026-10-14 新增）→ 预填两者；
-# - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 报错，官方口径），
-#   思考恒开（默认交错思考）→ 用户裁决"接受不可关闭"，**不预填**（无可用配置项，保持字符串条目）。
-#   裁决同时要求"恒开型默认 low"，但那要以"官网 + 锁定版本实测确认该供应商接受
-#   reasoning_effort=low"为前提；未实测就不发送任何参数（延续"查不到就不猜"的规矩），
-#   并在 crw config 回显里如实说明"该模型思考不可关闭，成本不可控"。
-#: 恒开型供应商的如实说明（官方口径 thinking.type=disabled 直接报错；未查证到可用的
-#: reasoning_effort 通道并经实测确认，因此不预填、不发送任何参数——但必须让用户看得见）
+# 思考挡位预填说明（挡位清单取自各供应商官方文档）：
+# - 默认挡位一律预填到各供应商的**关闭通道**上，而不是留空——"关闭"必须**显式发送参数**：
+#   不发参数在 DeepSeek 侧等于"思考开、effort high"，比关闭更贵。用户在菜单 6 手选过的条目
+#   （models.json 里已有 selected）一律优先于这里的默认值。
+# - DeepSeek：两条通道 thinking.type=enabled/disabled 与 reasoning_effort=none/low/high/max
+#   （V4 系文档只列 low/high/max，medium 未列入 → 不预填）；off 走 thinking.type、
+#   none 走 effort=none。
+# - Kimi：k2.6 支持 thinking.type=disabled，开启走 thinking.type=enabled（内置等级表的 on）
+#   → 预填 off/on；k3 无 thinking 参数、只有 reasoning_effort → 预填 low/high（内置 max 映射
+#   复合了 thinking.type，k3 不接受 → 不预填）。
+# - OpenAI：reasoning_effort=none/low/medium/high，按当代 GPT（5.6 系列）的文档口径预填；
+#   逐模型的挡位支持由用户按需核对，菜单 6 可随时清空或修改。
+# - 阿里云百炼：enable_thinking 布尔与 thinking_budget 走 extra_body（qwen3.8 为混合思考模型），
+#   与内置映射的 enabled / enable-off 一一对应 → 预填两者。
+# - Z.ai / BigModel：GLM-5.3 系**不支持关闭思考**（thinking.type=disabled 直接报错，官方口径），
+#   思考恒开（默认交错思考）→ 无可用配置项，**不预填**（保持字符串条目）。恒开型若要给默认
+#   low，前提是该供应商接受 reasoning_effort=low 经官方文档与锁定版本双向确认；确认不了就
+#   不发送任何参数（查不到就不猜），并在 crw config 回显里如实说明"该模型思考不可关闭、
+#   成本不可控"。
+#: 恒开型供应商的如实说明（官方口径 thinking.type=disabled 直接报错；没有确认到可用的
+#: reasoning_effort 通道，因此不预填、不发送任何参数——但必须让用户看得见）
 _THINKING_NOTE_ALWAYS_ON = (
     "思考不可关闭（官方口径 thinking.type=disabled 报错）：该模型的成本不可控；"
     "未查证到并经实测确认可用的挡位通道，故不预填、不发送任何思考参数"
@@ -170,7 +169,7 @@ PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
 )
 
 
-# ---- 模型条目两态（字符串 / 对象，Design §8.3 的思考挡位）----
+# ---- 模型条目两态（字符串 / 对象：对象带思考挡位配置）----
 
 
 def model_entry_name(item: Any) -> str | None:
@@ -197,7 +196,7 @@ def model_thinking_config(models: list[Any], name: str) -> dict[str, Any] | None
 
 
 def data_dir() -> Path:
-    """数据目录根：``CRW_HOME`` 覆盖，默认 ``~/.crw``（Design §8.3、§9.1）。
+    """数据目录根：``CRW_HOME`` 覆盖，默认 ``~/.crw``。
 
     配置（models.json）与运行记录同源解析：运行记录经 ``records.runs_root()`` 取
     ``data_dir()/runs``，测试由 conftest 统一指向临时目录。
@@ -209,7 +208,7 @@ def data_dir() -> Path:
 
 
 def config_path() -> Path:
-    """models.json 路径（``data_dir()/models.json``，Design §8.3）。"""
+    """models.json 路径（``data_dir()/models.json``）。"""
     return data_dir() / "models.json"
 
 
@@ -222,23 +221,23 @@ def env_registry_path() -> Path:
     return data_dir() / "env-vars.json"
 
 
-# ---- settings.json：运行默认值（Design §8.3，与"仅供应商"的 models.json 分工）----
+# ---- settings.json：运行默认值（与"仅供应商"的 models.json 分工）----
 
-#: 轮次上限的代码内绝对天花板（改动须评审，防"把上限改到无界"，Design §8.3）
+#: 轮次上限的代码内绝对天花板：防止配置把上限改到无界（调用量护栏）
 ROUNDS_LIMIT_CEILING = 20
-#: 未配置 settings.json 时的默认修复轮次（与命令行默认一致，Design §4.4）
+#: 未配置 settings.json 时的默认修复轮次（与命令行默认一致）
 DEFAULT_ROUNDS_DEFAULT = 3
-#: 未配置 settings.json 时的轮次上限（与命令行 0–10 的硬闸一致，Design §8.1）
+#: 未配置 settings.json 时的轮次上限（与命令行 0–10 的硬闸一致）
 DEFAULT_ROUNDS_LIMIT = 10
 
 
 def settings_path() -> Path:
-    """运行默认值文件路径：``data_dir()/settings.json``（Design §8.3）。"""
+    """运行默认值文件路径：``data_dir()/settings.json``。"""
     return data_dir() / "settings.json"
 
 
 def default_settings() -> dict[str, Any]:
-    """内置运行默认值（文件缺失 / 缺项时的回退，Design §4.4 的最下一级）。"""
+    """内置运行默认值（文件缺失 / 缺项时的回退，轮次取值优先级链的最后一级）。"""
     return {"rounds": {"default": DEFAULT_ROUNDS_DEFAULT, "limit": DEFAULT_ROUNDS_LIMIT}}
 
 
@@ -274,7 +273,7 @@ def rounds_config() -> tuple[int, int, int | None]:
     """``(默认轮次, 轮次上限, 显式配置的默认轮次)``：**一次**读取 settings.json 得出三者。
 
     第三项为 ``None`` 表示默认轮次来自内置回退（来源标注用：显式配置记 ``config``、
-    内置回退记 ``default``，Design §4.4 的来源枚举）。一次读取同时保证同一条命令里
+    内置回退记 ``default``，这两个标签是轮次来源枚举的全部取值）。一次读取同时保证同一条命令里
     各处的取值与来源标注一致（不会读到两次改动的中间态）；违规抛 :class:`ConfigError`。
     """
     path = settings_path()
@@ -305,7 +304,7 @@ def configured_rounds_default() -> int | None:
 def validate_settings(data: Any) -> None:
     """settings.json 结构校验；不合法抛 :class:`ConfigError`。
 
-    规则（Design §8.3）：``rounds`` 允许缺席（用内置默认），给出时必须是非空对象、
+    规则：``rounds`` 允许缺席（用内置默认），给出时必须是非空对象、
     只含 ``default`` / ``limit`` 两个整数键，且 ``0 ≤ default ≤ limit ≤ 20``。
     """
     if not isinstance(data, dict):
@@ -342,21 +341,21 @@ def validate_settings(data: Any) -> None:
         )
 
 
-# ---- 前作配置探测（Design §6.2 #2 / D7：仅在零配置时提示导入，不读进常态解析路径）----
+# ---- 姊妹工具配置探测（code-review-agent 的 ~/.cra：仅在零配置时提示导入，不读进常态解析路径）----
 
-#: 前作数据目录名（用户主目录下）
+#: 姊妹工具的数据目录名（用户主目录下）
 LEGACY_HOME_NAME = ".cra"
 
 
 def legacy_config_path() -> Path:
-    """前作配置路径 ``~/.cra/models.json``（只用于"探测存在性 + 提示导入"）。"""
+    """姊妹工具的配置文件路径 ``~/.cra/models.json``（只用于"探测存在性 + 提示导入"）。"""
     return Path.home() / LEGACY_HOME_NAME / "models.json"
 
 
 def load_legacy_config() -> dict[str, Any] | None:
-    """读取前作配置；不存在 / 损坏 / 顶层非对象返回 ``None``。
+    """读取姊妹工具的配置；不存在 / 损坏 / 顶层非对象返回 ``None``。
 
-    导入是可选的便利功能：前作文件读不了就当它不存在，不得让 ``crw config`` 因此报错。
+    导入是可选的便利功能：那个文件读不了就当它不存在，不得让 ``crw config`` 因此报错。
     """
     try:
         data = json.loads(legacy_config_path().read_text(encoding="utf-8"))
@@ -366,10 +365,11 @@ def load_legacy_config() -> dict[str, Any] | None:
 
 
 def importable_providers(data: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """把前作配置的供应商条目规范为本项目形态（只保留结构完整者，丢弃损坏条目）。
+    """把姊妹工具配置的供应商条目规范为本工具形态（只保留结构完整者，丢弃损坏条目）。
 
-    两者 ``models.json`` 结构同源（``default`` + ``providers[{name, base_url, models, api_key?}]``）：
-    差异只在数据目录与 key 环境变量前缀，条目本身可直接沿用；此处只做结构过滤，
+    两个工具的 ``models.json`` 结构一致：顶层为 ``default`` 与 ``providers``（条目含
+    ``name`` / ``base_url`` / ``models`` / 可选 ``api_key``），差异只在数据目录与 key 环境变量
+    前缀，条目本身可直接沿用；此处只做结构过滤，
     避免把半截条目带进新配置（整表校验由调用方执行）。
     """
     entries = data.get("providers") if isinstance(data, Mapping) else None
@@ -448,12 +448,12 @@ def legacy_env_var(name: str) -> str:
 
 
 def preset_default_thinking(provider: str | None, model: str) -> str | None:
-    """预设里该模型的默认思考挡位：``models.json`` 没写 ``selected`` 时的产品默认（§8.3）。
+    """预设里该模型的默认思考挡位：``models.json`` 没写 ``selected`` 时的产品默认。
 
     产品默认是**关闭思考**，而"关闭"必须显式发送参数（不发参数在 DeepSeek 侧等于"思考开、
     effort high"），所以默认值来自预设的 ``selected``，而不是"什么都不发"。
-    返回 ``None`` 表示该模型没有可用的关闭通道（恒开型或未查证），于是不发送任何思考参数——
-    延续"查不到就不猜、不预填"的规矩。``provider`` 为 ``None`` 时按模型名在各预设里查
+    返回 ``None`` 表示该模型没有可用的关闭通道（恒开型，或确认不到挡位参数形态），于是不发送
+    任何思考参数——查不到就不猜、不预填。``provider`` 为 ``None`` 时按模型名在各预设里查
     （环境变量回退路径没有供应商名）。
     """
     for preset in PROVIDER_PRESETS:
@@ -524,7 +524,7 @@ class ResolvedModel:
     ``api_key`` 恒为非空字符串：所有返回路径都保证 key 存在（缺失时抛
     :class:`ConfigError` 或返回 ``None``），调用方无须再做空值回退。
     ``thinking`` 为本次生效的思考挡位（``供应商/模型名（思考：…）`` 口径的一部分）；
-    ``None`` = 未配置挡位（不发送任何思考参数，行为与 M3 一致）。
+    ``None`` = 未配置挡位（不发送任何思考参数）。
     """
 
     model: str
@@ -589,7 +589,7 @@ def get_exec_timeout() -> int:
 
 
 def get_max_context_tokens() -> int:
-    """单节点请求的上下文预算：``CRW_MAX_CONTEXT_TOKENS``，默认 100000（Design §4.6）。
+    """单节点请求的上下文预算：``CRW_MAX_CONTEXT_TOKENS``，默认 100000。
 
     必须为正：0 / 负数会让护栏恒触发（等于静默禁用工具），属配置错误而非可运行配置。
     """
@@ -729,7 +729,7 @@ def conflicting_keyless_env_vars(providers: list[dict[str, Any]]) -> dict[str, l
     环境变量名归一化是有损映射（"DeepSeek" 与 "deepseek" 同名）；两个都依赖环境变量
     回退的供应商撞名时，会把同一凭据发往不同接入点（key 串用）。同一主机（同一供应商
     的多端点，如 Z.ai / BigModel 的 Coding Plan 与 API 双预设共用官方变量名）属设计内
-    共享，不算冲突。主变量名与历史变量名（CRW_/CRA_）都参与判定——回退链上任一环
+    共享，不算冲突。主变量名与兼容变量名（CRW_/CRA_）都参与判定——回退链上任一环
     撞名都会造成串用。回退链末端共享的 ``SE_CodeAgent`` 是有意保留的最后回退，不属
     本函数的判定范围。
     """
@@ -784,7 +784,7 @@ def _resolve_provider(
 
 
 def resolve(*, model: str | None = None, provider: str | None = None) -> ResolvedModel | None:
-    """按配置优先级解析本次使用的模型连接（Design §8.3）。
+    """按配置优先级解析本次使用的模型连接。
 
     Args:
         model: ``--model`` 覆盖值（须能在已配置清单中定位）。

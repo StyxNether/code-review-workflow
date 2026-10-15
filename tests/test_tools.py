@@ -1,4 +1,4 @@
-"""工具层：上下文根路径语义、文件与执行工具、环境净化、注册表协议（Design §8.4、D9）。"""
+"""工具层：上下文根路径语义、文件与执行工具、环境净化、注册表协议。"""
 
 from __future__ import annotations
 
@@ -226,7 +226,7 @@ def _temporary_files(directory: Path) -> list[str]:
 
 
 class TestWriteFile:
-    """修复节点的写盘入口：落盘边界 = 上下文根，且不产生半写文件（Design §4.2.2 / §8.4）。"""
+    """修复节点的写盘入口：落盘边界 = 上下文根，且不产生半写文件。"""
 
     def test_writes_content_and_reports_lines_and_bytes(self, root: Path) -> None:
         """返回文本要报出路径、行数与落盘字节数（摘要形态不限，数字必须对得上磁盘）。"""
@@ -513,7 +513,7 @@ class TestEnvSanitisation:
 
 class TestRegistry:
     def test_default_registry_has_the_four_tools(self, root: Path) -> None:
-        """默认装配含 write_file：修复节点只写改动的文件（Design §4.2.2 的写盘形态）。"""
+        """默认装配含 write_file：修复节点只写改动的文件（写盘形态）。"""
         assert build_registry([root]).names() == [
             "list_dir",
             "read_file",
@@ -533,7 +533,7 @@ class TestRegistry:
         assert set(schema["function"]["parameters"]["properties"]) == {"path", "content"}
 
     def test_no_exec_drops_the_execution_tool(self, root: Path) -> None:
-        """``--no-exec`` 的唯一闸口在注册表组装层（Design §8.1）：只关执行，不动写盘。"""
+        """``--no-exec`` 的唯一闸口在注册表组装层：只关执行，不动写盘。"""
         names = build_registry([root], allow_exec=False).names()
 
         assert names == ["list_dir", "read_file", "write_file"]
@@ -570,7 +570,7 @@ class TestRegistry:
         assert (root / "pkg" / "mod.py").read_bytes() == b"VALUE = 42\n"
 
     def test_dispatch_reports_bad_write_arguments_readably(self, root: Path) -> None:
-        """缺参数 / 非法 JSON / 越界路径都以 ``错误：`` 文本回传，不抛出（Design §8.4）。"""
+        """缺参数 / 非法 JSON / 越界路径都以 ``错误：`` 文本回传，不抛出。"""
         registry = build_registry([root])
 
         assert "执行失败" in registry.dispatch("write_file", "{}")
@@ -597,7 +597,7 @@ class TestRegistry:
         assert "必须是非空字符串" in registry.dispatch("read_file", json.dumps({"path": 12}))
 
     def test_tool_errors_never_raise(self, root: Path) -> None:
-        """工具异常一律结构化回传模型：运行不因工具失败而崩（Design §8.4）。"""
+        """工具异常一律结构化回传模型：运行不因工具失败而崩。"""
         registry = build_registry([root])
 
         result = registry.dispatch("run_python", json.dumps({"code": "import sys; sys.exit(1)"}))
@@ -667,8 +667,8 @@ class TestRecheckGuards:
         assert "条目过多已截断" in result
 
 
-class TestSelfReviewGuards:
-    """M3.5 自审修复的行为回归。"""
+class TestToolBoundaryGuards:
+    """工具输入校验与输出上限的行为回归。"""
 
     def test_read_file_rejects_non_integer_line_range(self, root: Path) -> None:
         (root / "a.py").write_text("print(1)\n", encoding="utf-8")
@@ -710,7 +710,7 @@ class TestSelfReviewGuards:
 
     def test_run_python_does_not_leave_bytecode_in_the_workspace(self, root: Path) -> None:
         """子进程不写 __pycache__（PYTHONDONTWRITEBYTECODE）：核实执行不得污染工作区 /
-        版本目录 —— 真实演示暴露：字节码落进产物目录会传播进 resume 与 --out。"""
+        版本目录 —— 字节码一旦落进产物目录，就会随 resume 与 --out 一起传播出去。"""
         (root / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
 
         result = exec_py.run_python(
@@ -726,7 +726,7 @@ def test_reader_that_overshot_the_reap_window_is_marked_incomplete() -> None:
     """读取线程超窗未收尾：输出必须带"未收集完"标注，不得报成"无输出"。
 
     子进程退出后管道仍可被孙进程占着，`_join_readers` 只等 KILL_REAP_SECONDS；把
-    未收尾的空缓冲直接交给模型，等于让模型以为程序什么都没打印（Design §4.6）。
+    未收尾的空缓冲直接交给模型，等于让模型以为程序什么都没打印（失败必须如实上报）。
     """
     hold = threading.Event()
     thread = threading.Thread(target=lambda: hold.wait(5), daemon=True)

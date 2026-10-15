@@ -1,4 +1,4 @@
-"""``crw chat`` / ``crw sessions`` 命令面与两处聚合的用例（Design §8.1 / §4.7）。
+"""``crw chat`` / ``crw sessions`` 命令面与两处聚合的用例。
 
 会话流程的端到端细节在 ``test_session_chat.py``；本文件盯命令面：参数面、配置默认链、
 退出码、sessions/runs/show/resume 的展示与跨两处查找。
@@ -68,7 +68,7 @@ def test_run_accepts_rounds_mode(mode: str) -> None:
     args = parser.parse_args(["run", "--rounds-mode", mode, "写一个计算器"])
 
     assert args.rounds_mode == mode
-    # 轮次语义不并入 max_iter_source：只给模式时轮次数值仍走"配置默认 > 内置"（Design §4.4）
+    # 轮次语义不并入 max_iter_source：只给模式时轮次数值仍走"配置默认 > 内置"
     assert args.max_iter_source is None
 
 
@@ -389,7 +389,7 @@ def test_session_round_resume_input_summary_uses_version_dir_wording(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """M3.5 遗留项 1：续跑记录的输入摘要写"版本目录：<记录名>/code_vN"而不是"文件：code_vN"。"""
+    """续跑记录的输入摘要写"版本目录：<记录名>/code_vN"而不是"文件：code_vN"。"""
     _configured(configured_provider, fake_chat_model)
     fake_chat_model.load(
         [orchestrator_reply("code"), ai_text(file_fence(CLEAN_CODE)), *clean_review_calls()]
@@ -494,7 +494,7 @@ def test_rounds_mode_alone_keeps_the_configured_default(
     fake_chat_model: ScriptedChatModel,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """只给 ``--rounds-mode`` 时轮次数值仍走配置默认（不并入 max_iter_source，Design §4.4）。"""
+    """只给 ``--rounds-mode`` 时轮次数值仍走配置默认（不并入 max_iter_source）。"""
     _configured(configured_provider, fake_chat_model)
     config_mod.save_settings({"rounds": {"default": 2, "limit": 8}})
     # exact 跑满 2 轮修复 + 3 次审查（首审干净也不停）
@@ -646,7 +646,7 @@ def test_chat_does_not_accept_out(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_chat_does_not_accept_parallel_review(capsys: pytest.CaptureFixture[str]) -> None:
-    """会话内暂不提供 ``--parallel-review``（Design §12.3）：不注册即明确报参数错误。"""
+    """会话内暂不提供 ``--parallel-review``：不注册即明确报参数错误。"""
     with pytest.raises(SystemExit) as excinfo:
         cli.build_parser().parse_args(["chat", "--parallel-review"])
 

@@ -361,7 +361,7 @@ def test_review_intent_without_any_code_is_refused(
 def test_exact_mode_runs_the_full_rounds_even_when_clean(
     session: _Session, fake_chat_model: ScriptedChatModel
 ) -> None:
-    """exact：首审干净也继续跑满 n 轮修复 + n+1 次审查；结尾恒为一次审查（Design §4.4）。"""
+    """exact：首审干净也继续跑满 n 轮修复 + n+1 次审查；结尾恒为一次审查。"""
     fake_chat_model.load(
         [
             orchestrator_reply("code", rounds=1, rounds_mode="exact", reply="好，跑满一轮。"),
@@ -392,7 +392,7 @@ def test_exact_mode_runs_the_full_rounds_even_when_clean(
 def test_message_rounds_are_clamped_to_the_configured_limit(
     session: _Session, fake_chat_model: ScriptedChatModel
 ) -> None:
-    """消息里的轮次越界 → 夹到上限并标注（进终端与会话档案，Design §4.4）。"""
+    """消息里的轮次越界 → 夹到上限并标注（进终端与会话档案）。"""
     fake_chat_model.load(
         [
             orchestrator_reply("code", rounds=99, reply="好，最多 5 轮。"),
@@ -414,7 +414,7 @@ def test_message_rounds_are_clamped_to_the_configured_limit(
 def test_command_line_rounds_override_the_message(
     session: _Session, fake_chat_model: ScriptedChatModel
 ) -> None:
-    """优先级：命令行显式 > 消息提取（Design §4.4）。"""
+    """优先级：命令行显式 > 消息提取。"""
     fake_chat_model.load(
         [
             orchestrator_reply("code", rounds=1, reply="好。"),
@@ -572,7 +572,7 @@ def test_memory_appends_structured_summaries_without_code(
     raw = "\n".join(
         json.dumps(item, ensure_ascii=False) for item in (*encoder_lines, *reviewer_lines)
     )
-    assert "```" not in raw  # 代码不进记忆（Design §4.7）
+    assert "```" not in raw  # 代码不进记忆
 
 
 def test_memory_snapshot_compacts_when_the_budget_is_tight(
@@ -728,7 +728,7 @@ def test_second_code_round_modifies_the_previous_version(
 def test_review_fix_without_explicit_rounds_fixes_even_when_clean(
     session: _Session, fake_chat_model: ScriptedChatModel
 ) -> None:
-    """试用反馈（2026-10-14）：用户要"审查后修复"时，干净的首审不能吞掉修复阶段。
+    """用户要"审查后修复"时，干净的首审不能吞掉修复阶段。
 
     review_fix 未由消息指定模式、且会话仍是默认 up-to 时，本轮按 exact + 1 轮执行：
     审查 → （复核/修复一轮）→ 复审，轮次用法为 审查 2 轮 / 修复 1 轮。
@@ -816,7 +816,7 @@ def test_review_fix_with_explicit_rounds_runs_them_all(
     assert second["fix_rounds"] == 2
 
 
-# ---- 干净判定（默认加严 / --severe-only 放宽，Design §4.4）----
+# ---- 干净判定（默认加严 / --severe-only 放宽）----
 
 
 def _moderate_review_calls(*, version: int = 1, name: str = "main.py") -> list[Any]:
@@ -884,10 +884,10 @@ def test_severe_only_option_reaches_the_round_and_the_archive(
 def test_review_intent_does_not_enter_the_fix_loop(
     session: _Session, fake_chat_model: ScriptedChatModel
 ) -> None:
-    """「只审查不改」= 0 轮修复（Design §5.4）：首审有阻塞问题也不动代码。
+    """「只审查不改」= 0 轮修复：首审有阻塞问题也不动代码。
 
-    会话的默认轮次设置（内置 3）不能把这一句变成"接着修"——与 M4 试用反馈修掉的
-    review_fix 早退是同一类缺陷的反方向。
+    会话的默认轮次设置（内置 3）不能把这一句变成"接着修"——意图决定阶段，
+    轮次默认值只决定"要修的时候修几轮"。
     """
     fake_chat_model.load(
         [

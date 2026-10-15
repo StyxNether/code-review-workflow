@@ -1,4 +1,4 @@
-"""运行记录 IO：原子写、白名单、列表降级派生与选择（Design §8.2、§9.1）。"""
+"""运行记录 IO：原子写、白名单、列表降级派生与选择。"""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def write_run(
 
 
 def test_data_dir_follows_crw_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """数据目录经 CRW_HOME 解析（Design §8.3/§9.1）：测试不写真实用户目录。"""
+    """数据目录经 CRW_HOME 解析：测试不写真实用户目录。"""
     monkeypatch.setenv(config.HOME_ENV, str(tmp_path / "crw-home"))  # 用例自洽：不依赖夹具顺序
     assert config.data_dir().is_relative_to(tmp_path)
     assert records.runs_root() == config.data_dir() / "runs"
@@ -87,7 +87,7 @@ def test_valid_run_ids(run_id: str) -> None:
     ],
 )
 def test_invalid_run_ids_are_rejected(run_id: str) -> None:
-    """白名单校验挡住路径穿越与格式漂移（Design §8.2）。"""
+    """白名单校验挡住路径穿越与格式漂移。"""
     assert not records.is_valid_run_id(run_id)
     with pytest.raises(records.RunRecordError, match="运行号格式非法"):
         records.run_dir(run_id)
@@ -182,7 +182,7 @@ def test_append_log_event_keeps_only_schema_keys_and_truncates_detail(tmp_path: 
 
 
 def test_read_events_skips_incomplete_and_broken_lines(tmp_path: Path) -> None:
-    """跳过写一半的末行与损坏行（Design §8.2）。"""
+    """跳过写一半的末行与损坏行。"""
     log_path = tmp_path / "log.jsonl"
     log_path.write_text(
         '{"ts": "t", "node": "engine", "event": "start"}\n'
@@ -269,7 +269,7 @@ def test_list_runs_is_empty_without_records() -> None:
 
 
 def test_list_runs_derives_columns_from_workspace_and_reviews() -> None:
-    """单条记录状态损坏时按降级派生链回退（Design §8.2）。"""
+    """单条记录状态损坏时按降级派生链回退。"""
     run_path = write_run(
         "r-20261012-0001",
         write_state=False,
@@ -354,7 +354,7 @@ def test_load_detail_rejects_unknown_or_invalid_ids() -> None:
 
 
 def test_load_detail_degrades_when_state_is_corrupt() -> None:
-    """state.json 损坏 → 降级展示（Design §8.2）：给日志与产物，不抛异常、不假装完好。"""
+    """state.json 损坏 → 降级展示：给日志与产物，不抛异常、不假装完好。"""
     run_path = records.create_run_dir("r-20261012-0001")
     (run_path / "state.json").write_text("{损坏", encoding="utf-8")
     records.append_log_event(
@@ -399,7 +399,7 @@ def test_parse_index(raw: str, count: int, expected: int | None) -> None:
 
 @pytest.mark.parametrize("raw", [None, "", " ", "abc", "1.0", "１", "1 0", "0x1"])
 def test_parse_index_rejects_non_ascii_or_out_of_range(raw: str | None) -> None:
-    """ASCII 白名单：全角数字、空串与越界一律视为取消（沿用前作选择交互口径）。"""
+    """ASCII 白名单：全角数字、空串与越界一律视为取消。"""
     assert records.parse_index(raw, 3) is None
 
 
@@ -426,7 +426,7 @@ def test_select_run_returns_none_when_cancelled(answer: str | None) -> None:
     assert picked is None
 
 
-# ---- 陈旧 running 标注（Design §8.2）----
+# ---- 陈旧 running 标注 ----
 
 
 def test_stale_running_is_flagged_after_thirty_minutes(tmp_path: Path) -> None:
@@ -474,7 +474,7 @@ def test_log_preview_falls_back_for_unserialisable_details(tmp_path: Path) -> No
     assert "{" in str(line["detail"]) and "}" in str(line["detail"])  # set 的 repr 形态
 
 
-# ---- 会话轮次记录：两处查找与降级引用（Design §4.7 / §8.2）----
+# ---- 会话轮次记录：两处查找与降级引用 ----
 
 
 def _make_session_round(
@@ -537,7 +537,7 @@ def test_list_runs_aggregates_session_rounds_and_degrades_them() -> None:
     assert summaries["r-20261012-0002"].path == good
     degraded = summaries["s-20261012-0001/round-2"]
     assert degraded.session_id == "s-20261012-0001"
-    assert degraded.status == "unknown"  # 状态由日志也推不出来（Design §8.2 的降级派生）
+    assert degraded.status == "unknown"  # 状态由日志也推不出来
 
 
 def test_load_detail_accepts_the_degraded_reference_form() -> None:

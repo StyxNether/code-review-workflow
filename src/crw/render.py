@@ -1,9 +1,9 @@
 """终端渲染管线：阶段面板、行级流式、分级着色与围栏抑制。
 
 渲染输入由工作流事件驱动（节点开始 / 工具边界 / 重试 / 清单分区 / 节点结束），不依赖框架
-的流式元数据；仅命令面使用本模块（Design §3.1、§8.4）。
+的流式元数据；仅命令面使用本模块。
 
-三条呈现约定（Design §6.2 #6 的完整管线）：
+三条呈现约定：
 
 - **阶段面板**：每个节点开始时打一条彩色横幅（``── [审查] 第 1 轮 ──``），Agent 切换一眼
   可辨；阶段结束给一行摘要，清单分区随后渲染，各块之间留空行。
@@ -13,8 +13,8 @@
 - **分级着色**：【严重】红 /【一般】黄 /【建议】暗，处置 fixed 绿 / partial 黄 / skipped 暗；
   不支持颜色时（非 TTY、``NO_COLOR``、``color=False``）自动退化为纯文本。
 
-输出通道（§8.4）：结论 / findings 清单 / 报告走 stdout；模型正文与过程叙述、错误走 stderr。
-``--no-stream`` 时模型正文按阶段缓存、于阶段结束时整体输出（Design §8.1）。
+输出通道：结论 / findings 清单 / 报告走 stdout；模型正文与过程叙述、错误走 stderr。
+``--no-stream`` 时模型正文按阶段缓存、于阶段结束时整体输出。
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from .workflow import state as state_mod
 
 #: 规则线宽度（结论横幅与阶段标题共用）
 RULE_WIDTH = 52
-#: 兼容别名（既有实现按私有名引用）
+#: 兼容别名：本模块的排版代码按这个短名引用规则线宽度
 _RULE_WIDTH = RULE_WIDTH
 
 #: 密钥形态（与命令面同一构造：左侧非字母数字断言，避免误伤普通连字符词）
@@ -62,7 +62,7 @@ _NODE_STYLE: dict[str, str] = {
     "fix": "bold magenta",
     "orchestrator": "bold green",
 }
-#: 分级着色（Design §6.2 #6）
+#: 分级着色：【严重】红 /【一般】黄 /【建议】暗
 _SEVERITY_STYLE: dict[str, str] = {
     contracts.SEVERE: "bold red",
     contracts.MODERATE: "yellow",
@@ -74,7 +74,7 @@ _STATUS_LABEL: dict[str, str] = {"fixed": "已修复", "partial": "部分修复"
 
 _STAGE_HINTS: dict[str, str] = {"encode": "生成初始代码"}
 
-#: 会话层节点（不在工作流图内）的显示名：编排节点（Design §5.4）
+#: 会话层节点（不在工作流图内）的显示名：编排节点只在这里出现自己的名字
 _EXTRA_NODE_LABELS: dict[str, str] = {"orchestrator": "编排"}
 
 #: 并行双视角的分支节点：正文一律按节点缓存后整块输出（见 :meth:`RunRenderer.on_delta`）
@@ -103,8 +103,8 @@ def pad(text: str, width: int) -> str:
 def ask_user(prompt: str, *, color: bool | None = None) -> str | None:
     """交互输入统一封装：回车返回空串；Ctrl+C / EOF / 输入流不可用按取消处理（返回 ``None``）。
 
-    提示语写 stderr（Design §8.4），并按 :data:`PROMPT_STYLE`（天蓝）着色——终端里一眼能
-    找到输入位置；``color=None`` 时按输出流是否终端自动判定（管道 / ``NO_COLOR`` 下为纯文本，
+    提示语写 stderr（不占 stdout 的结论通道），并按 :data:`PROMPT_STYLE`（天蓝）着色——终端里一眼
+    能找到输入位置；``color=None`` 时按输出流是否终端自动判定（管道 / ``NO_COLOR`` 下为纯文本，
     重定向保存的日志里不会混入转义码）。stdin 被捕获（pytest）或被整体关闭时 CPython 抛
     ``OSError`` / ``RuntimeError``（lost sys.stdin），与 EOF 同义——按"取消"处理而不是让
     命令以 traceback 退出。
@@ -118,7 +118,7 @@ def ask_user(prompt: str, *, color: bool | None = None) -> str | None:
 
 
 def guarded(callback: Callable[[], None]) -> None:
-    """执行展示动作并隔离输出流故障（下游关闭管道 / 终端断开，Design §4.6 的同口径）。
+    """执行展示动作并隔离输出流故障（下游关闭管道 / 终端断开）。
 
     渲染是呈现层：管道被下游关掉（``crw show | head``）时无处分说，也**不得改变命令的结论
     与退出码**（运行记录仍是真相来源）。渲染器自身的编码缺陷（非 ``OSError``）照常抛出，
@@ -324,7 +324,7 @@ def _marker_of(line: str) -> tuple[str, str] | None:
 
 
 class RunRenderer:
-    """运行过程渲染器：实现引擎的观察者接口（Design §6.2 #6 的阶段序列）。
+    """运行过程渲染器：实现引擎的观察者接口，按阶段序列呈现。
 
     Args:
         stream: 是否流式输出模型正文。``False``（``crw run --no-stream``）时按节点缓存
@@ -380,7 +380,7 @@ class RunRenderer:
             self._end_stage(node)
             self._line(f"[{node_label(node)}] {text}", style=_style_of(node))
         elif kind == "retry":
-            # Design §4.6：重试的第二次模型输出不重复渲染正文，只给一行提示
+            # 契约重试的第二次模型输出不重复渲染正文，只给一行提示
             self.discard_text(node)
             with self._lock:
                 self._suppress.add(node)
@@ -399,8 +399,8 @@ class RunRenderer:
         """模型正文增量：单阶段时流式输出，多阶段（并行分支）时按节点缓存到该阶段结束。
 
         围栏内容（代码 / JSON 结论）不进终端（见 :class:`_ProseFilter`）。并行分支会**同时**
-        产生增量，若各自即时写出，两位审查者的叙述会在终端交错成一段读不成句的文本
-        （实测并发执行确实同时到达）；此时按分支缓存，各分支在自己的阶段结束时整块输出，
+        产生增量，若各自即时写出，两位审查者的叙述会在终端交错成一段读不成句的文本；
+        此时按分支缓存，各分支在自己的阶段结束时整块输出，
         顺序与阶段结束顺序一致。
         """
         with self._lock:
@@ -460,7 +460,7 @@ class RunRenderer:
         """
         counts = contracts.severity_counts(findings)
         if view:
-            # 分支结论属"结论"通道（stdout，§8.4）：合并结果随后按完整清单展开
+            # 分支结论属"结论"通道（stdout）：合并结果随后按完整清单展开
             self._out.print(
                 f"  · {view}视角：{counts[contracts.SEVERE]} 严重 / "
                 f"{counts[contracts.MODERATE]} 一般 / {counts[contracts.ADVICE]} 建议",
@@ -564,7 +564,7 @@ def node_label(node: Any) -> str:
 
 
 def mask_secrets(text: str) -> str:
-    """遮蔽 ``sk-`` 形态的密钥：会话层与命令面的报错通道统一口径（Design §8.2 的截断惯例）。"""
+    """遮蔽 ``sk-`` 形态的密钥：会话层与命令面的报错通道共用这一份口径。"""
     return _SECRET_PATTERN.sub("sk-***", text)
 
 
@@ -614,7 +614,7 @@ def _render_result(
     err_console = console_for(stderr, color)
     reached_limit = result.status == state_mod.STATUS_RESIDUAL
     if result.succeeded or reached_limit:
-        out_console.print("")  # 结论前留空行：与阶段输出分区（Design §6.2 #6 的排版约定）
+        out_console.print("")  # 结论前留空行：与阶段输出分区
         # 结论句与报告同源（engine.conclusion_text）：判定口径变化时两处一起变
         conclusion = engine_mod.conclusion_text(
             status=result.status,
@@ -657,7 +657,7 @@ def render_sessions(
     out: TextIO | None = None,
     color: bool | None = None,
 ) -> None:
-    """会话列表：会话号 | 时间 | 轮次数 | 最后状态（Design §8.1）。"""
+    """会话列表：会话号 | 时间 | 轮次数 | 最后状态。"""
     guarded(lambda: _render_sessions(summaries, out=out, color=color))
 
 
@@ -702,7 +702,7 @@ def render_runs(
     out: TextIO | None = None,
     color: bool | None = None,
 ) -> None:
-    """运行列表：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型（Design §8.1）。"""
+    """运行列表：运行号 | 时间 | 输入摘要 | 状态 | 修复轮数 | 残留严重数 | 模型。"""
     guarded(lambda: _render_runs(summaries, out=out, color=color))
 
 
@@ -753,9 +753,9 @@ def render_detail(
     out: TextIO | None = None,
     color: bool | None = None,
 ) -> None:
-    """运行详情：摘要 → 时间线（含工具调用）→ 逐轮 findings 表 → 产物路径（Design §8.1）。
+    """运行详情：摘要 → 时间线（含工具调用）→ 逐轮 findings 表 → 产物路径。
 
-    ``state.json`` 损坏时降级展示（Design §8.2）：摘要行取自日志与产物清单，逐轮审查表仍
+    ``state.json`` 损坏时降级展示：摘要行取自日志与产物清单，逐轮审查表仍
     来自 ``review_*.json``（文件独立于状态快照），并显式说明当前展示的数据来源。
     """
     guarded(lambda: _render_detail(detail, out=out, color=color))
@@ -980,7 +980,7 @@ def _tool_count(detail: records_mod.RunDetail, node: str, round_number: Any) -> 
 
 
 def _not_converged(detail: records_mod.RunDetail, round_number: int) -> bool:
-    """未收敛判定（Design §4.4）：与上一轮的 ``(location, issue)`` 集合完全相同。"""
+    """未收敛判定：与上一轮的 ``(location, issue)`` 集合完全相同（判定在引擎侧，此处取同一份）。"""
     if round_number <= 1:
         return False
     previous = next((item for item in detail.rounds if item.round_number == round_number - 1), None)
@@ -1065,7 +1065,7 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> str:
-    """详情页的输入行：``-f`` / resume 输入标注来源与工作区映射（Design §4.5）。
+    """详情页的输入行：``-f`` / resume 输入标注来源与工作区映射。
 
     resume 的来源是父运行的版本目录（名称形如 ``code_vN``），映射口径为
     "父版本目录 → ``code_v1/``"；``-f`` 为"原文件 → ``code_v1/<原文件名>``"。
@@ -1085,7 +1085,7 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
     text = state_mod.summarize_input(descriptor, limit=200)
     source = str(descriptor.get("source_path") or "")
     if source and rounds_mod.is_code_version_dir_name(Path(source).name or ""):
-        # 会话轮次：需求驱动编码起步、既有代码来自上一版本（Design §4.7）
+        # 会话轮次：需求驱动编码起步、既有代码来自上一版本
         return f"{text}（基于 {Path(source).name}/ 继续开发 → {start_dir}/）"
     return text
 

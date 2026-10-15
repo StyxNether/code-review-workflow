@@ -1,10 +1,10 @@
 """修复 Agent 节点：按 findings 逐条修复，用 ``write_file`` **只写改动的文件**。
 
-写入根 = 本轮产出的版本目录（引擎已把上一版本整目录复制过来，Design §4.2.2）：路径因此
+写入根 = 本轮产出的版本目录（引擎已把上一版本整目录复制过来）：路径因此
 天然限定在该目录内，未改动的文件不必"整份重贴"，也不会因重写而顺手改坏。manifest、
 版本完整性校验与"本轮未产生改动"的逐字节比较都由引擎按**目录实际内容**重算——节点只
 交回 fixes 清单文本（恰好一个 ```json 围栏，覆盖上一轮 findings 的全部 id，可附
-``deleted`` 删除申请）。抽取、校验、落盘、删除确认都在 workflow 包装层完成（Design §3.1）。
+``deleted`` 删除申请）。抽取、校验、落盘、删除确认都在 workflow 包装层完成。
 
 工具集**按轮装配**：上下文根只有在引擎复制出新版本目录之后才确定，所以根取自状态的
 ``current_version_dir``，而不是运行开始时固定的工作区。
@@ -24,7 +24,7 @@ from .runtime import AgentRuntime, history_from_state
 #: 节点函数类型（与 workflow 层同构；agents 不向上 import，故此处自带别名）
 NodeFn = Callable[..., Mapping[str, Any]]
 
-#: 修复节点的工具集（Design §4.2 的"工具"列）：读文件、只写改动文件、运行核实
+#: 修复节点的工具集：读文件、只写改动文件、运行核实
 FIX_TOOL_NAMES: tuple[str, ...] = (READ_FILE_TOOL, WRITE_FILE_TOOL, EXEC_TOOL_NAME)
 
 

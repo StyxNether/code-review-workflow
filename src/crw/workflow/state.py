@@ -1,6 +1,6 @@
 """运行状态 schema 与快照的纯序列化 / 反序列化。
 
-字段定义见 Design §4.3；本模块只做数据与序列化，文件 IO 归 records、时序归 engine（Design §3.1）。
+运行状态是纯数据：本模块只做 schema 与序列化，文件 IO 归 records、时序与落盘归 engine。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Annotated, Any, TypedDict
 from .. import usage as usage_mod
 from ..rounds import ROUNDS_UP_TO
 
-# ---- 取值枚举（Design §4.3 / §8.1）----
+# ---- 取值枚举 ----
 
 STATUS_RUNNING = "running"
 STATUS_SUCCESS = "success"
@@ -30,7 +30,7 @@ NEXT_FIX_AGAIN = "fix_again"
 INPUT_REQUIREMENT = "requirement"
 INPUT_FILE = "file"
 
-#: 轮次取值来源（Design §4.3 / §4.4）
+#: 轮次上限的取值来源（写入 state 供报告标注"这个数字从哪来"）
 SOURCE_CLI = "cli"
 SOURCE_REQUIREMENT = "requirement"
 SOURCE_CONFIG = "config"
@@ -39,14 +39,14 @@ SOURCE_DEFAULT = "default"
 
 
 class ErrorInfo(TypedDict, total=False):
-    """运行失败信息（Design §4.3 的 ``error`` 字段）。"""
+    """运行失败信息（state 的 ``error`` 字段）。"""
 
     node: str
     message: str
 
 
 class InputDescriptor(TypedDict, total=False):
-    """输入描述：需求文本或既有代码文件（Design §4.3 的 ``input`` 字段）。"""
+    """输入描述：需求文本或既有代码文件（state 的 ``input`` 字段）。"""
 
     kind: str
     requirement: str
@@ -54,9 +54,9 @@ class InputDescriptor(TypedDict, total=False):
 
 
 class Finding(TypedDict, total=False):
-    """单条审查问题（Design §4.3 / §5.2）。
+    """单条审查问题。
 
-    ``views`` 是并行双视角审查的附加字段（来源视角，Design §12.2）：契约校验层不认识它
+    ``views`` 是并行双视角审查的附加字段（来源视角名单）：契约校验层不认识它
     （模型输出不含该键），汇合节点写入、报告与 `crw show` 读它。
     """
 
@@ -70,7 +70,7 @@ class Finding(TypedDict, total=False):
 
 
 class NodeEvent(TypedDict, total=False):
-    """节点执行事件（Design §4.3 的 ``history`` 元素）。"""
+    """节点执行事件（state 的 ``history`` 元素）。"""
 
     node: str
     round: int
@@ -81,7 +81,7 @@ class NodeEvent(TypedDict, total=False):
 
 
 class RunState(TypedDict, total=False):
-    """单轮运行状态（Design §4.3）；``history`` 追加累积，其余字段按轮替换。
+    """单轮运行状态；``history`` 追加累积，其余字段按轮替换。
 
     以 ``total=False`` 声明全部可选：状态在运行过程中逐字段填充，缺席字段按
     ``_DEFAULTS`` 归一（见 :func:`snapshot`）。
@@ -99,21 +99,21 @@ class RunState(TypedDict, total=False):
     parallel_review: bool
     session_id: str | None
     round_index: int | None
-    #: 本次运行的起始版本号（会话轮次跨轮连续递增时由命令面给出，Design §4.7）；
+    #: 本次运行的起始版本号（会话轮次跨轮连续递增时由命令面给出）；
     #: ``code_version`` = 该值 + 已完成修复轮数，一次性运行恒为 1
     version_base: int
     current_version_dir: str
     #: 当前版本内的文件清单（版本内相对路径，posix 风格，与 manifest 一致）：
-    # 审查 / 修复节点的任务提示词需要它（节点不接触文件，Design §3.1）
+    # 审查 / 修复节点的任务提示词需要它（节点不接触文件，只能靠状态里的清单）
     version_files: list[str]
     #: 既有实现的文件内容（``路径 → 内容``，会话轮次的编码上下文）：编码节点把它内联进
     #: 任务提示词，使"按新需求修改"有真实依据。**瞬态键**：不进运行记录（见 PERSISTED_FIELDS）
     prior_files: Mapping[str, str]
-    #: 三 Agent 各自的会话记忆（``agent → [{"role", "text"}]``，Design §4.7）：各节点把它
+    #: 三 Agent 各自的会话记忆（``agent → [{"role", "text"}]``）：各节点把它
     #: 作为历史消息交给运行时。**瞬态键**：不进运行记录（见 PERSISTED_FIELDS）
     agent_memory: Mapping[str, list[Mapping[str, str]]]
     findings: list[Finding]
-    #: 并行双视角审查的分支结论（独立 key：同超级步多写者不得冲突，Design §12.2）。
+    #: 并行双视角审查的分支结论（独立 key：同超级步多写者不得冲突）。
     #: 汇合节点消费后由 ``findings`` 承载权威结论，故不进入运行记录（见 PERSISTED_FIELDS）。
     findings_correctness: list[Finding]
     findings_security: list[Finding]
@@ -131,7 +131,7 @@ class RunState(TypedDict, total=False):
     finished_at: str | None
 
 
-#: 持久化字段与顺序 = Design §4.3；新增状态字段时同步本表与 Design（§12.2 第 1 步）。
+#: 持久化字段与顺序：即 ``state.json`` 的字段顺序，新增状态字段时同步本表。
 PERSISTED_FIELDS: tuple[str, ...] = (
     "run_id",
     "parent_run_id",
@@ -162,8 +162,8 @@ PERSISTED_FIELDS: tuple[str, ...] = (
 )
 
 # 说明：并行双视角的分支 key（``findings_correctness`` / ``findings_security``）刻意**不进**
-# 本表与 ``PERSISTED_FIELDS``——它们是图执行期的中间态，汇合后由 ``findings`` 承载权威结论
-# （Design §12.2），归一化重建的状态不含这两键，读取方按"缺省即空"处理（``state.get(k) or []``）。
+# 本表与 ``PERSISTED_FIELDS``——它们是图执行期的中间态，汇合后由 ``findings`` 承载权威结论，
+# 归一化重建的状态不含这两键，读取方按"缺省即空"处理（``state.get(k) or []``）。
 _DEFAULTS: dict[str, Any] = {
     "run_id": "",
     "parent_run_id": None,
@@ -195,7 +195,7 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def review_file_name(round_number: int, *, view: str | None = None) -> str:
-    """审查结论文件名：``review_<轮次>.json``（并行双视角的分支加视角后缀，Design §12.2）。"""
+    """审查结论文件名：``review_<轮次>.json``（并行双视角的分支加视角后缀）。"""
     if view:
         return f"review_{round_number}_{view}.json"
     return f"review_{round_number}.json"
@@ -223,22 +223,22 @@ def new_state(
     round_index: int | None = None,
     version_base: int = 1,
 ) -> RunState:
-    """构造运行初始状态（字段与默认值见 Design §4.3）。
+    """构造运行初始状态（字段含义见 :class:`RunState`，默认值见 ``_DEFAULTS``）。
 
     Args:
         run_id: 运行号（全局唯一，会话轮次亦复用同一编号空间）。
         input_descriptor: 输入描述（requirement / file）。
         workspace: 运行工作区绝对路径（产物落盘根）。
         max_iterations: 修复轮次上限；``max_iterations_source`` 记录其来源。
-        model: 本次运行的模型标识（``供应商/模型名``，Design §4.3）。
+        model: 本次运行的模型标识（``供应商/模型名``）。
         created_at: 开始时间戳（ISO 8601，由注入时钟给出）。
-        rounds_mode: 轮次语义（up-to 干净即早退 / exact 跑满，Design §4.4）。
-        severe_only: 是否放宽干净判定（只把【严重】当阻塞，Design §4.4 的 ``--severe-only``）。
-        parallel_review: 是否启用并行双视角审查（Design §12.2 的扩展示例）。
+        rounds_mode: 轮次语义（up-to 干净即早退 / exact 跑满）。
+        severe_only: 是否放宽干净判定（只把【严重】当阻塞，对应 ``--severe-only``）。
+        parallel_review: 是否启用并行双视角审查。
         parent_run_id: 续跑来源运行号（resume 时写入，新运行为空）。
         session_id: 所属会话号（会话轮次写入；一次性运行为空）。
         round_index: 会话内轮次序号（从 1 起；一次性运行为空）。
-        version_base: 本次运行的起始版本号（会话跨轮连续递增，Design §4.7；一次性运行为 1）。
+        version_base: 本次运行的起始版本号（会话跨轮连续递增；一次性运行为 1）。
 
     Returns:
         完整的运行初始状态字典。
@@ -278,7 +278,7 @@ def new_state(
 
 
 def snapshot(state: Mapping[str, Any]) -> dict[str, Any]:
-    """把图执行上下文投影为可持久化的状态快照（Design §4.3）。
+    """把图执行上下文投影为可持久化的状态快照。
 
     只保留 ``PERSISTED_FIELDS`` 声明的字段：节点交回的暂存键（如 ``code_text``）与
     未来扩展键不进入运行记录；缺席字段补默认值，保证 state.json 恒为完整快照。
@@ -345,7 +345,7 @@ def _ellipsis(text: str, limit: int) -> str:
 
 
 def _jsonable(value: Any) -> Any:
-    """Path → str 归一：状态字段必须可 JSON 序列化（Design §8.2）。"""
+    """Path → str 归一：状态字段必须可 JSON 序列化。"""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):

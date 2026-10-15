@@ -1,11 +1,11 @@
-"""编排 / 路由节点：用户消息 → 意图与轮次参数（结构化）→ 选择下一节点（Design §5.4 / D12）。
+"""编排 / 路由节点：用户消息 → 意图与轮次参数（结构化）→ 选择下一节点。
 
 会话里只有编排节点面向用户（单口约束）：它把用户消息解释为 ``code | review |
 review_fix | ask`` 并给出 ``rounds`` / ``rounds_mode`` / ``reply``，由本模块校验后交给
 chat 驱动工作流。**分不清意图一律按 ask 反问**（不静默挑一条路）；模型输出无法解析时
 也走同一条反问兜底——猜错方向的代价是多跑一整轮工作流。
 
-系统提示词是**常量**（不注入时间戳 / 会话号 / 轮次上限等易变值，Design §4.7）：会话现状
+系统提示词是**常量**（不注入时间戳 / 会话号 / 轮次上限等易变值）：会话现状
 与本次消息都在用户消息里，前缀稳定才能吃到供应商的上下文缓存。
 """
 
@@ -22,7 +22,7 @@ from ..workflow import engine as engine_mod
 from ..workflow import state as state_mod
 from ..workflow.contracts import scan_fences
 
-#: 意图枚举（Design §5.4）
+#: 意图枚举
 INTENT_CODE = "code"
 INTENT_REVIEW = "review"
 INTENT_REVIEW_FIX = "review_fix"
@@ -44,7 +44,7 @@ NEXT_ACTION_LABELS: Mapping[str, str] = {
     state_mod.NEXT_FIX_AGAIN: "可继续修复（crw resume，或在会话里说「继续修」）",
 }
 
-#: 模型输出无法解析时的兜底反问（不静默挑路，Design §5.4 的路由兜底）
+#: 模型输出无法解析时的兜底反问（不静默挑一条路，交给用户澄清）
 FALLBACK_ASK = (
     "我没能确定你的意图。请说明一下：是要（1）写/改代码、（2）只审查当前实现、"
     "还是（3）对当前实现再走一轮「审查→修复」？"
@@ -87,7 +87,7 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是代码审查工作流（crw）会话里的
 
 @dataclass(frozen=True)
 class Decision:
-    """编排节点对一条用户消息的结构化解释（已过校验 / 夹取，Design §5.4）。"""
+    """编排节点对一条用户消息的结构化解释（已过校验 / 夹取）。"""
 
     intent: str
     reply: str
@@ -102,7 +102,7 @@ class Decision:
 
     @property
     def starts_workflow(self) -> bool:
-        """是否要启动工作流（``ask`` 不启动，Design §5.4）。"""
+        """是否要启动工作流（``ask`` 只回话，不启动）。"""
         return self.intent != INTENT_ASK
 
 
@@ -214,7 +214,7 @@ def _parse_payload(text: str) -> tuple[Any, str]:
 
 
 def _validate(payload: Any, *, rounds_limit: int) -> Decision | str:
-    """校验编排节点的输出（Design §5.4 的校验规则）；违规时返回可读原因（字符串）。
+    """校验编排节点的输出；违规时返回可读原因（字符串）。
 
     - ``intent`` 必须是枚举值；``ask`` 必须给出非空 ``reply``；
     - ``rounds`` 缺省 / 非整数按"未指定"处理，越界**夹取并标注**（意图理解 ≠ 用户显式参数）；
@@ -316,7 +316,7 @@ def round_report(
     run_dir: str,
     report_written: bool,
 ) -> str:
-    """每轮汇报（**从结构化状态渲染**，不由模型复述，Design §4.7 / §8.1）。
+    """每轮汇报（**从结构化状态渲染**，不由模型复述）。
 
     内容 = 轮次使用情况 + 结论 + ``next_action`` + 代码版本与产物路径。
     """

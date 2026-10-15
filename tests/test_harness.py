@@ -1,4 +1,4 @@
-"""测试基础设施自测：网络闸门与数据目录重定向（Design §9.1）。
+"""测试基础设施自测：网络闸门与数据目录重定向。
 
 闸门与重定向都由 autouse 夹具提供，若被误改套件会静默失去约束，故在此锁定其行为。
 出网目标一律用保留网段 **TEST-NET-1**（``192.0.2.0/24``，永不路由）与 ``.invalid`` 域名：
@@ -49,7 +49,7 @@ def test_network_gate_blocks_outbound_calls(attempt: object) -> None:
 
 
 def test_data_dir_is_redirected_into_the_test_tmp_dir(tmp_path: Path) -> None:
-    """数据目录经 CRW_HOME 指向本用例的临时目录，测试不写真实 ~/.crw（Design §9.1）。
+    """数据目录经 CRW_HOME 指向本用例的临时目录，测试不写真实 ~/.crw。
 
     不只校验环境变量：**配置层解析出的目录**也必须落在临时目录内——否则"夹具跑了"
     不等于"重定向生效"（config 若把 home 固化成导入期常量，本用例能抓到）。

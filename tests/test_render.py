@@ -1,4 +1,4 @@
-"""终端渲染：输出通道分流、阶段行、清单分区与列表 / 详情（Design §8.1、§8.4）。"""
+"""终端渲染：输出通道分流、阶段行、清单分区与列表 / 详情。"""
 
 from __future__ import annotations
 
@@ -245,7 +245,7 @@ def test_severe_only_conclusion_keeps_the_severe_wording() -> None:
 
 
 def test_interrupted_status_label_is_live_for_session_records() -> None:
-    """STATUS_INTERRUPTED 属会话轮次口径（Design §8.2）：标签与结论分支须可渲染。"""
+    """STATUS_INTERRUPTED 属会话轮次状态：标签与结论分支须可渲染。"""
     assert engine_mod.status_label(state_mod.STATUS_INTERRUPTED) == "已中断"
     out, err = StringIO(), StringIO()
 
@@ -446,7 +446,7 @@ def test_ask_user_treats_input_failures_as_cancel(
 
 
 def test_runs_table_flags_stale_running_records() -> None:
-    """陈旧 running 标注"可能已中断"（Design §8.2）。"""
+    """陈旧 running 标注"可能已中断"。"""
     out = StringIO()
 
     render.render_runs(
@@ -473,7 +473,7 @@ def test_detail_flags_stale_running_records() -> None:
 
 
 def test_interrupted_run_is_not_promised_a_report() -> None:
-    """中断收尾不写报告（Design §4.6 的写盘序列）：提示语不得指向不存在的 report.md。"""
+    """中断收尾不写报告（写盘序列不含报告）：提示语不得指向不存在的 report.md。"""
     out, err = StringIO(), StringIO()
 
     render.render_result(
@@ -504,7 +504,7 @@ def test_completed_run_points_to_the_report() -> None:
     assert "(报告 report.md)" in out.getvalue().replace("（", "(").replace("）", ")")
 
 
-# ---- 流式正文与 --no-stream（Design §8.1）----
+# ---- 流式正文与 --no-stream ----
 
 
 def make_stream_renderer(stream: bool) -> tuple[render.RunRenderer, StringIO, StringIO]:
@@ -588,7 +588,7 @@ def test_error_event_flushes_pending_text_before_the_report_line() -> None:
     assert text.index("正在写代码……") < text.index("[编码] 错误：超时")
 
 
-# ---- crw review 的报告渲染（Design §6.4 / §8.1）----
+# ---- crw review 的报告渲染 ----
 
 
 def test_review_text_report_lists_every_file() -> None:
@@ -630,7 +630,7 @@ def test_review_json_report_renders_findings_and_skips_duplicate_summary() -> No
 
 
 def test_review_json_report_keeps_the_overall_section_when_nothing_was_reviewable() -> None:
-    """files 为空时"总体评价"是唯一承载结论的地方（Design §8.1 的报告不能空壳）。"""
+    """files 为空时"总体评价"是唯一承载结论的地方（报告不得空壳）。"""
     text = render.review_json_report({"files": [], "summary": "没有可用的审查结果。"})
 
     assert "## 总体评价" in text
@@ -711,7 +711,7 @@ def test_streamed_text_ending_with_newline_keeps_a_single_newline() -> None:
     assert err.getvalue() == "整段正文\n[审查] 第 1 轮：干净\n"
 
 
-# ---- M3：围栏抑制 / 分级着色 / 阶段排版 ----
+# ---- 围栏抑制 / 分级着色 / 阶段排版 ----
 
 
 def test_streamed_code_fence_is_not_dumped_to_the_terminal() -> None:
@@ -905,7 +905,7 @@ def test_degraded_detail_renders_log_summary_and_artifacts(tmp_path: Path) -> No
 
 
 def test_detail_marks_not_converged_rounds(tmp_path: Path) -> None:
-    """未收敛标注（Design §4.4）：与上一轮问题集合一致时在详情与报告里如实标出。"""
+    """未收敛标注：与上一轮问题集合一致时在详情与报告里如实标出。"""
     detail = records.RunDetail(
         summary=summary(status=state_mod.STATUS_RESIDUAL),
         state={
@@ -990,7 +990,7 @@ class _BrokenStream(StringIO):
 
 
 def test_render_detail_survives_a_closed_output_stream() -> None:
-    """展示层故障不改变命令结论（Design §4.6 的同口径）：管道被下游关掉不报成运行失败。"""
+    """展示层故障不改变命令结论：管道被下游关掉不报成运行失败。"""
     detail = records.RunDetail(
         summary=summary(),
         state={"run_id": "r-20261012-0001", "status": state_mod.STATUS_SUCCESS, "history": []},
@@ -1064,7 +1064,7 @@ def test_ask_user_colors_the_prompt_only_for_terminals(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """交互提示在终端里是天蓝色（用户反馈 2026-10-14），非终端 / NO_COLOR 下退化为纯文本。"""
+    """交互提示在终端里是天蓝色，非终端 / NO_COLOR 下退化为纯文本。"""
     monkeypatch.setattr("builtins.input", lambda: "  3  ")
 
     assert render.ask_user("你> ", color=True) == "3"

@@ -1,4 +1,4 @@
-"""审查 Agent 节点：读取代码文件、运行核实，产出分级 findings（Design §4.2、§5.2）。
+"""审查 Agent 节点：读取代码文件、运行核实，产出分级 findings。
 
 **执行有效性门禁的接线点**：审查契约要求"本轮至少有一次成功工具事件（或内联送达
 记录）"，否则空 ``findings`` 就成了"没审就通过"的逃逸。工作流内代码不在提示词里
@@ -6,7 +6,7 @@
 ``review_evidence`` 交回引擎，由引擎传给 :func:`crw.workflow.contracts.parse_review_output`
 的 ``has_tool_evidence``。
 
-并行双视角审查（Design §12.2）复用本节点：同一 runtime、同一工具集，只有系统提示词
+并行双视角审查复用本节点：同一 runtime、同一工具集，只有系统提示词
 与任务说明按视角分派（``name`` 取分支节点名，工具事件与增量按分支归轮，便于终端与
 log 区分是哪位审查者在动作）。
 
@@ -31,7 +31,7 @@ EVIDENCE_KEY = REVIEW_EVIDENCE_KEY
 
 
 def _files_of(state: Mapping[str, Any]) -> list[str]:
-    """状态的版本文件清单（审查任务要覆盖全部文件，Design §4.2.2）。"""
+    """状态的版本文件清单（审查任务要覆盖全部文件）。"""
     files = state.get("version_files")
     if not isinstance(files, list):
         return []
@@ -96,8 +96,8 @@ def review_once(
 ) -> str:
     """单次独立审查（``crw review``）：文件内容内联送达，返回模型正文。
 
-    与工作流节点的两点差异（Design §6.4 / §8.1）：内容直接附在提示词里（用户显式传入的
-    审查目标，无需工具读取）；``--json`` 走前作的 ``files[]`` 形态，由命令面校验与消费。
+    与工作流节点的两点差异：内容直接附在提示词里（用户显式传入的
+    审查目标，无需工具读取）；``--json`` 输出 ``files[]`` 形态，由命令面校验与消费。
     """
     result = runtime.run(
         node="review",

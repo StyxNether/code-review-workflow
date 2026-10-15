@@ -1,4 +1,4 @@
-"""``crw uninstall``：分级确认后的卸载清理（Design §6.2 #8 / §8.1）。
+"""``crw uninstall``：分级确认后的卸载清理。
 
 清理分四级、顺序固定：① 程序 / 垫片（``uv tool uninstall code-review-workflow``，由
 "等本进程退出"的分离后台任务执行——运行中的 venv 解释器文件被锁）→ ② PATH 条目
@@ -7,10 +7,10 @@
 带明文 key 的 ``models.json``）。确认前零删除：清单先行、逐级提问，被拒绝或取消的
 一级不动；未以 uv tool 安装时跳过 ①② 并说明。
 
-可测试性接缝（Design §9.1）：输入、输出、外部命令与删除动作一律经
+可测试性接缝：输入、输出、外部命令与删除动作一律经
 :class:`UninstallIO` 注入，真实实现集中在 :func:`default_io`——除此之外模块内不
-触碰终端、``subprocess``、``shutil.rmtree`` 与 ``os.environ``。输出通道按 §8.4
-分流：清单 / 菜单 / 结论走 stdout，错误与警示走 stderr。
+触碰终端、``subprocess``、``shutil.rmtree`` 与 ``os.environ``。输出通道分流：
+清单 / 菜单 / 结论走 stdout，错误与警示走 stderr。
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ PROG = "crw"
 #: uv 垫片目录（用户主目录下），PATH 条目展示与清理共用
 UV_BIN_DIRNAME = ".local/bin"
 
-#: 退出码：正常完成 / 用户取消为 0；存在未完成的清理失败项为 2（Design §8.1）
+#: 退出码：正常完成 / 用户取消为 0；存在未完成的清理失败项为 2
 _EXIT_OK = 0
 _EXIT_ERROR = 2
 
@@ -49,10 +49,10 @@ _AFFIRMATIVE = ("y", "yes")
 
 @dataclass
 class UninstallIO:
-    """卸载流程的可注入 IO / 环境接缝（Design §9.1）；除 :func:`default_io` 外不碰真实系统。
+    """卸载流程的可注入 IO / 环境接缝；除 :func:`default_io` 外不碰真实系统。
 
     字段语义：``ask`` 读用户输入（``None`` = 取消 / EOF / 中断）；``say`` 走 stdout、
-    ``fail`` 走 stderr（Design §8.4 的通道分流）；``list_uv_tools`` 读 uv 工具清单；
+    ``fail`` 走 stderr（结论与错误分流）；``list_uv_tools`` 读 uv 工具清单；
     ``run_script`` 同步执行外部命令并返回退出码（启动失败抛 ``OSError``，由调用方提示）；
     ``spawn_task`` 启动分离后台任务并返回是否成功；``remove_tree`` 递归删除目录；
     ``environ`` 为进程环境（清理登记变量用，默认 ``os.environ``）；``platform`` 决定
@@ -145,7 +145,7 @@ def run_uninstall(*, io: UninstallIO | None = None) -> int:
     _print_manifest(io, inventory)
     failed = False
 
-    # ① ② 程序 / 垫片与 PATH 条目：未以 uv tool 安装则整段跳过并说明（Design §8.1）
+    # ① ② 程序 / 垫片与 PATH 条目：未以 uv tool 安装则整段跳过并说明
     if PACKAGE_NAME in inventory.uv_tools:
         failed = _run_program_tiers(io, inventory) or failed
     else:
@@ -167,12 +167,12 @@ def run_uninstall(*, io: UninstallIO | None = None) -> int:
 
 
 def _say(text: str) -> None:
-    """结论通道：stdout（Design §8.4）。"""
+    """结论通道：stdout。"""
     print(text)
 
 
 def _fail(text: str) -> None:
-    """错误与警示通道：stderr（Design §8.4）。"""
+    """错误与警示通道：stderr。"""
     print(text, file=sys.stderr)
 
 
@@ -184,7 +184,7 @@ def _ask(prompt: str) -> str | None:
         return None
 
 
-#: ``uv tool list`` 的工具首行形状："名称 v版本"（实测 uv 0.9 输出 ``code-review-agent v0.1.0``）
+#: ``uv tool list`` 的工具首行形状："名称 v版本"（uv 0.9 的输出形态）
 _UV_TOOL_LINE = re.compile(r"^(?P<name>\S+)\s+v\S+")
 
 
@@ -193,7 +193,7 @@ def _uv_tool_names() -> list[str]:
 
     输出形态：每个工具首行 "名称 vX.Y.Z"，随后若干 "- 别名/可执行文件" 行。取词必须按
     "名称 v版本" 的形状匹配，不能拿"非 '-' 开头的非空行首词"当工具名——**没有工具时 uv
-    打印一行提示文本 ``No tools installed``**（实测），按首词取会得到 ``["No"]``：
+    打印一行提示文本 ``No tools installed``**，按首词取会得到 ``["No"]``：
     "已无其他 uv 工具"因此判反，PATH 条目被静默保留，而"干净退场"正是这一步的目的。
     """
     try:
@@ -254,7 +254,7 @@ def _confirmed(answer: str | None) -> bool:
 
 
 def _print_manifest(io: UninstallIO, inventory: Inventory) -> None:
-    """先打印完整清理清单再逐级提问（"先看后做"），结论走 stdout（Design §8.4）。"""
+    """先打印完整清理清单再逐级提问（"先看后做"），结论走 stdout。"""
     io.say(f"{PROG} 卸载程序")
     io.say("以下为本程序可清理的内容，每一级单独确认；如需保留某一级，拒绝该级即可。")
     if PACKAGE_NAME in inventory.uv_tools:
@@ -368,7 +368,7 @@ def _run_data_tier(io: UninstallIO, inventory: Inventory) -> bool:
     if not _confirmed(io.ask(prompt)):
         io.say(f"已保留用户数据目录：{display}")
         return False
-    # 打印绝对路径后才动删除（Design §6.2 #8）
+    # 打印绝对路径后才动删除
     io.say(f"将删除数据目录：{display}")
     try:
         io.remove_tree(inventory.data_dir)
@@ -446,18 +446,18 @@ def _cleanup_registered_env_vars(io: UninstallIO, names: Sequence[str]) -> bool:
     return not invalid
 
 
-# ---- 数据目录删除的两道保险 ----
+# ---- 数据目录删除的放行保险 ----
 
 
 def _data_dir_block_reason(data_dir: Path, home_override: str) -> str | None:
     """数据目录删除的放行判定；返回拒绝原因（``None`` = 允许删除）。
 
-    三道保险（Design §6.2 #8）：① 目录名必须是默认的 ``.crw``，或 ``CRW_HOME`` 被显式
-    设置（只有用户主动指定的目录才算数）；② 绝不删除仓库目录——即使命中第 ① 条，含
-    ``.git`` 的目录与当前工作目录及其上级也一律拒绝，防误删代码仓库；③ 绝不删除
-    **文件系统根**——第 ① 条把"设了 CRW_HOME"当成用户意图，而 `CRW_HOME=/` 这类误配
-    恰好是"设了但指错了"，主目录与上级两道拦不住跨盘的根（Windows 上主目录在另一块盘时
-    `home.is_relative_to(根)` 为假），确认前必须拦下。
+    删除前逐条把关：① 目录名必须是默认的 ``.crw``，或 ``CRW_HOME`` 被显式设置（只有用户
+    主动指定的目录才算数）；② 绝不删除**文件系统根**——第 ① 条把"设了 CRW_HOME"当成用户
+    意图，而 ``CRW_HOME=/`` 这类误配恰好是"设了但指错了"，后面的主目录与上级两道拦不住
+    跨盘的根（Windows 上主目录在另一块盘时 ``home.is_relative_to(根)`` 为假），确认前必须
+    拦下；③ 绝不删除仓库目录——即使命中第 ① 条，含 ``.git`` 的目录也一律拒绝，防误删
+    代码仓库；④ 绝不删除用户主目录、当前工作目录及其上级。
     """
     if data_dir.name != config_mod.DEFAULT_HOME_NAME and not home_override.strip():
         return (

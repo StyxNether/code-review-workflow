@@ -4,7 +4,7 @@
 ``dispatch(name, arguments_json) -> str``；工具异常一律结构化为 ``错误：`` 文本回传
 模型，不向上抛出——工具失败不应让整轮运行以 traceback 结束。
 
-``--no-exec`` 的实施闸口唯一在本层：**不注册** ``run_python``（Design §8.1），不做
+``--no-exec`` 的实施闸口唯一在本层：**不注册** ``run_python``，不做
 提示词层假设——模型看不到执行工具，也就无从调用。
 """
 
@@ -116,12 +116,12 @@ def build_registry(
     names: Sequence[str] | None = None,
     allow_exec: bool = True,
 ) -> ToolRegistry:
-    """按上下文根装配工具集（Design §8.4 / §8.1）。
+    """按上下文根装配工具集。
 
     Args:
         roots: 上下文根（运行工作区；``crw review`` 为审查目标所在目录的并集）。
             所有文件 / 执行工具的相对路径都相对它解析，越界一律结构化拒绝。
-        names: 要注册的工具名（按 Design §4.2 各节点的工具集裁剪）；缺省注册全部。
+        names: 要注册的工具名（按各节点的工具集裁剪）；缺省注册全部。
         allow_exec: 是否注册 ``run_python``；``--no-exec`` 传 ``False``（不注册即无法调用）。
     """
     registry = ToolRegistry()

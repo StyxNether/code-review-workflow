@@ -1,4 +1,4 @@
-"""模块骨架测试：Design §3 列出的模块均可导入、带 docstring，且清单不漂移。"""
+"""模块骨架测试：清单里的模块均可导入、带 docstring，且清单不漂移。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 
 import crw
 
-# Design §3 的模块清单：新增 / 删除模块时必须同步本表，否则 test_module_list_matches_package_tree 会失败。
+# 模块清单：新增 / 删除模块时必须同步本表，否则 test_module_list_matches_package_tree 会失败。
 MODULES = (
     "crw",
     "crw.cli",
@@ -70,5 +70,5 @@ def test_module_documents_its_responsibility(module_name: str) -> None:
 
 
 def test_module_list_matches_package_tree() -> None:
-    """包目录实际模块集合与 Design §3 清单一致（多、少、改名都即刻暴露）。"""
+    """包目录实际模块集合与本清单一致（多、少、改名都即刻暴露）。"""
     assert _modules_on_disk() == set(MODULES)

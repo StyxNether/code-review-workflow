@@ -141,7 +141,7 @@ def test_run_rejects_requirement_and_file_together() -> None:
 
 @pytest.mark.parametrize("argv", [["run"], ["run", ""], ["run", "   "], ["run", "-f", ""]])
 def test_run_requires_non_blank_input(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
-    """run 的两种输入必须恰好给出一个，且不得为空白（Design §8.1）。"""
+    """run 的两种输入必须恰好给出一个，且不得为空白。"""
     with pytest.raises(SystemExit) as excinfo:
         main(argv)
 
@@ -151,7 +151,7 @@ def test_run_requires_non_blank_input(argv: list[str], capsys: pytest.CaptureFix
 
 @pytest.mark.parametrize("value", ["0", "1", "3", "10"])
 def test_run_max_iter_accepts_values_up_to_the_limit(value: str) -> None:
-    """轮次由用户在命令行指定，取值范围 0–10（Design §4.4；0 = 只审不修）。"""
+    """轮次由用户在命令行指定，取值范围 0–10（0 = 只审不修）。"""
     assert build_parser().parse_args(["run", "--max-iter", value]).max_iter == int(value)
 
 
@@ -264,7 +264,7 @@ def test_review_requires_at_least_one_path() -> None:
     ],
 )
 def test_short_options_also_accept_long_names(argv: list[str]) -> None:
-    """短选项均有等价长名（用户 2026-10-11 决定：全面恢复长名）。"""
+    """短选项均有等价长名。"""
     assert build_parser().parse_args(argv).out == argv[-1]
 
 
@@ -312,7 +312,7 @@ def test_commands_without_arguments(command: str) -> None:
     ],
 )
 def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
-    """缺选项值、未知选项与多余位置参数一律按参数错误退出（Design §8.1）。"""
+    """缺选项值、未知选项与多余位置参数一律按参数错误退出。"""
     with pytest.raises(SystemExit) as excinfo:
         main(argv)
 
@@ -320,7 +320,7 @@ def test_usage_errors_exit_with_code_2(argv: list[str]) -> None:
 
 
 def test_resume_of_an_unknown_run_reports_readably(capsys: pytest.CaptureFixture[str]) -> None:
-    """M3：resume 已落地；记录不存在时给可读原因并退出 2（Design §4.4）。"""
+    """resume 的记录不存在时给可读原因并退出 2。"""
     assert main(["resume", "r-20261011-1a2b"]) == 2
 
     captured = capsys.readouterr()
@@ -329,7 +329,7 @@ def test_resume_of_an_unknown_run_reports_readably(capsys: pytest.CaptureFixture
 
 
 def test_run_without_configuration_points_to_crw_config(capsys: pytest.CaptureFixture[str]) -> None:
-    """未配置供应商：给可读指引并退出 2，不产生运行记录（Design §8.1 的运行错误）。"""
+    """未配置供应商：给可读指引并退出 2，不产生运行记录。"""
     assert main(["run", "写一个计算器"]) == 2
 
     captured = capsys.readouterr()
@@ -339,7 +339,7 @@ def test_run_without_configuration_points_to_crw_config(capsys: pytest.CaptureFi
     assert records.list_runs() == []
 
 
-# ---- run：真实 Agent 节点（经假模型驱动，Design §8.1）----
+# ---- run：真实 Agent 节点（经假模型驱动）----
 
 #: 假模型给编码节点的产出（可编译的最小模块）
 CLEAN_CODE = '"""计算器。"""\n\n\ndef main() -> None:\n    print("ok")\n'
@@ -359,7 +359,7 @@ def test_run_with_requirement_prints_conclusion_and_persists_record(
     captured = capsys.readouterr()
     assert "完成：干净通过" in captured.out
     assert "运行记录" in captured.out
-    assert "[编码]" in captured.err  # 过程叙述走 stderr（Design §8.4）
+    assert "[编码]" in captured.err  # 过程叙述走 stderr
     assert "[审查]" in captured.err
     assert "· 工具：" in captured.err  # 工具调用过程可见（阶段面板下的打点行）
 
@@ -369,7 +369,7 @@ def test_run_with_requirement_prints_conclusion_and_persists_record(
     assert summary.residual_severe == 0
     state = records.read_state(summary.path)
     assert state is not None
-    # 真实模型标识含生效挡位（产品默认已关闭思考，默认值也要看得见，Design §8.3 的回显口径）
+    # 真实模型标识含生效挡位（产品默认已关闭思考，默认值也要看得见）
     assert state["model"] == "DeepSeek/deepseek-flash（思考：off）"
 
 
@@ -377,7 +377,7 @@ def test_run_records_tool_events_in_the_log(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
 ) -> None:
-    """工具调用过程进 log.jsonl（状态追踪与演示的时间线来源，Design §5.1）。"""
+    """工具调用过程进 log.jsonl（状态追踪与演示的时间线来源）。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
 
@@ -421,7 +421,7 @@ def test_run_with_divide_by_zero_fixture_residual(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """达限残留：退出码 1 + 残留清单（Design §4.4）。"""
+    """达限残留：退出码 1 + 残留清单。"""
     configured_provider()
     fake_chat_model.load(
         fakes.residual_script(
@@ -446,7 +446,7 @@ def test_review_without_any_tool_call_is_rejected(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """执行有效性门禁（Design §5.2）：审查一次工具都没调、却报"无问题" → 不许通过。
+    """执行有效性门禁：审查一次工具都没调、却报"无问题" → 不许通过。
 
     首轮与重试都没有工具事件 → 按节点失败处理（退出码 2），而不是把空数组当"干净"。
     """
@@ -469,7 +469,7 @@ def test_run_no_exec_does_not_register_the_execution_tool(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
 ) -> None:
-    """``--no-exec``：工具注册层不注册 run_python（模型侧根本看不到该工具，Design §8.1）。"""
+    """``--no-exec``：工具注册层不注册 run_python（模型侧根本看不到该工具）。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
 
@@ -486,7 +486,7 @@ def test_run_streams_model_text_and_no_stream_buffers_it(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--no-stream`` 不丢内容：两种模式都输出模型正文（围栏内容按 §6.2 #6 抑制）。
+    """``--no-stream`` 不丢内容：两种模式都输出模型正文（围栏内容在流式模式下抑制）。
 
     流式与缓存的**差别**（立即写出 / 阶段结束整体写出）由 tests/test_render.py 的渲染器用例
     锁定——在整段 stderr 文本上两者的行序相同，只有写入时机不同，这里只保证内容可读。
@@ -516,7 +516,7 @@ def test_run_out_copies_final_code_and_report(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--out``：最终版本目录整目录复制为 code_final/，报告一并复制（Design §4.2.2）。"""
+    """``--out``：最终版本目录整目录复制为 code_final/，报告一并复制。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
     out_dir = tmp_path / "deliver"
@@ -536,7 +536,7 @@ def test_run_out_avoids_overwriting_existing_outputs(
     configured_provider: Callable[[], dict[str, object]],
     fake_chat_model: object,
 ) -> None:
-    """重名加序号：已有 code_final/ 时写到 code_final_2/，不覆盖用户文件（Design §4.5）。"""
+    """重名加序号：已有 code_final/ 时写到 code_final_2/，不覆盖用户文件。"""
     configured_provider()
     out_dir = tmp_path / "deliver"
     out_dir.mkdir()
@@ -565,7 +565,7 @@ def test_run_records_max_iterations_source(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """轮次取值来源：命令行显式给出记 cli，否则记内置默认（Design §4.4）。"""
+    """轮次取值来源：命令行显式给出记 cli，否则记内置默认。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
 
@@ -745,7 +745,7 @@ def test_run_state_file_records_the_cli_options(
 def test_unexpected_failure_reports_readably(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """处理器阶段的未预期异常兜底为可读报错 + 退出码 2，而不是 traceback 退出（Design §8.1）。"""
+    """处理器阶段的未预期异常兜底为可读报错 + 退出码 2，而不是 traceback 退出。"""
 
     def _boom(args: argparse.Namespace) -> int:
         raise RuntimeError("运行目录不可写")
@@ -814,7 +814,7 @@ def test_input_contract_accepts_legal_combinations(argv: list[str]) -> None:
 def test_run_reports_directory_input_readably(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``-f`` 目标为目录：给中文可读说明（Design §4.6 可读报错），退出码 2。"""
+    """``-f`` 目标为目录：给中文可读说明，退出码 2。"""
     assert main(["run", "-f", str(tmp_path)]) == 2
 
     captured = capsys.readouterr()
@@ -847,7 +847,7 @@ def test_run_writes_nothing_to_the_real_user_directory(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """运行记录根目录随 CRW_HOME 走：测试用例不会写真实用户目录（Design §9.1）。"""
+    """运行记录根目录随 CRW_HOME 走：测试用例不会写真实用户目录。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
 
@@ -858,7 +858,7 @@ def test_run_writes_nothing_to_the_real_user_directory(
     assert summary.path.is_relative_to(tmp_path)
 
 
-# ---- crw review：单 Agent 审查（Design §8.1 / §6.4）----
+# ---- crw review：单 Agent 审查 ----
 
 
 def _user_prompt(model: object, index: int = 0) -> str:
@@ -894,7 +894,7 @@ def test_review_interrupt_reports_readably_and_exits_2(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``crw review`` 被 Ctrl+C 中断：stderr 一行可读提示 + 退出码 2（Design §8.1）。"""
+    """``crw review`` 被 Ctrl+C 中断：stderr 一行可读提示 + 退出码 2。"""
     configured_provider()
 
     def _interrupted(*args: object, **kwargs: object) -> str:
@@ -914,7 +914,7 @@ def test_review_json_mode_reports_severe_with_exit_code_1(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--json``：结构化输出走 stdout，存在【严重】时退出码 1（Design §8.1）。"""
+    """``--json``：结构化输出走 stdout，存在【严重】时退出码 1。"""
     configured_provider()
     report = {
         "files": [
@@ -976,7 +976,7 @@ def test_review_directory_runs_one_session_over_a_listing(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """目录目标 = **整项目一次会话**：任务里只给清单，不给正文（Design §8.1）。"""
+    """目录目标 = **整项目一次会话**：任务里只给清单，不给正文。"""
     configured_provider()
     (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("print(2)\nprint(3)\n", encoding="utf-8")
@@ -1438,7 +1438,7 @@ def test_review_reads_stdin(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``-``：读 stdin（Design §8.1）。"""
+    """``-``：读 stdin。"""
     configured_provider()
     fake_chat_model.load([fakes.ai_text("stdin 内容的审查结论。")])
     monkeypatch.setattr("sys.stdin", io.StringIO("print('hi')\n"))
@@ -1532,7 +1532,7 @@ def test_review_empty_directory_is_a_run_error(
     assert "没有可审查的文本文件" in captured.err
 
 
-# ---- crw config：供应商配置与连通性自检（Design §8.3）----
+# ---- crw config：供应商配置与连通性自检 ----
 
 
 def test_config_test_without_providers_is_a_config_error(
@@ -1607,14 +1607,14 @@ def test_config_interactive_adds_a_provider_and_writes_models_json(
 
 
 def test_config_interactive_reports_a_broken_file(capsys: pytest.CaptureFixture[str]) -> None:
-    """损坏的 models.json：给可读原因 + 修复指引，退出 2（Design §8.1）。"""
+    """损坏的 models.json：给可读原因 + 修复指引，退出 2。"""
     config_mod.config_path().parent.mkdir(parents=True, exist_ok=True)
     config_mod.config_path().write_text("{ 不是 JSON", encoding="utf-8")
 
     assert main(["config"]) == 2
 
     captured = capsys.readouterr()
-    assert "配置错误" in captured.err  # 错误走 stderr（与 config test 同口径，Design §8.4）
+    assert "配置错误" in captured.err  # 错误走 stderr（与 config test 同口径）
     assert "手工修复" in captured.err
     assert "配置错误" not in captured.out
 
@@ -1742,7 +1742,7 @@ def engine_result_without_dir() -> object:
     )
 
 
-# ---- M3.5：旧单文件记录守卫与思考挡位回显（Design §4.2.2、§8.3） ----
+# ---- 旧单文件记录守卫与思考挡位回显 ----
 
 
 def _write_legacy_record(run_id: str = "r-20261012-0001") -> str:
@@ -1767,7 +1767,7 @@ def _write_legacy_record(run_id: str = "r-20261012-0001") -> str:
 
 
 def test_show_rejects_legacy_single_file_records(capsys: pytest.CaptureFixture[str]) -> None:
-    """旧格式记录不做兼容：一行可读提示 + 退出码 2，不崩溃（用户裁决 2026-10-13）。"""
+    """旧格式记录不做兼容：一行可读提示 + 退出码 2，不崩溃。"""
     run_id = _write_legacy_record()
 
     assert main(["show", run_id]) == 2
@@ -1795,7 +1795,7 @@ def test_run_with_thinking_override_echoes_it_everywhere(
     fake_chat_model: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--thinking`` 快捷切换：头行、state.model、报告口径一致（Design §8.3 的回显要求）。"""
+    """``--thinking`` 快捷切换：头行、state.model、报告口径一致。"""
     configured_provider()
     fake_chat_model.load(fakes.clean_requirement_script(code=CLEAN_CODE))
 
@@ -1816,7 +1816,7 @@ def test_thinking_unknown_level_is_a_parameter_error(
     configured_provider: Callable[[], dict[str, object]],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """表外挡位 = 参数错误（退出码 2，列出可用挡位），不静默夹取（Design §8.3）。"""
+    """表外挡位 = 参数错误（退出码 2，列出可用挡位），不静默夹取。"""
     configured_provider()
 
     with pytest.raises(SystemExit) as excinfo:
@@ -2204,7 +2204,7 @@ def test_failed_node_still_records_the_usage_it_spent(
                 fakes.file_fence(CLEAN_CODE),
                 usage=fakes.call_usage(input_tokens=800, output_tokens=300),
             ),
-            # 两次都不是契约要求的 json 围栏 → 审查节点按失败收尾（Design §4.6）
+            # 两次都不是契约要求的 json 围栏 → 审查节点按失败收尾
             fakes.ai_text(
                 "我要开始审查了。", usage=fakes.call_usage(input_tokens=900, output_tokens=40)
             ),

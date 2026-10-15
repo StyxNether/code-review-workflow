@@ -1,11 +1,11 @@
 """Agent 层：编码 / 审查 / 修复三个节点的装配与运行时。
 
-装配分两步，便于引擎把过程事件与正文增量接进来（Design §3.1、§6.2 #5）::
+装配分两步，便于引擎把过程事件与正文增量接进来::
 
     runtime = build_runtime(resolved=..., emit=engine_emit, on_delta=engine_delta)
     nodes = build_nodes(runtime, roots=(workspace,), no_exec=False)
 
-每个节点的工具集按 Design §4.2 的表固定：编码无工具（纯生成）；审查可列目录 / 读文件 /
+每个节点的工具集固定：编码无工具（纯生成）；审查可列目录 / 读文件 /
 运行核实；修复读文件、**只写改动的文件**（``write_file``，上下文根 = 本轮产出的版本目录）
 与运行核实。``--no-exec`` 在工具注册表组装层生效（不注册 ``run_python``），不做提示词层假设。
 """
@@ -38,7 +38,7 @@ from .runtime import (
     history_from_state,
 )
 
-#: 各节点的工具集（Design §4.2 的"工具"列；修复节点的上下文根是本轮产出的版本目录）
+#: 各节点的工具集（修复节点的上下文根是本轮产出的版本目录）
 NODE_TOOL_NAMES: Mapping[str, tuple[str, ...]] = {
     "encode": (),
     "review": (LIST_DIR_TOOL, READ_FILE_TOOL, EXEC_TOOL_NAME),
@@ -95,7 +95,7 @@ def build_nodes(
     Args:
         runtime: 单任务运行时（由引擎装配，带事件与增量回调）。
         roots: 上下文根（工作流运行 = 运行工作区）；修复节点例外——它的根是本轮产出的
-            版本目录，由节点在每轮调用时按状态自取（Design §4.2.2）。
+            版本目录，由节点在每轮调用时按状态自取。
         no_exec: 关闭执行（工具注册表不注册 ``run_python``）。
         parallel_review: 并行双视角形态：两个审查节点共用同一 runtime 与工具集，只有
             系统提示词与任务说明按视角分派；汇合节点由 workflow 层补齐（本层不 import 上层）。
@@ -112,7 +112,7 @@ def build_nodes(
     }
     nodes: dict[str, NodeFn] = {
         "encode": build_encode_node(runtime, registries["encode"]),
-        # 修复节点按轮自建注册表：上下文根是本轮产出的版本目录（引擎复制后才确定，§4.2.2）
+        # 修复节点按轮自建注册表：上下文根是本轮产出的版本目录（引擎复制后才确定）
         "fix": build_fix_node(runtime, no_exec=no_exec),
     }
     if parallel_review:
@@ -161,7 +161,7 @@ def review_project_once(
 ) -> str:
     """``crw review`` 的整项目审查：一次会话给出**文件清单**，内容由模型自己顺链读取。
 
-    与 :func:`review_once`（内联单文件）的差别（Design §8.1）：任务里不附正文，跨文件的
+    与 :func:`review_once`（内联单文件）的差别：任务里不附正文，跨文件的
     逻辑链（签名对不上、循环导入、异常跨层被吞）只有同一次判断里读到双方才看得见；
     一次会话即**一位审查者的一份结论**，返回的正文可以是多条 ``files`` 的报告。
     """

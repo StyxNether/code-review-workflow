@@ -100,7 +100,7 @@ class TestRuntimeBasics:
         assert {node for node, _ in deltas} == {"fix"}
 
     def test_each_run_is_independent(self, workspace: Path) -> None:
-        """单任务语义：第二次 run 只带自己的 user 消息（不持有跨轮正本，Design §6.2 #5）。"""
+        """单任务语义：第二次 run 只带自己的 user 消息（运行时不持有跨轮正本）。"""
         model = fakes.ScriptedChatModel(
             responses=[fakes.ai_text("第一次。"), fakes.ai_text("第二次。")]
         )
@@ -186,7 +186,7 @@ class TestRuntimeBasics:
 
 class TestErrorProtocol:
     def test_unknown_tool_returns_structured_error(self, workspace: Path) -> None:
-        """未注册工具：``错误：`` 文本回传模型，不中断运行（Design §8.4）。"""
+        """未注册工具：``错误：`` 文本回传模型，不中断运行。"""
         model = fakes.ScriptedChatModel(
             responses=[fakes.ai_tool_call("deploy", target="prod"), fakes.ai_text("改用静态分析。")]
         )
@@ -246,7 +246,7 @@ class TestErrorProtocol:
 
 class TestGuardrails:
     def test_tool_round_limit_drops_tools_and_records_a_notice(self, workspace: Path) -> None:
-        """工具轮次上限：下一轮去工具 + 注入收尾指令，并把事实记进 notices（Design §4.6）。"""
+        """工具轮次上限：下一轮去工具 + 注入收尾指令，并把事实记进 notices。"""
         (workspace / "code_v1.py").write_text("print(1)\n", encoding="utf-8")
         model = fakes.ScriptedChatModel(
             responses=[
@@ -270,7 +270,7 @@ class TestGuardrails:
         assert runtime.drain_notices() == []  # 取走即清空
 
     def test_context_budget_stops_tools_from_the_first_request(self, workspace: Path) -> None:
-        """任务级预算护栏：估算超阈值即停止工具 + 收尾（Design §4.6）。"""
+        """任务级预算护栏：估算超阈值即停止工具 + 收尾。"""
         model = fakes.ScriptedChatModel(responses=[fakes.ai_text("结论（可能不完整）。")])
         runtime = make_runtime(model, max_context_tokens=1)
 
@@ -306,7 +306,7 @@ class TestNodeAssembly:
         assert "写一个计算器" in str(last_prompt(model, 0))
 
     def test_review_node_reports_tool_evidence(self, workspace: Path) -> None:
-        """有工具事件 → review_evidence 为真；一次工具都没调 → 为假（Design §5.2 门禁依据）。"""
+        """有工具事件 → review_evidence 为真；一次工具都没调 → 为假（执行有效性门禁依据）。"""
         (workspace / "code_v1.py").write_text("print(1)\n", encoding="utf-8")
         state = {
             "current_code": str(workspace / "code_v1.py"),
@@ -377,10 +377,10 @@ class TestNodeAssembly:
         assert "findings 必须为数组" in str(last_prompt(model, 0))
 
     def test_fix_node_writes_only_the_changed_files(self, workspace: Path) -> None:
-        """修复节点用 ``write_file`` 落盘：只写改动的文件，未改动的原样保留（Design §4.2.2）。
+        """修复节点用 ``write_file`` 落盘：只写改动的文件，未改动的原样保留。
 
         上下文根 = 本轮产出的版本目录，所以模型给的路径不带 ``code_vN/`` 前缀；节点只交回
-        fixes 围栏（产物内容不再走围栏），版本完整性由引擎按磁盘内容校验。
+        fixes 围栏（产物内容不走围栏），版本完整性由引擎按磁盘内容校验。
         """
         version = workspace / "code_v2"
         version.mkdir()
@@ -628,7 +628,7 @@ class TestToolMarkupGuard:
         )
 
         assert result.text == "重发后的结论。"
-        assert any(event["event"] == "retry" for event in events)  # 重发留痕（Design §8.2）
+        assert any(event["event"] == "retry" for event in events)  # 重发要留痕
         assert len(model.requests) == 2
         # 重发改为"无工具 + 直接要结论"：多轮探索是这类故障的温床，原样重发很可能再撞一次
         assert [] in model.bound_tools

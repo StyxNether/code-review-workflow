@@ -1,8 +1,8 @@
 """命令面：参数解析与子命令分发（run / runs / show / resume / review / config / graph / uninstall）。
 
-只有本层接触 argparse 与终端输入；业务逻辑委托 workflow / agents 层，命令面与选项口径见
-Design §8.1。输出通道按 §8.4 分流：结论 / findings 清单 / 报告走 stdout，过程叙述、审查
-原文与错误走 stderr（``--json`` 时 stdout 纯 JSON）。
+只有本层接触 argparse 与终端输入；业务逻辑委托 workflow / agents 层。输出通道分流：
+结论 / findings 清单 / 报告走 stdout，过程叙述、审查原文与错误走 stderr
+（``--json`` 时 stdout 纯 JSON）。
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ _CONFIG_SCOPE_HINT = "当前无供应商配置。请添加一个供应商（或�
 
 
 def _package_version() -> str:
-    """读取已安装发行版的版本号（Design §9：版本以包元数据为准）。
+    """读取已安装发行版的版本号（版本以包元数据为准，不写进源码常量）。
 
     源码目录未安装时元数据缺失，返回可辨识的占位值，避免误报一个具体版本。
     """
@@ -61,7 +61,7 @@ def _package_version() -> str:
 
 
 def _max_iter_rounds(text: str) -> int:
-    """解析修复轮次上限：0 ~ ``_MAX_ITER_LIMIT`` 的 ASCII 十进制整数（Design §4.4）。
+    """解析修复轮次上限：0 ~ ``_MAX_ITER_LIMIT`` 的 ASCII 十进制整数。
 
     先按字面收紧再取值——int() 会接受 ``+3`` / ``1_0`` / 全角与阿拉伯-印度数字等写法并静默
     重新解释用户输入；同时设硬上限，避免误填大值造成无界循环与无界调用费用。
@@ -77,7 +77,7 @@ def _max_iter_rounds(text: str) -> int:
 
 
 class _MaxIterAction(argparse.Action):
-    """记录 ``--max-iter`` 是否由命令行显式给出（轮次取值来源，Design §4.4）。"""
+    """记录 ``--max-iter`` 是否由命令行显式给出——轮次取值要区分"用户指定"与"默认"。"""
 
     def __call__(
         self,
@@ -91,7 +91,7 @@ class _MaxIterAction(argparse.Action):
 
 
 def _thinking_level(text: str) -> str:
-    """解析 ``--thinking``：只认内置等级表（不要求该模型预配置过该挡位，Design §8.3）。
+    """解析 ``--thinking``：只认内置等级表（不要求该模型预配置过该挡位）。
 
     表外名称按参数错误处理（退出码 2 并列出可用挡位），不静默夹取。
     """
@@ -135,7 +135,7 @@ def _add_workflow_options(
         f"可取值 0–{_MAX_ITER_LIMIT}；0 = 只审不修）",
     )
     # 轮次语义与轮次数值是两件事：本选项**不**并入 max_iter_source（只给模式时数值仍走
-    # "消息提取 > 会话设置 > 配置默认"，Design §4.4）
+    # "消息提取 > 会话设置 > 配置默认"）
     parser.add_argument(
         "--rounds-mode",
         dest="rounds_mode",
@@ -182,7 +182,7 @@ def _add_review_options(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构造完整的命令行解析器（命令面与选项口径见 Design §8.1）。"""
+    """构造完整的命令行解析器。"""
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description="基于 LLM 的代码审查工作流：编码 → 审查 → 修复（+ 复审循环）。",
@@ -218,8 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", dest="resume", metavar="会话号", help="恢复既有会话（与 -f 二选一）"
     )
     chat_parser.set_defaults(_subparser=chat_parser)
-    # 会话内暂不提供 --parallel-review（Design §12.3 的评估项）与 --out（会话每轮的产物已在
-    # 会话目录里，导出属于一次性运行的语义）：不注册即明确报参数错误，而不是"解析了却不生效"
+    # 会话内不提供 --parallel-review 与 --out（会话每轮的产物已在会话目录里，导出是一次性
+    # 运行的语义）：不注册即明确报参数错误，而不是"解析了却不生效"
     _add_workflow_options(chat_parser, include_parallel_review=False, include_out=False)
 
     subparsers.add_parser("sessions", help="列出会话（会话号 / 时间 / 轮次数 / 最后状态）")
@@ -292,8 +292,8 @@ def _mask_secrets(text: str) -> str:
 def _report_failure(command: str | None, exc: Exception) -> int:
     """兜底报错：单行可读提示 + 运行错误退出码。
 
-    异常文本可能来自模型 / HTTP 栈（含请求细节）而终端输出常被重定向保存，故按 Design §8.2
-    的截断惯例限长，并遮蔽 ``sk-`` 形态的密钥（覆盖常见供应商，尽力而为而非保证）。
+    异常文本可能来自模型 / HTTP 栈（含请求细节）而终端输出常被重定向保存，故限长，
+    并遮蔽 ``sk-`` 形态的密钥（覆盖常见供应商，尽力而为而非保证）。
     """
     detail = _mask_secrets(f"{type(exc).__name__}: {exc}")
     if len(detail) > _MAX_ERROR_CHARS:
@@ -311,8 +311,8 @@ def _resolve_model(
 ) -> Any:
     """解析本次运行的模型连接；失败给可读指引并返回 ``None``（调用方退出 2）。
 
-    ``thinking``（``--thinking``）优先于配置里的挡位：切换模型的当次就能指定挡位
-    （用户裁决 2026-10-13），不要求该模型预配置过该挡位。
+    ``thinking``（``--thinking``）优先于配置里的挡位：切换模型的当次就能指定挡位，
+    不要求该模型预配置过该挡位。
     """
     try:
         resolved = config_mod.resolve(model=model, provider=provider)
@@ -335,17 +335,23 @@ def _resolve_model(
 
 
 def _legacy_config_hint() -> str:
-    """零配置且有前作配置时的导入提示（Design §6.2 #2 / D7：只探测存在性并提示）。"""
+    """零配置且检测到姊妹工具 ``code-review-agent`` 的 ``~/.cra/models.json`` 时的导入提示。
+
+    只探测存在性并提示，不读取内容——配置导入是用户显式发起的动作。
+    """
     if config_mod.config_path().exists():
         return ""
     legacy = config_mod.legacy_config_path()
     if not legacy.exists():
         return ""
-    return f"提示：检测到前作配置 {legacy}——运行 crw config 可选择导入（不会修改前作文件）。"
+    return (
+        f"提示：检测到 code-review-agent 的配置 {legacy}——"
+        "运行 crw config 可选择导入（不会修改那个文件）。"
+    )
 
 
 def _read_input_file(path: Path) -> tuple[str | None, int]:
-    """读取输入文件（Design §8.4：CLI 自身读取）；失败给可读原因并返回运行错误码。"""
+    """读取输入文件（由命令面自己读，工作区落盘是引擎的事）；失败给可读原因并返回运行错误码。"""
     if not path.exists():
         print(f"crw run：运行失败 — 输入文件不存在：{path}", file=sys.stderr)
         return None, _EXIT_ERROR
@@ -378,10 +384,10 @@ def _read_input_file(path: Path) -> tuple[str | None, int]:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    """运行工作流：解析模型 → 装配请求 → 驱动引擎 → 渲染结论（Design §8.1）。
+    """运行工作流：解析模型 → 装配请求 → 驱动引擎 → 渲染结论。
 
-    ``-f`` 输入由命令面读取（Design §8.4），工作区内落盘交给引擎；``--out`` 在收尾后把
-    最终代码与报告复制出去（Design §4.5）。轮次取值优先级见 §4.4：命令行 > 配置默认 > 内置。
+    ``-f`` 输入由命令面读取，工作区内落盘交给引擎；``--out`` 在收尾后把最终代码与报告
+    复制出去。轮次取值优先级：命令行 > 配置默认 > 内置。
     """
     requirement = (args.requirement or "").strip() or None
     source_path: Path | None = None
@@ -423,7 +429,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _rounds_for_run(args: argparse.Namespace) -> tuple[int, str]:
-    """``crw run`` 的轮次取值（Design §4.4）：命令行显式 > 配置默认 > 内置 3。
+    """``crw run`` 的轮次取值：命令行显式 > 配置默认 > 内置 3。
 
     配置默认来自 ``~/.crw/settings.json`` 的 ``rounds.default``（未配置时记"内置默认"来源）；
     配置损坏抛 :class:`crw.config.ConfigError`，由调用方按配置错误退出 2。
@@ -454,10 +460,10 @@ def _export_target(out_dir: Path, kind: str, suffix: str) -> Path:
 
 
 def _export_outputs(result: engine_mod.RunResult, out_dir: Path) -> None:
-    """``--out``：把最终版本目录与报告复制到指定目录（Design §4.2.2 / §4.5；重名加序号）。
+    """``--out``：把最终版本目录与报告复制到指定目录（重名加序号）。
 
     版本目录整目录复制为 ``<out>/code_final/``（目录内含 manifest.json 与全部文件）；
-    复制失败不影响运行结论（Design §4.6）：只向 stderr 警示，退出码仍按运行状态。
+    复制失败不影响运行结论：只向 stderr 警示，退出码仍按运行状态。
     """
     if result.run_dir is None:
         print("crw run：本次运行没有工作目录，--out 已跳过（无产物可复制）。", file=sys.stderr)
@@ -537,7 +543,7 @@ def _version_copy_sources(version_dir: Path) -> list[Path]:
 
 
 def _deletion_confirmer() -> engine_mod.DeletionConfirmer | None:
-    """删除确认闸门（Design §4.2.2）：非交互（管道 / CI）返回 ``None``（一律保留）。"""
+    """删除确认闸门：非交互（管道 / CI）返回 ``None``（一律保留）。"""
     if not sys.stdin.isatty():
         return None
 
@@ -553,11 +559,11 @@ def _deletion_confirmer() -> engine_mod.DeletionConfirmer | None:
     return confirm
 
 
-# ---- crw chat / crw sessions：会话模式（Design §4.7 / §5.4 / §8.1）----
+# ---- crw chat / crw sessions：会话模式 ----
 
 
 def _cmd_chat(args: argparse.Namespace) -> int:
-    """会话模式：装配会话 IO 与模型，交给 session 层的主循环（Design §8.1）。
+    """会话模式：装配会话 IO 与模型，交给 session 层的主循环。
 
     命令面的职责只有三件：解析 ``-f`` 起始文件、按优先级链算好**初始轮次设置**、
     把真实终端 IO 与渲染器装进 :class:`crw.session.chat.ChatIO`；会话的时序全在 session 层。
@@ -578,7 +584,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         print(f"crw chat：配置错误 — {exc}", file=sys.stderr)
         print("请手工修复该文件，或删除后重试（将重建默认设置）。", file=sys.stderr)
         return _EXIT_ERROR
-    # 命令行覆盖按字段生效：只给 --rounds-mode 时不钉住轮次数值（Design §4.4）
+    # 命令行覆盖按字段生效：只给 --rounds-mode 时不钉住轮次数值
     overrides = session_chat_mod.RoundOverrides(
         max_iterations=int(args.max_iter) if args.max_iter_source else None,
         rounds_mode=args.rounds_mode,
@@ -612,7 +618,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 
 def _cmd_sessions(args: argparse.Namespace) -> int:
-    """列出会话（会话号 / 时间 / 轮次数 / 最后状态，Design §8.1）。"""
+    """列出会话（会话号 / 时间 / 轮次数 / 最后状态）。"""
     render.render_sessions(session_state_mod.list_sessions())
     return _EXIT_OK
 
@@ -626,7 +632,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 def _inherited_rounds(parent_state: Mapping[str, Any], parent_run_id: str) -> int | None:
     """续跑继承的轮次上限；父运行未记录返回 ``None``。
 
-    校验上限用**代码内绝对天花板**（``config.ROUNDS_LIMIT_CEILING`` = 20，Design §8.3）而不是
+    校验上限用**代码内绝对天花板**（``config.ROUNDS_LIMIT_CEILING`` = 20）而不是
     命令行的 0–10 硬闸：父运行的轮次可能来自配置默认或会话内消息提取（那些路径的上限是
     settings 的 ``rounds.limit``，可达 20），用 10 校验会把合法记录判为非法。护栏仍在：
     ``state.json`` 被手改成 999 会被拒并如实提示，退回配置默认。
@@ -648,7 +654,7 @@ def _inherited_rounds(parent_state: Mapping[str, Any], parent_run_id: str) -> in
 def _rounds_for_resume(
     args: argparse.Namespace, parent_state: Mapping[str, Any], run_id: str
 ) -> tuple[int, str, str]:
-    """``crw resume`` 的轮次取值（Design §4.4）：命令行显式 > 继承父运行 > 配置默认 > 内置。
+    """``crw resume`` 的轮次取值：命令行显式 > 继承父运行 > 配置默认 > 内置。
 
     ``--severe-only`` 与审查形态（``--parallel-review``）一并继承父运行——续跑是"接着修"，
     换判定标准或换审查方式会让结论不可比；``--no-exec`` 例外（它不进状态快照）。
@@ -665,7 +671,7 @@ def _rounds_for_resume(
         else:
             rounds, source = _configured_rounds_fallback()
     # 轮次语义独立继承：即使命令行显式给了轮次数值，未给 --rounds-mode 时仍继承父运行的
-    # 模式与审查形态——续跑是"接着修"，换判定标准会让结论不可比（Design §4.4）
+    # 模式与审查形态——续跑是"接着修"，换判定标准会让结论不可比
     inherited_mode = str(parent_state.get("rounds_mode") or "")
     if args.rounds_mode:
         mode = args.rounds_mode
@@ -677,11 +683,10 @@ def _rounds_for_resume(
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
-    """展示运行详情；省略运行号时列出记录供数字选择（Design §8.1）。
+    """展示运行详情；省略运行号时列出记录供数字选择。
 
-    ``state.json`` 损坏时按 §8.2 降级展示（摘要取自日志与产物清单）并给出退出码 2——
-    §8.1 的"记录损坏"口径即此：**展示照给，退出码照实**（脚本化消费能察觉异常，
-    人读仍拿得到可用信息）。
+    ``state.json`` 损坏时降级展示（摘要取自日志与产物清单）并给出退出码 2——口径是
+    **展示照给，退出码照实**：脚本化消费能察觉异常，人读仍拿得到可用信息。
     """
     run_id = args.run_id
     if run_id is None:
@@ -689,7 +694,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not summaries:
             print("crw show：暂无运行记录（先执行 crw run）。", file=sys.stderr)
             return _EXIT_ERROR
-        # 候选清单属交互过程：走 stderr，stdout 只留被选中记录的详情（Design §8.4）
+        # 候选清单属交互过程：走 stderr，stdout 只留被选中记录的详情
         picked = records_mod.select_run(
             summaries,
             ask=render.ask_user,
@@ -710,7 +715,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return _EXIT_ERROR
     if records_mod.is_legacy_record(detail.state):
         print(
-            "crw show：该记录来自单文件格式（M3.5 前），已被多文件版本格式取代，不再支持展示。",
+            "crw show：该记录来自单文件格式，已被多文件版本格式取代，不再支持展示。",
             file=sys.stderr,
         )
         return _EXIT_ERROR
@@ -718,11 +723,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    """续跑：以父运行的最新版本目录为新运行的起点（Design §4.2.2 / §4.4）。
+    """续跑：以父运行的最新版本目录为新运行的起点。
 
     ``-f`` 不适用（起点由父运行决定）；父运行须存在 ``current_version_dir`` 且目录仍在，
-    否则给出可读原因并退出 2。旧单文件格式记录不做兼容（用户裁决 2026-10-13）：给一行
-    可读提示并退出 2。未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
+    否则给出可读原因并退出 2。旧单文件格式记录不做兼容：给一行可读提示并退出 2。
+    未显式给出的轮次设置**继承父运行**（来源标 ``parent``），父运行的
     ``--severe-only`` 与审查形态一并继承——续跑是"接着修"，换判定标准会让结论不可比。
     ``--no-exec`` 不继承（它不进状态快照，命令面无法可靠区分"显式关闭"与"从未设置"）。
     """
@@ -741,7 +746,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         return _EXIT_ERROR
     if records_mod.is_legacy_record(parent_state):
         print(
-            "crw resume：该记录来自单文件格式（M3.5 前），已被多文件版本格式取代，无法续跑。",
+            "crw resume：该记录来自单文件格式，已被多文件版本格式取代，无法续跑。",
             file=sys.stderr,
         )
         return _EXIT_ERROR
@@ -758,7 +763,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     resolved = _resolve_model(args.model, args.provider, "resume", thinking=args.thinking)
     if resolved is None:
         return _EXIT_ERROR
-    # 轮次取值来源：命令行显式 > 父运行继承 > 配置默认 > 内置（Design §4.4）
+    # 轮次取值来源：命令行显式 > 父运行继承 > 配置默认 > 内置
     try:
         rounds, rounds_source, rounds_mode = _rounds_for_resume(args, parent_state, args.run_id)
     except config_mod.ConfigError as exc:
@@ -787,7 +792,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 
 def _cmd_graph(args: argparse.Namespace) -> int:
-    """导出工作流 mermaid 流程图（Design §8.1）：默认 stdout，``-o`` 写文件。
+    """导出工作流 mermaid 流程图：默认 stdout，``-o`` 写文件。
 
     导出的节点 / 边集合与 ``build_graph`` 同源（同一份结构声明），由快照测试锁定；
     ``--parallel-review`` 导出并行双视角形态的图。
@@ -838,7 +843,7 @@ _REVIEW_SKIP_NAMES = 20
 
 
 def _review_roots(paths: Sequence[str]) -> list[Path]:
-    """审查上下文本根：文件取其所在目录、目录取自身；stdin 退回进程启动目录（Design §8.4）。"""
+    """审查上下文本根：文件取其所在目录、目录取自身；stdin 退回进程启动目录。"""
     roots: list[Path] = []
     for raw in paths:
         if raw == "-":
@@ -860,7 +865,7 @@ def _review_common_root(paths: Sequence[str]) -> Path | None:
     """整项目形态的**单一**上下文根 = 各目标的公共父目录；无法确定时返回 ``None``。
 
     唯一化是清单可读的前提：多根下 ``read_file("pkg/util.py")`` 会按根的顺序命中第一个
-    同名候选（Design §8.4），同一个名字对应两个文件时审查者读到哪个都可能错。公共父目录
+    同名候选，同一个名字对应两个文件时审查者读到哪个都可能错。公共父目录
     无法确定（跨盘符等）时不猜、不改语义，由调用方退回逐文件形态。
     """
     candidates: list[str] = []
@@ -884,7 +889,7 @@ def _review_skip_line(label: str, names: Sequence[str]) -> None:
 
 
 def _review_data_dir_names() -> frozenset[str]:
-    """数据目录名：运行记录与配置不是待审代码，整目录跳过（Design §8.4 的拒绝名单）。"""
+    """数据目录名：运行记录与配置不是待审代码，整目录跳过。"""
     return frozenset({config_mod.data_dir().name, ".crw", ".cra"})
 
 
@@ -1047,7 +1052,7 @@ def _review_contents(paths: Sequence[str], files: Sequence[Path]) -> list[tuple[
 def _wants_project_review(args: argparse.Namespace) -> bool:
     """整项目一次会话的选形：目标是目录**或**多于一个路径，且未 ``--per-file``、不含 stdin。
 
-    单文件与 stdin 保持内联快审（内容已在手，无需再读，Design §8.1）；``--per-file``
+    单文件与 stdin 保持内联快审（内容已在手，无需再读）；``--per-file``
     是显式回退开关，用于与整项目形态做质量对照。
     """
     if args.per_file or "-" in args.paths:
@@ -1182,7 +1187,7 @@ def _review_project_session(
             total_lines=scope.total_lines,
         )
     except KeyboardInterrupt:
-        # 中断：已花掉的用量照样回显——钱花了就该看得见（Design §8.1）
+        # 中断：已花掉的用量照样回显——钱花了就该看得见
         print("crw review：已中断（整项目一次会话），未产出结论。", file=sys.stderr)
         _report_review_usage(runtime)
         return _EXIT_ERROR
@@ -1247,7 +1252,7 @@ def _review_per_file_session(
                 max_lines=render.REVIEW_PROMPT_MAX_LINES,
             )
         except KeyboardInterrupt:
-            # 中断整批审查（Design §8.1）：已花掉的用量照样回显——钱花了就该看得见
+            # 中断整批审查：已花掉的用量照样回显——钱花了就该看得见
             print(
                 f"crw review：已中断（第 {position + 1} / {len(files)} 个文件），未产出结论。",
                 file=sys.stderr,
@@ -1309,7 +1314,7 @@ def _review_per_file_session(
 def _report_review_usage(runtime: Any) -> None:
     """``crw review`` 的用量一行（stderr）：本命令不产生运行记录，用量只能在结束时回显。
 
-    ``crw run`` / ``crw chat`` 的用量进 state.json 与 report.md（Design §4.5），这里给的是
+    ``crw run`` / ``crw chat`` 的用量进 state.json 与 report.md，这里给的是
     同一套数的即时读数——批量审查花掉多少输入 / 输出 token、缓存命中多少，不看记录也要能知道。
     """
     record = usage_mod.totals(runtime.drain_usage())
@@ -1325,12 +1330,12 @@ def _report_review_usage(runtime: Any) -> None:
 
 
 def _say(text: str = "") -> None:
-    """配置交互的输出（菜单与结论）：stdout（Design §8.4 的结论通道）。"""
+    """配置交互的输出（菜单与结论）：stdout（结论通道）。"""
     print(text)
 
 
 def _say_error(text: str) -> None:
-    """配置交互的错误（配置损坏 / 写盘失败）：stderr（Design §8.4 的错误通道）。
+    """配置交互的错误（配置损坏 / 写盘失败）：stderr（错误通道）。
 
     与 ``crw config test`` 的错误同口径——同一类"配置错误"不因走交互模式而换通道。
     """
@@ -1769,11 +1774,11 @@ def _config_update_key(session: _ConfigSession) -> None:
 
 
 def _config_manage_thinking(session: _ConfigSession) -> None:
-    """模型思考挡位配置（Design §8.3）：选供应商 → 模型 → 勾选挡位 → 选默认。
+    """模型思考挡位配置：选供应商 → 模型 → 勾选挡位 → 选默认。
 
     挡位名以内置等级表为主、允许自定义名（发送侧经 extra_body 原样透传）；
-    官网未查证挡位的供应商不在预设里预填（用户裁决：查不到的交给用户自己填）。
-    未配置挡位的模型不发送任何思考参数（行为与 M3 一致）。
+    未能确认挡位通道的供应商不做预填——查不到的交给用户自己填。
+    未配置挡位的模型不发送任何思考参数。
     """
     entry = _choose_entry(session.providers(), "供应商")
     if entry is None:
@@ -1890,11 +1895,11 @@ def _set_model_thinking(
 
 
 def _maybe_import_legacy_config(session: _ConfigSession) -> None:
-    """零配置时提示导入前作 ``~/.cra/models.json``（Design §6.2 #2 / D7）。
+    """零配置时提示导入姊妹工具 ``code-review-agent`` 的 ``~/.cra/models.json``。
 
-    只在"本工具尚无任何供应商"时探测前作配置的存在性，用户显式同意才导入；导入只读取
-    前作文件的供应商名称、接入点、模型清单与 key（条目结构两者同构），**不修改前作文件**。
-    导入前先按本项目的校验规则整表校验：前作配置与本工具冲突（如同名供应商）时给可读
+    只在"本工具尚无任何供应商"时探测该文件的存在性，用户显式同意才导入；导入只读取
+    它的供应商名称、接入点、模型清单与 key（条目结构两者同构），**不修改那个文件**。
+    导入前先按本工具的校验规则整表校验：与现有配置冲突（如同名供应商）时给可读
     原因并保持原状，不产生半导入状态。
     """
     if session.providers():
@@ -1905,8 +1910,10 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     entries = config_mod.importable_providers(data)
     if not entries:
         return
-    _say(f"检测到前作配置：{config_mod.legacy_config_path()}（{len(entries)} 个供应商）")
-    answer = _ask("是否导入到本工具？（y/N；只读取前作文件，不修改它）")
+    _say(
+        f"检测到 code-review-agent 的配置：{config_mod.legacy_config_path()}（{len(entries)} 个供应商）"
+    )
+    answer = _ask("是否导入到本工具？（y/N；只读取该文件，不修改它）")
     if answer is None or answer.lower() not in ("y", "yes"):
         _say("已跳过导入。")
         return
@@ -1926,7 +1933,7 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     try:
         config_mod.validate_config(probe)
     except config_mod.ConfigError as exc:
-        _say_error(f"导入失败：前作配置不符合本工具的配置规则 — {exc}")
+        _say_error(f"导入失败：code-review-agent 的配置不符合本工具的配置规则 — {exc}")
         return
     session.data["providers"] = probe["providers"]
     if imported_default:
@@ -1935,7 +1942,7 @@ def _maybe_import_legacy_config(session: _ConfigSession) -> None:
     _say(f"已导入 {len(candidate)} 个供应商。")
     if not imported_default:
         _say(
-            "提示：前作的默认模型未一并导入（引用的供应商或模型不在清单内），可用菜单 4) 设置默认模型。"
+            "提示：code-review-agent 的默认模型未一并导入（引用的供应商或模型不在清单内），可用菜单 4) 设置默认模型。"
         )
 
 
@@ -1976,7 +1983,7 @@ def _save_rounds(default: int, limit: int) -> None:
 
 
 def _config_set_rounds_default() -> None:
-    """菜单 7：默认修复轮次（命令行与会话消息都未指定时使用，Design §4.4）。"""
+    """菜单 7：默认修复轮次（命令行与会话消息都未指定时使用）。"""
     try:
         default, limit = config_mod.rounds_settings()
     except config_mod.ConfigError as exc:
@@ -1999,7 +2006,7 @@ def _config_set_rounds_default() -> None:
 
 
 def _config_set_rounds_limit() -> None:
-    """菜单 8：轮次上限（会话内消息提取值的夹取上限，天花板 20，Design §8.3）。"""
+    """菜单 8：轮次上限（会话内消息提取值的夹取上限，天花板 20）。"""
     try:
         default, limit = config_mod.rounds_settings()
     except config_mod.ConfigError as exc:
@@ -2071,7 +2078,7 @@ def _run_config_interactive() -> int:
 
 
 def _run_config_test() -> int:
-    """``crw config test``：逐供应商发一次最小请求报告连通性（Design §8.3）。
+    """``crw config test``：逐供应商发一次最小请求报告连通性。
 
     退出码：全部 OK 为 0，存在失败为 1（检查结论），配置损坏 / 无供应商为 2（运行错误）。
     """
@@ -2103,7 +2110,7 @@ def _run_config_test() -> int:
 
 
 def _cmd_config(args: argparse.Namespace) -> int:
-    """供应商配置入口：``test`` 走自检，省略则交互式配置（Design §8.3）。"""
+    """供应商配置入口：``test`` 走自检，省略则交互式配置。"""
     return _run_config_test() if args.action == "test" else _run_config_interactive()
 
 
@@ -2126,14 +2133,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     参数非法时由 argparse 与 ``_validate_input_contract`` 报出并直接抛 ``SystemExit(2)``（不返回）；
     解析 / 校验与处理器两阶段的未预期异常均兜底为可读报错 + 退出码 2，避免以 traceback 退出
-    而混淆"达限残留"语义（Design §8.1）。
+    而混淆"达限残留"语义。
 
     Args:
         argv: 命令行参数（不含程序名）；省略时取 ``sys.argv[1:]``。
 
     Returns:
         进程退出码：0 完成 / 1 达修复轮次上限仍有阻塞问题（默认含【一般】，
-        ``--severe-only`` 时只算【严重】）/ 2 运行错误（Design §8.1）。
+        ``--severe-only`` 时只算【严重】）/ 2 运行错误。
     """
     command: str | None = None
     try:

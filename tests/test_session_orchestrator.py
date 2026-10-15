@@ -100,7 +100,7 @@ def test_ask_decision_does_not_start_the_workflow(
 def test_rounds_are_clamped_to_the_limit_with_a_note(
     fake_chat_model: ScriptedChatModel, tmp_path: Path
 ) -> None:
-    """消息提取值越界**夹取而非报错**（意图理解 ≠ 用户显式参数，Design §4.4）。"""
+    """消息提取值越界**夹取而非报错**（意图理解 ≠ 用户显式参数）。"""
     fake_chat_model.load([_orchestrator_reply({"intent": "code", "rounds": 99, "reply": "好"})])
 
     decision = _interpret(fake_chat_model, tmp_path, rounds_limit=5)
@@ -227,7 +227,7 @@ def test_session_context_is_rendered_into_the_user_message(
 
 
 def test_decision_notice_reports_the_effective_settings() -> None:
-    """本轮口径说明：本条消息按什么处理 + 轮次取值与来源（用户可当场纠正，Design §11）。"""
+    """本轮口径说明：本条消息按什么处理 + 轮次取值与来源（用户可当场纠正）。"""
     decision = orch.Decision(intent=orch.INTENT_CODE, reply="好", rounds=99, note="已夹取")
 
     notice = orch.decision_notice(

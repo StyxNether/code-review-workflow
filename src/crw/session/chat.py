@@ -1,17 +1,17 @@
 """会话循环：读入用户消息、编排路由、驱动工作流、中断与退出语义、会话档案与会话总报告。
 
-职责边界（Design §3.1 / §4.7）：本模块是会话层的**时序组织者**——它决定何时新建 / 恢复
+职责边界：本模块是会话层的**时序组织者**——它决定何时新建 / 恢复
 会话、何时该跑一轮工作流、何时落盘会话档案与 ``session.md``；单轮运行的执行、事件与
 记录仍全部交给引擎（每轮 = 一条与 ``crw run`` 同构的完整运行记录）。
 
 关键口径：
 
 - **每轮一条完整运行记录**：``sessions/<会话号>/rounds/round-<i>/``，``state.json`` 带
-  ``session_id`` / ``round_index``；代码版本号跨轮连续递增（Design §4.7）。
+  ``session_id`` / ``round_index``；代码版本号跨轮连续递增。
 - **中断**：一轮进行中 Ctrl+C = 引擎按 ``status=interrupted`` 收尾并回提示符（会话保留）；
   在提示符处 Ctrl+C / EOF / ``/exit`` 均为正常退出。
 - **退出码**：最后一轮状态的映射（0 干净 / 1 达限残留 / 2 运行错误或被中断），
-  一轮都没跑过为 0（Design §8.1）。
+  一轮都没跑过为 0。
 - **记忆**：三 Agent 各自的追加式记忆由本模块在每轮结束后按**结构化状态**追加摘要
   （不含代码与思考内容）；下一轮把它们作为历史消息交给对应 Agent，接近预算时显式压缩。
 """
@@ -42,10 +42,10 @@ _EXIT_OK = 0
 _EXIT_ISSUES = 1
 _EXIT_ERROR = 2
 
-#: 退出命令（``/exit`` 为 Design §8.1 的定稿口径；其余为常见手滑写法）
+#: 退出命令（``/exit`` 是对外文档的定稿写法；其余为常见手滑写法）
 EXIT_COMMANDS = frozenset({"/exit", "exit", "/quit", "quit"})
 
-#: 会话节点名 → 记忆文件所属 Agent（Design §4.7 的三份独立记忆）
+#: 会话节点名 → 记忆文件所属 Agent（三份独立记忆）
 _AGENT_OF_NODE: Mapping[str, str] = {
     "encode": "encoder",
     "review": "reviewer",
@@ -58,7 +58,7 @@ _AGENT_OF_NODE: Mapping[str, str] = {
 #: 版本目录名 → 版本号（会话内跨轮连续递增，目录名是权威来源）
 _VERSION_DIR_RE = re.compile(r"^code_v([0-9]+)$")
 
-#: 运行状态 → 退出码（Design §8.1 的 crw chat 行）
+#: 运行状态 → 退出码（``crw chat`` 的退出码即最后一轮的状态映射）
 _STATUS_EXIT_CODES: Mapping[str, int] = {
     state_mod.STATUS_SUCCESS: _EXIT_OK,
     state_mod.STATUS_RESIDUAL: _EXIT_ISSUES,
@@ -76,7 +76,7 @@ class RoundSettings:
 
 @dataclass(frozen=True)
 class RoundOverrides:
-    """命令行**显式**给出的轮次覆盖，按字段生效（Design §4.4）。
+    """命令行**显式**给出的轮次覆盖，按字段生效。
 
     两个字段相互独立：只给 ``--rounds-mode`` 时钉住的是"轮次语义"，轮次**数值**仍按
     消息提取 / 会话当前设置 / 配置默认的优先级链取值——把模式当成"轮次数值的命令行来源"
@@ -89,10 +89,10 @@ class RoundOverrides:
 
 @dataclass
 class ChatIO:
-    """会话交互的可注入接缝（Design §9.1 的注入惯例，与 uninstall 的 IO 接缝同形）。
+    """会话交互的可注入接缝（与 :class:`crw.uninstall.UninstallIO` 同形的注入惯例）。
 
     ``ask`` 读入一行（``None`` = EOF / Ctrl+C / 输入流不可用）；``say`` 走 stdout（会话头、
-    汇报与结论），``warn`` 走 stderr（过程提示与可读报错，Design §8.4）；``renderer`` 构造
+    汇报与结论），``warn`` 走 stderr（过程提示与可读报错）；``renderer`` 构造
     运行观察者（会话级渲染）。
     """
 
@@ -130,7 +130,7 @@ def run_chat(
     no_exec: bool = False,
     confirm_deletions: engine_mod.DeletionConfirmer | None = None,
 ) -> int:
-    """会话主循环；返回退出码（Design §8.1：最后一轮状态的映射）。
+    """会话主循环；返回退出码（最后一轮状态的映射）。
 
     Args:
         io: 交互与渲染接缝（命令面装配真实实现，测试注入脚本化替身）。
@@ -140,13 +140,13 @@ def run_chat(
         run_id_factory: 运行号生成器（透传给每轮引擎；缺省引擎自带实现）。
         rounds_limit: 轮次夹取上限（``settings.json`` 的 ``rounds.limit``；缺省取 10）。
         initial_rounds: 会话的初始轮次设置（新建会话时用；恢复会话时以档案里的为准）。
-        overrides: 命令行显式给出的轮次覆盖（按字段生效，优先级最高，Design §4.4）。
+        overrides: 命令行显式给出的轮次覆盖（按字段生效，优先级最高）。
         file_input: ``-f`` 起始的输入（路径与内容；仅新建会话的第 1 轮使用）。
         resume_session_id: ``--resume`` 的会话号（恢复记忆、代码版本与轮次设置）。
         severe_only: 是否放宽干净判定（只把【严重】当阻塞；随档案保留，恢复时取"档案或本次
             命令行"的并集）。
         no_exec: 是否关闭代码执行（按轮传入，不进档案——无法区分"显式关闭"与"未设置"）。
-        confirm_deletions: 删除确认闸门（与 ``crw run`` 同一闸门，Design §4.2.2）。
+        confirm_deletions: 删除确认闸门（与 ``crw run`` 同一闸门）。
 
     Returns:
         退出码：0 干净 / 1 达限残留 / 2 运行错误或被中断；未跑过任何轮次为 0。
@@ -382,7 +382,7 @@ def _handle_message(
         )
         return None
     index = _next_round_index(state)
-    # 本轮标注：夹取事实与编排层的说明都留痕（去重后按序连接，Design §4.4）
+    # 本轮标注：夹取事实与编排层的说明都留痕（去重后按序连接）
     round_note = "；".join(dict.fromkeys(text for text in (clamp_note, decision.note) if text))
     io.say("")
     io.say(
@@ -470,7 +470,7 @@ def _session_rounds_default(state: Mapping[str, Any]) -> int:
 def _has_code_for(
     intent: str, state: Mapping[str, Any], file_input: tuple[Path, str] | None
 ) -> bool:
-    """该意图是否有可作用的对象：审查 / 修复类意图需要既有代码（Design §5.4 的兜底）。"""
+    """该意图是否有可作用的对象：审查 / 修复类意图需要既有代码（没有代码时反问，不空跑一轮）。"""
     if intent == orch_mod.INTENT_CODE:
         return True
     current = str(state.get("current_version_dir") or "")
@@ -486,7 +486,7 @@ def _resolve_rounds(
     overrides: RoundOverrides | None,
     limit: int,
 ) -> tuple[RoundSettings, str]:
-    """本轮轮次设置（优先级：命令行显式 > 消息提取 > 会话当前设置，Design §4.4）。
+    """本轮轮次设置（优先级：命令行显式 > 消息提取 > 会话当前设置）。
 
     命令行的两个字段**分别**钉住：显式 ``--max-iter`` 钉住轮次数值（来源记 cli），
     显式 ``--rounds-mode`` 只钉住轮次语义——只给模式时，数值仍按优先级链从消息 / 会话
@@ -542,7 +542,7 @@ def _resolve_rounds(
         if review_fix_default
         else (pinned_mode or decision.rounds_mode or base.rounds_mode)
     )
-    # review 的意图级语义（Design §5.4："只审查不改"等价 rounds=0）：会话里默认的轮次
+    # review 的意图级语义（"只审查不改"等价 rounds=0）：会话里默认的轮次
     # 设置不能把"只看不改"变成"接着修"。同一句话里明确给了轮次、或命令行钉住了轮次时，
     # 以那句话/那个参数为准（优先级链不变）。
     if decision.intent == orch_mod.INTENT_REVIEW and decision.rounds is None and pinned is None:
@@ -586,7 +586,7 @@ def _run_round(
     prior_files: Mapping[str, str] | None = None
     current_dir = str(state.get("current_version_dir") or "")
     if decision.intent == orch_mod.INTENT_CODE:
-        # 在既有实现上继续开发（Design §4.7）：内联既有代码，起始版本号跨轮递增。
+        # 在既有实现上继续开发：内联既有代码，起始版本号跨轮递增。
         # 传 source_path（而非 source_dir）只作来源追溯——物化会让编码产物压着同一号目录，
         # 新版本由编码输出定义，不需要先放一份副本。
         requirement = message
@@ -667,7 +667,7 @@ def _memory_snapshot_safely(
 
 
 def _effective_severe_only(state: Mapping[str, Any], *, cli_severe_only: bool) -> bool:
-    """本轮是否放宽干净判定：本次命令行或档案里的设置（Design §4.4 的继承口径）。
+    """本轮是否放宽干净判定：本次命令行或档案里的设置取并集。
 
     并集方向与 ``--severe-only`` 的语义一致：命令行只能放宽判定，不能把档案里的放宽
     重新收紧——续跑 / 恢复会话是"接着干"，换判定标准会让结论不可比。
@@ -756,7 +756,7 @@ def _append_memory(
     intent: str,
     ts: str,
 ) -> None:
-    """把本轮各 Agent 的结构化摘要追加进各自的记忆（代码与思考内容不进记忆，Design §4.7）。"""
+    """把本轮各 Agent 的结构化摘要追加进各自的记忆（代码与思考内容不进记忆）。"""
     entries = _memory_entries(state, round_index=round_index, message=message, intent=intent)
     for agent, exchanges in entries.items():
         if not exchanges:
@@ -771,8 +771,8 @@ def _memory_entries(
 ) -> dict[str, list[tuple[str, str]]]:
     """本轮各 Agent 的记忆条目：``agent → [(任务要点, 结论要点)]``。
 
-    条目由**结构化状态**（``history`` 的阶段摘要）生成：摘要本身不含代码（代码在产物
-    文件里，Design §4.7 的"代码不进记忆"），失败轮次的条目也在其中（如实记录）。
+    条目由**结构化状态**（``history`` 的阶段摘要）生成：摘要本身不含代码（代码只在产物
+    文件里），失败轮次的条目也在其中（如实记录）。
     """
     entries: dict[str, list[tuple[str, str]]] = {agent: [] for agent in memory_mod.MEMORY_AGENTS}
     history = state.get("history") if isinstance(state.get("history"), list) else []
@@ -798,7 +798,7 @@ def _memory_snapshot(session_path: Path, *, ts: str) -> dict[str, list[dict[str,
     """三 Agent 的记忆快照（进 prompt 的历史消息）；接近预算时先做一次显式压缩。
 
     预算取 ``CRW_MAX_CONTEXT_TOKENS``（与运行时护栏同源）；压缩只追加 compaction 行、
-    旧行留盘（Design §4.7）。
+    旧行留盘。
     """
     try:
         budget = config_mod.get_max_context_tokens()
@@ -818,8 +818,8 @@ def _memory_snapshot(session_path: Path, *, ts: str) -> dict[str, list[dict[str,
 def _finish_session(io: ChatIO, *, state: SessionState, clock: Callable[[], str]) -> None:
     """收尾：写会话档案（status=ended + 时间）与会话总报告 ``session.md``，打印汇总。
 
-    收尾失败只警示：会话记录与运行记录是更强的一手证据（Design §4.6 的"要么结构化回传、
-    要么落盘 + 可读报错"）。
+    收尾失败只警示：会话档案与 ``session.md`` 是派生记录，每轮的运行记录才是更强的
+    一手证据——写不进去给一行可读警示，不改变会话结论。
     """
     session_path = session_state.session_dir(str(state["session_id"]))
     state["status"] = session_state.SESSION_STATUS_ENDED
@@ -846,7 +846,7 @@ def _finish_session(io: ChatIO, *, state: SessionState, clock: Callable[[], str]
 
 
 def build_session_md(state: Mapping[str, Any], *, session_path: Path) -> str:
-    """会话总报告（Design §4.7）：摘要 → 逐轮结论演进 → 剩余建议 → 记忆索引。
+    """会话总报告：摘要 → 逐轮结论演进 → 剩余建议 → 记忆索引。
 
     "剩余建议"取自**最后一轮**的运行记录（``state.json`` 的残留 findings）：会话档案里
     只存结论句，问题清单仍在各轮记录里（单一真相）。
