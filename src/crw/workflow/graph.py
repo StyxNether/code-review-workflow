@@ -83,11 +83,6 @@ def findings_key_for_view(view: str) -> str:
     return f"findings_{view}"
 
 
-def evidence_key_for_view(view: str) -> str:
-    """某视角的执行证据状态键（节点交回、包装层消费）。"""
-    return f"review_evidence_{view}"
-
-
 def resolve_nodes(
     nodes: Mapping[str, NodeFn] | None = None,
     *,

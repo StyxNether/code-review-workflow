@@ -284,18 +284,13 @@ def _validate_input_contract(parser: argparse.ArgumentParser, args: argparse.Nam
 _MAX_ERROR_CHARS = 400
 
 
-def _mask_secrets(text: str) -> str:
-    """遮蔽 ``sk-`` 形态的密钥（实现只在渲染层一处：遮蔽口径漂移是安全问题，不是重复问题）。"""
-    return render.mask_secrets(text)
-
-
 def _report_failure(command: str | None, exc: Exception) -> int:
     """兜底报错：单行可读提示 + 运行错误退出码。
 
     异常文本可能来自模型 / HTTP 栈（含请求细节）而终端输出常被重定向保存，故限长，
     并遮蔽 ``sk-`` 形态的密钥（覆盖常见供应商，尽力而为而非保证）。
     """
-    detail = _mask_secrets(f"{type(exc).__name__}: {exc}")
+    detail = render.mask_secrets(f"{type(exc).__name__}: {exc}")
     if len(detail) > _MAX_ERROR_CHARS:
         detail = f"{detail[:_MAX_ERROR_CHARS]}…（已截断）"
     scope = f" {command}" if command else ""
@@ -317,7 +312,7 @@ def _resolve_model(
     try:
         resolved = config_mod.resolve(model=model, provider=provider)
     except config_mod.ConfigError as exc:
-        print(f"crw {command}：配置错误 — {_mask_secrets(str(exc))}", file=sys.stderr)
+        print(f"crw {command}：配置错误 — {render.mask_secrets(str(exc))}", file=sys.stderr)
         return None
     if resolved is None:
         print(
@@ -1192,7 +1187,7 @@ def _review_project_session(
         _report_review_usage(runtime)
         return _EXIT_ERROR
     except Exception as exc:  # noqa: BLE001 — 一次调用即整批：如实报错，不产出部分结论
-        print(f"crw review：整项目审查失败 — {_mask_secrets(str(exc))}", file=sys.stderr)
+        print(f"crw review：整项目审查失败 — {render.mask_secrets(str(exc))}", file=sys.stderr)
         _report_review_usage(runtime)
         return _EXIT_ERROR
     severe = False
@@ -1261,7 +1256,7 @@ def _review_per_file_session(
             return _EXIT_ERROR
         except Exception as exc:  # noqa: BLE001 — 单文件失败继续批量；最终退出码 2
             print(
-                f"[审查失败] {display_name}：{_mask_secrets(str(exc))}",
+                f"[审查失败] {display_name}：{render.mask_secrets(str(exc))}",
                 file=sys.stderr,
             )
             failed = True
@@ -1817,7 +1812,7 @@ def _config_manage_thinking(session: _ConfigSession) -> None:
         # 默认值会得到自相矛盾的配置（默认不在可选清单内），这里不制造这种半状态。
         # 清空后不再发送任何思考参数——对"默认就是思考开"的供应商，这等于把挡位交回供应商
         # 默认（比关闭更贵），所以要提醒一句，并给出"跟随默认"这条更省的路。
-        _set_model_thinking(session, entry, models, model_name, [], None)
+        _set_model_thinking(session, models, model_name, [], None)
         _say(
             "注意：清空后不发送任何思考参数，部分供应商（如 DeepSeek）的出厂默认是"
             "「思考开、high」。"
@@ -1855,12 +1850,11 @@ def _config_manage_thinking(session: _ConfigSession) -> None:
     if new_selected and new_selected != "off" and new_selected not in new_levels:
         _say(f"默认挡位 {new_selected!r} 不在挡位清单内，已取消（请先启用它再设默认）。")
         return
-    _set_model_thinking(session, entry, models, model_name, new_levels, new_selected)
+    _set_model_thinking(session, models, model_name, new_levels, new_selected)
 
 
 def _set_model_thinking(
     session: _ConfigSession,
-    entry: dict[str, Any],
     models: list[Any],
     model_name: str,
     levels: list[str],

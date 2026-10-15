@@ -18,7 +18,7 @@ from typing import Any
 
 import fakes
 import pytest
-from support import read_sample, sample_path
+from support import sample_path
 
 import crw.cli
 import crw.render
@@ -398,11 +398,7 @@ def test_run_with_syntax_fixture_reports_the_fix_cycle(
 ) -> None:
     """修复循环：首审含【严重】→ 修复 → 复审干净（退出码 0）。"""
     configured_provider()
-    fake_chat_model.load(
-        fakes.fix_cycle_script(
-            code=read_sample("syntax_error.py"), fixed_code=CLEAN_CODE, name="syntax_error.py"
-        )
-    )
+    fake_chat_model.load(fakes.fix_cycle_script(fixed_code=CLEAN_CODE, name="syntax_error.py"))
 
     assert main(["run", "-f", str(sample_path("syntax_error.py"))]) == 0
 
@@ -425,7 +421,6 @@ def test_run_with_divide_by_zero_fixture_residual(
     configured_provider()
     fake_chat_model.load(
         fakes.residual_script(
-            code=read_sample("divide_by_zero.py"),
             name="divide_by_zero.py",
             location="divide_by_zero.py:7",
         )
@@ -628,7 +623,6 @@ def test_show_renders_the_record(
     configured_provider()
     fake_chat_model.load(
         fakes.fix_cycle_script(
-            code=read_sample("syntax_error.py"),
             fixed_code=CLEAN_CODE,
             name="syntax_error.py",
             location="syntax_error.py:7",

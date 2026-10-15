@@ -627,7 +627,6 @@ def clean_requirement_script(*, code: str) -> list[Any]:
 
 def fix_cycle_script(
     *,
-    code: str,
     fixed_code: str,
     name: str = "main.py",
     location: str | None = None,
@@ -650,7 +649,7 @@ def fix_cycle_script(
     ]
 
 
-def residual_script(*, code: str, name: str = "main.py", location: str | None = None) -> list[Any]:
+def residual_script(*, name: str = "main.py", location: str | None = None) -> list[Any]:
     """每轮都报同类【严重】：`--max-iter 1` 下以残留收尾（退出码 1）。"""
     where = location or f"{name}:1"
     return [

@@ -1560,7 +1560,6 @@ def build_report(
             lines.extend(
                 _round_section(
                     item,
-                    status=status,
                     not_converged=bool(previous and not_converged(previous.review, item.review)),
                 )
             )
@@ -1575,7 +1574,9 @@ def build_report(
         input_descriptor.get("source_path") if isinstance(input_descriptor, Mapping) else None
     )
     mapped_name = Path(str(source_path)).name if source_path else ""
-    start_dir = rounds_mod.code_version_dir_name(_version_base_of(state))
+    start_dir = rounds_mod.code_version_dir_name(
+        rounds_mod.normalize_version_base(state.get("version_base"))
+    )
     for path in artifacts:
         relative = _relative_display(path, run_dir)
         if source_path and mapped_name and relative == f"workspace/{start_dir}/{mapped_name}":
@@ -1641,7 +1642,7 @@ def _cell(value: Any) -> str:
     return " ".join(str(value if value is not None else "").split()).replace("|", "\\|")
 
 
-def _round_section(item: RoundReport, *, status: str, not_converged: bool = False) -> list[str]:
+def _round_section(item: RoundReport, *, not_converged: bool = False) -> list[str]:
     """单轮问题清单：标题固定为"第 i 轮审查（基于 code_vi/）"，问题按文件分组。
 
     ``not_converged`` 为真时插入"未收敛"标注：问题集合与上一轮一致说明
@@ -1947,11 +1948,6 @@ def _version_files_of(state: Mapping[str, Any]) -> list[str]:
     if not isinstance(files, list):
         return []
     return [str(item) for item in files if isinstance(item, str) and item.strip()]
-
-
-def _version_base_of(state: Mapping[str, Any]) -> int:
-    """状态的起始版本号（展示与报告用）：坏值按 1 处理（口径见 rounds.normalize_version_base）。"""
-    return rounds_mod.normalize_version_base(state.get("version_base"))
 
 
 def _fingerprint(files: Mapping[str, str]) -> dict[str, str]:

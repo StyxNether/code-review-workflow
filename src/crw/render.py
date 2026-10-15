@@ -990,11 +990,6 @@ def _not_converged(detail: records_mod.RunDetail, round_number: int) -> bool:
     return engine_mod.not_converged(previous.review, current.review)
 
 
-def version_base_of(state: Mapping[str, Any]) -> int:
-    """状态的起始版本号（展示用）：坏值按 1 处理，口径见 ``rounds.normalize_version_base``。"""
-    return rounds_mod.normalize_version_base(state.get("version_base"))
-
-
 def _duration_ms(started: str, ended: str) -> str:
     """两个 ISO 时间戳的耗时（毫秒，降级时间线用）；解析失败留空。"""
     try:
@@ -1071,7 +1066,9 @@ def _input_line(state: Mapping[str, Any], summary: records_mod.RunSummary) -> st
     "父版本目录 → ``code_v1/``"；``-f`` 为"原文件 → ``code_v1/<原文件名>``"。
     """
     descriptor = _mapping(state.get("input"))
-    start_dir = rounds_mod.code_version_dir_name(version_base_of(state))
+    start_dir = rounds_mod.code_version_dir_name(
+        rounds_mod.normalize_version_base(state.get("version_base"))
+    )
     if descriptor.get("kind") == state_mod.INPUT_FILE:
         source = str(descriptor.get("source_path") or "")
         if rounds_mod.is_code_version_dir_name(Path(source).name or ""):
